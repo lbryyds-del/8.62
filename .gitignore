@@ -32,10 +32,10 @@ torch_cache/
 detectron2_repo/
 
 # Datasets and generated data
-data/
-datasets/
-few_shot_test_csvs/
-test_csvs*/
+/data/
+/datasets/
+/few_shot_test_csvs/
+/test_csvs*/
 
 # Training, evaluation, and experiment outputs
 output/
