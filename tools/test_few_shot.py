@@ -167,6 +167,11 @@ def create_progress_bar(total, description):
     return tqdm(total=total, desc=description, dynamic_ncols=True, leave=False)
 
 
+def should_log_iter_stats(progress_bar):
+    """Use tqdm in interactive runs and keep per-iter logger output for non-interactive runs."""
+    return progress_bar is None
+
+
 def shot_metric_name(cfg):
     """Display name for the current few-shot setting."""
     return f"shot_{cfg.FEW_SHOT.K_SHOT}_acc"
@@ -321,7 +326,8 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
 
 
         val_meter.update_predictions(preds, labels)
-        val_meter.log_iter_stats(cur_epoch, cur_iter)
+        if should_log_iter_stats(progress_bar):
+            val_meter.log_iter_stats(cur_epoch, cur_iter)
         if progress_bar is not None:
             progress_bar.update(1)
             progress_bar.set_postfix(

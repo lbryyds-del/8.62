@@ -1,192 +1,284 @@
 """
-This file contains the functions to get the semantic points from the clustering.
+Point tracking module for extracting and tracking semantic points in videos.
+
+This module provides functionality to:
+- Extract semantic points from videos using clustering methods
+- Track points across video frames using CoTracker
+- Save tracking results and generate visualizations
 """
+import sys
 import os
-import warnings
-import numpy as np
+import time
+import random
+import argparse
+import pickle
+import traceback
+
+os.environ.setdefault('OMP_NUM_THREADS', '4')
+os.environ.setdefault('OPENBLAS_NUM_THREADS', os.environ['OMP_NUM_THREADS'])
+os.environ.setdefault('MKL_NUM_THREADS', os.environ['OMP_NUM_THREADS'])
+os.environ.setdefault('NUMEXPR_NUM_THREADS', os.environ['OMP_NUM_THREADS'])
+
 import torch
-from PIL import Image
-import matplotlib.pyplot as plt
-from clustering import (get_temporal_bipartite_clusters,
-                        cluster_coordinates,
-                        cluster_coordinates_per_component)
+import numpy as np
+from einops import rearrange
+import pandas as pd
+from utils import convert_points_for_tracking, save_video
+from feat_extractor import feature_extract
+from get_semantic_points import get_points_from_clustering
+from new_video_loader import load_video_pyvideo_reader
+from omni_vis import vis_trail
 
-from utils import get_cluster_peak_frames, find_connected_components
-from utils import create_overlay_mask
+# set seeds
+torch.manual_seed(1234)
+np.random.seed(1234)
+random.seed(1234)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-def make_frame_cluster_vis(video_frames, frame_id, feat_cluster_labels,
-                           debug_vis_root):
-    """Make a visualisation of the cluster points for a given frame.
+BASE_PATH = '/fs/cfar-projects/actionloc/camera_ready/tats_v2/dumps'
+
+_TORCH_THREADS = int(os.environ.get(
+    'TROKENS_TORCH_THREADS',
+    os.environ.get('OMP_NUM_THREADS', '4'),
+))
+torch.set_num_threads(_TORCH_THREADS)
+try:
+    torch.set_num_interop_threads(max(1, min(2, _TORCH_THREADS)))
+except RuntimeError:
+    pass
+# pylint: disable=redefined-outer-name
+
+
+def check_columns_in_df(df):
+    """Check if the dataframe has the required columns.
 
     Args:
-        video_frames (torch.Tensor): Video frames
-        frame_id (int): Frame id
-        feat_cluster_labels (torch.Tensor): Feature cluster labels
-        debug_vis_root (str): Debug visualisation path
+        df (pd.DataFrame): Dataframe to check
+
+    Raises:
+        ValueError: If the dataframe does not have the required columns
     """
-    original_frame = Image.fromarray(video_frames[0,frame_id])
-
-    overlay_dino_global_torch = create_overlay_mask(original_frame,
-                                                    feat_cluster_labels[frame_id])
-
-    # Create a figure with one row and two columns
-    _, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-
-    # Left subplot - Original frame
-    ax1.imshow(video_frames[0,frame_id])
-    ax1.set_title(f'Frame {frame_id}', fontsize=14)
-    ax1.axis('off')
-
-    # Right subplot - DINO Cluster with points
-    ax2.imshow(overlay_dino_global_torch)
-    ax2.set_title('DINO Global Cluster', fontsize=14)
-    ax2.axis('off')
-
-    # Adjust layout and save
-    plt.tight_layout()
-    os.makedirs(debug_vis_root, exist_ok=True)
-    plt.savefig(os.path.join(debug_vis_root, f"debug_cluster_pts_{frame_id}.png"),
-            bbox_inches='tight', dpi=150)
-    plt.close()
+    required_columns = ['video_path', 'dataset']
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"Column {col} not found in the dataframe")
 
 
-
-def get_points_in_cluster(args,labels, image_size, clusters_to_consider=None):
-    """Per cluster sample points such that the points are uniformly spread
-    across the cluster.
+def extract_points(args, cotracker, feat_extractor, video_path, ds_dump_path,
+                    custom_fps=None):
+    """Extract points from a video and save them to a pickle file.
 
     Args:
         args (argparse.Namespace): Arguments
-        labels (np 2d array or torch tensor): Cluster labels spread across frame
-        image_size (tuple): Size of the original image
-        clusters_to_consider (list): cluster ids to consider
+        cotracker (torch.nn.Module): Cotracker model
+        feat_extractor (torch.nn.Module): Feature extractor model
+        video_path (str): Path to the video
+        ds_dump_path (str): Path to the directory where the pickle file will be saved
+        custom_fps (int): Custom fps to use for the video if video duration > 90s
 
     Returns:
-        points (np.ndarray): Points in the cluster.
-        point_labels (np.ndarray): Point labels.
-        component_labels (np.ndarray): Component labels.
+        bool: True if the points were extracted, False otherwise
     """
-    img_height, img_width = image_size
+    # load video for DINO feat extractor
+    vid_name = video_path.split('/')[-1].split('.')[0]
+    debug_vis_dump_root = os.path.join(ds_dump_path, 'debug_vis', vid_name)
+    feat_dump_path = os.path.join(ds_dump_path, 'feat_dump', f'{vid_name}.pkl')
+    gif_dump_path = os.path.join(ds_dump_path, 'gif_dump', f'{vid_name}.gif')
+    if os.path.exists(feat_dump_path) and not args.rerun:
+        return True
 
-    # Convert labels to tensor if it's numpy array
-    if isinstance(labels, np.ndarray):
-        labels = torch.from_numpy(labels)
+    video_loaded, video_frames, frames_id_dict = load_video_pyvideo_reader(
+        video_path, return_tensor=True, use_float=False,
+        num_frames=args.num_frames_clustering, sample_all_frames=False,
+        fps=custom_fps if custom_fps is not None else args.fps)  # (B, T, C, H, W)
+    if not video_loaded:
+        print(f"Video {vid_name} not loaded")
+        return None
+    video_frames = rearrange(video_frames, 'b t c h w -> b t h w c')
+    video_frames = video_frames.cpu().numpy()
 
-    points_list = []
-    labels_list = []
-    component_labels_list = []
-    for label in clusters_to_consider:
-        mask = labels == label
+    if args.debug_mode:
+        time_start = time.time()
 
-        mask = torch.nn.functional.interpolate(
-            mask[None, None, :, :].float(),  # Add batch and channel dims
-            size=(img_height, img_width),
-            mode='nearest'
-        )[0, 0]  # Remove batch and channel dims
+    base_point_info = get_points_from_clustering(
+        args, video_frames, feat_extractor, debug_vis_dump_root)
+    points_list, point_labels_list, component_labels_list = base_point_info
+    queries_points, cluster_ids_all_frames = convert_points_for_tracking(
+        points_list, point_labels_list, frames_id_dict=frames_id_dict,
+        component_labels_list=component_labels_list,
+        use_connected_components=args.use_connected_components, device=args.device)
+    if args.debug_mode:
+        os.makedirs(debug_vis_dump_root, exist_ok=True)
+        time_end = time.time()
+        print(f"Time taken to get points and labels: {time_end - time_start} seconds")
+    torch.cuda.empty_cache()
 
-        y_indices, x_indices = torch.where(mask)
-        if args.use_connected_components:
-            components = find_connected_components(mask.cpu().numpy(),
-                                                   connectivity=4)
-            if not components:
-                warnings.warn(f"No connected components found for label {label}")
-                continue
-            cluster_points, component_labels = cluster_coordinates_per_component(
-                                    components,
-                                    args.num_points_per_entity,
-                                    cluster_coordinates_fn=cluster_coordinates)
-
-            component_labels_list.extend(component_labels.tolist())
-
-        else:
-            stacked_indices = torch.stack([y_indices, x_indices], dim=1).cpu().numpy()
-            cluster_points = cluster_coordinates(stacked_indices,
-                                                 args.num_points_per_entity)
-
-        scaled_x = cluster_points[:,1:2]
-        scaled_y = cluster_points[:,0:1]
-
-        # Optional: Clamp values to ensure they stay within image boundaries
-        scaled_x = np.clip(scaled_x, 0, img_width - 1)
-        scaled_y = np.clip(scaled_y, 0, img_height - 1)
-
-        points_list.extend(np.concatenate([scaled_x, scaled_y], axis=1).tolist())
-        labels_list.extend([label] * len(scaled_x))
-
-    # Convert to numpy arrays
-    points = np.array(points_list)  # Shape: (N, 2)
-    point_labels = np.array(labels_list)  # Shape: (N,)
-    component_labels = np.array(component_labels_list)
-
-    return points, point_labels, component_labels
-
-
-
-
-def get_points_from_clustering(args, video_frames, feat_extractor, debug_vis_root):
-    """Get points from clustering.
-
-    Args:
-        args (argparse.Namespace): Arguments
-        video_frames (torch.Tensor): Video frames
-        feat_extractor (FeatureExtractor): Object feature extractor class.
-        debug_vis_root (str): Debug visualisation path
-
-
-    Returns:
-        points_list (list): List of points.
-        point_labels_list (list): List of point labels.
-        component_labels_list (list): List of component labels.
-    """
-    _, n_frames, h, w, _ = video_frames.shape
-    #extracting dino features
-    dino_features = feat_extractor(video_frames, model_type='dino').squeeze() # (T, 16, 16, 768)
-
-     # Apply clustering for all frame frame features
-    if args.clustering_method == 'bipartite':
-        feat_cluster_labels = get_temporal_bipartite_clusters(
-                                        dino_features, merge_ratio=args.merge_ratio,
-                                        num_iters=args.num_iters)
-    elif args.clustering_method == 'kmeans':
-        # vectorised kmeans implmented in feat_extractor class, using that.
-        feat_cluster_labels, _ = feat_extractor.cluster_features(
-                            dino_features, method='kmeans',
-                            n_clusters=args.n_clusters, global_clustering=True,
-                            use_torch=True
-                        )
+    _, video, _ = load_video_pyvideo_reader(video_path, return_tensor=True, use_float=True,
+                             device=args.device, sample_all_frames=True,
+                             fps=custom_fps if custom_fps is not None else args.fps)  # B T C H W
+    if args.debug_mode:
+        time_start = time.time()
+    if args.use_grid:
+        pred_tracks, pred_visibility = cotracker(
+            video, grid_size=args.cotracker_grid_size,
+            queries=None, backward_tracking=False)
     else:
-        raise ValueError(f"Clustering method not implemented {args.clustering_method}")
+        pred_tracks, pred_visibility = cotracker(video,
+                                                 queries=queries_points,
+                                                 backward_tracking=True)
+    if args.debug_mode:
+        time_end = time.time()
+        print(f"Time taken to run cotracker: {time_end - time_start} seconds")
+    point_queries = queries_points.cpu().squeeze(0).numpy()[:, 0]
+    pred_tracks = pred_tracks.cpu().squeeze(0).numpy()
+    pred_visibility = pred_visibility.cpu().squeeze(0).numpy()
+    video = video.cpu().squeeze(0).numpy()
+    video = rearrange(video, 't c h w -> t h w c')
+    pt_obj_cluster_dict = {}
 
-    points_list = []
-    clusters_considerd = set()
-    # where max cluster is visible, we make query points from there.
-    peak_frames = get_cluster_peak_frames(feat_cluster_labels)
-    point_labels_list = []
-    component_labels_list = []
+    dump_dict = {
+        'pred_tracks': torch.tensor(pred_tracks).half(),
+        'pred_visibility': torch.tensor(pred_visibility).bool(),
+        'obj_ids': torch.tensor(cluster_ids_all_frames).long(),
+        'point_queries': torch.tensor(point_queries).long(),
+        **pt_obj_cluster_dict
+    }
 
-    for frame_id in range(n_frames):
-        if frame_id not in peak_frames:
-            points_list.append([])
-            point_labels_list.append([])
-            if args.use_connected_components:
-                component_labels_list.append([])
-            continue
-        clusters_to_consider = peak_frames[frame_id]
-        # getting
-        feat_cluster_labels_frame = torch.tensor(feat_cluster_labels[frame_id])
-        points, cluster_labels, component_labels= get_points_in_cluster(
-                    args, feat_cluster_labels_frame.to(dino_features.device),
-                    image_size=(h,w), clusters_to_consider=clusters_to_consider)
-        clusters_considerd.update(set(cluster_labels))
-        points_list.append(points)
-        point_labels_list.append(cluster_labels)
-        if args.use_connected_components:
-            component_labels_list.append(component_labels)
+    os.makedirs(os.path.dirname(feat_dump_path), exist_ok=True)
+    pickle.dump(dump_dict, open(feat_dump_path, "wb"))
+    torch.cuda.empty_cache()
+
+    if args.debug_mode or args.make_vis:
+        frames = vis_trail(video, pred_tracks, pred_visibility,
+                           cluster_ids=cluster_ids_all_frames)
+        os.makedirs(os.path.dirname(gif_dump_path), exist_ok=True)
+        save_video(frames, gif_dump_path)
+    return True
 
 
-        if args.debug_mode:
-            make_frame_cluster_vis(video_frames, frame_id, feat_cluster_labels,
-                                   debug_vis_root)
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug_mode", action="store_true",
+                        help="Enable debug mode")
 
+    parser.add_argument("--use_connected_components", action="store_true",
+                        help="Use connected components")
 
-    return points_list, point_labels_list, component_labels_list
+    parser.add_argument("--num_frames_clustering", type=int, default=32,
+                        help="Number of frames to cluster")
+
+    parser.add_argument("--merge_ratio", type=int, default=25,
+                        help="Merge ratio")
+
+    parser.add_argument("--num_iters", type=int, default=11,
+                        help="Number of iterations")
+
+    parser.add_argument("--clustering_method", type=str, default='bipartite',
+                        help="Clustering method to use")
+
+    parser.add_argument("--n_clusters", type=int, default=32,
+                        help="Number of clusters")
+
+    parser.add_argument("--num_points_per_entity", type=int, default=16,
+                        help="Number of samples per mask")
+
+    parser.add_argument("--use_grid", action="store_true",
+                        help="Use grid")
+
+    parser.add_argument("--cotracker_grid_size", type=int, default=16,
+                        help="Cotracker grid size")
+
+    parser.add_argument("--csv_path", type=str, default='sample.csv',
+                        help='Path to csv file')
+
+    parser.add_argument("--fps", type=int, default=None,
+                        help="FPS for point tracking")
+
+    parser.add_argument("--base_feat_path", type=str, default=BASE_PATH,
+                        help="Base path for feature dumps")
+
+    parser.add_argument("--make_vis", action="store_true",
+                        help="Make gifs")
+    parser.add_argument("--rerun", action="store_true",
+                        help="Rerun the point tracking")
+    parser.add_argument("--continue_on_error", action="store_true",
+                        help="Skip videos that fail and continue processing")
+    parser.add_argument("--failure_csv", type=str, default=None,
+                        help="Optional CSV path to write failed videos")
+    parser.add_argument("--progress_every", type=int, default=100,
+                        help="Print progress after this many videos")
+
+    args = parser.parse_args()
+
+    use_connected_components = args.use_connected_components
+
+    if args.clustering_method == 'kmeans':
+        CLUSTER_STR = f'kmeans_n{args.n_clusters}'
+    elif args.clustering_method == 'bipartite':
+        CLUSTER_STR = 'bip'
+    else:
+        raise ValueError(f"Invalid clustering method: {args.clustering_method}")
+    df = pd.read_csv(args.csv_path)
+    check_columns_in_df(df)
+    if args.debug_mode:
+        df = df[df['video_name'] == '27k-12-1-2|P1|6116|6514.mp4']
+        args.rerun = True
+        args.make_vis = True
+        # df = df.iloc[:1]  # just running on the first sample for debugging
+
+    dump_name = f'cotracker3_{CLUSTER_STR}_fr_{args.num_frames_clustering}'
+    if args.merge_ratio != 25 or args.num_iters != 11:  # if not default then add to dump name
+        dump_name += f'_m{args.merge_ratio}_i{args.num_iters}'
+    if use_connected_components:
+        dump_name += '_concomp'
+    if args.fps is not None:
+        dump_name += f'_fps_{args.fps}'
+
+    # base_featpath = '/fs/cfar-projects/actionloc/shirley/sam_based_debug/somethingv2'
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    setattr(args, 'device', device)
+    cotracker = torch.hub.load(
+        "facebookresearch/co-tracker",
+        "cotracker3_offline",
+        trust_repo=True,
+        skip_validation=True,
+    ).to(device)
+    feat_extractor = feature_extract()
+    failures = []
+    total_videos = len(df)
+    for video_index, vid_info_row in df.iterrows():
+        dataset = vid_info_row['dataset']
+        video_path = vid_info_row['video_path']
+        if 'duration' in vid_info_row:
+            duration = vid_info_row['duration']
+            if duration>90:
+                custom_fps = 1
+            else:
+                custom_fps = None
+        else:
+            custom_fps = None
+        video_uniq_id = video_path.split('/')[-1].split('.')[0]
+        feat_dump_name = f'{video_uniq_id}'
+        ds_dump_path = os.path.join(args.base_feat_path, dump_name, dataset)
+        try:
+            extract_points(args, cotracker, feat_extractor, video_path, ds_dump_path,
+                            custom_fps=custom_fps)
+        except Exception as exc:
+            print(f"Failed to process {video_path}: {exc}", flush=True)
+            traceback.print_exc()
+            failures.append({
+                'row_index': video_index,
+                'dataset': dataset,
+                'video_path': video_path,
+                'error': repr(exc),
+            })
+            if not args.continue_on_error:
+                raise
+        if args.progress_every > 0 and (video_index + 1) % args.progress_every == 0:
+            print(f"Processed {video_index + 1}/{total_videos} videos", flush=True)
+
+    if failures and args.failure_csv is not None:
+        failure_df = pd.DataFrame(failures)
+        os.makedirs(os.path.dirname(args.failure_csv), exist_ok=True)
+        failure_df.to_csv(args.failure_csv, index=False)
+        print(f"Wrote failures to {args.failure_csv}", flush=True)
