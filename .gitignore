@@ -1,0 +1,97 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local env files
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+ENV/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local caches
+.cache/
+.torch-cache/
+torch_cache/
+detectron2_repo/
+
+# Datasets and generated data
+data/
+datasets/
+few_shot_test_csvs/
+test_csvs*/
+
+# Training, evaluation, and experiment outputs
+output/
+outputs/
+runs/
+runs*/
+logs/
+wandb/
+checkpoints/
+exp_weights/
+save_exp/
+better_output/
+
+# Model weights and large binaries
+CP/
+*.pt
+*.pth
+*.pyth
+*.ckpt
+*.onnx
+*.pkl
+*.pickle
+*.npy
+*.npz
+
+# Archives and downloaded assets
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.rar
+*.7z
+*.gz
+
+# Generated reports and media
+*.pdf
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.gif
+
+# Local scratch/config files
+paths.yaml
+old_cmds/
+/stdout*
+/out/
+
+# Project-specific local scripts and temporary notebooks/data
+point_tracking/slurm_extract_pt.py
+check_sampler.sh
+check_feat.py
+check.csv
+handle_wandb.ipynb
+notebooks/data/
+notebooks/analysis/*.csv
+notebooks/paper_plot_stuff/**/*.csv
+notebooks/vis_stuff/vis_to_save*/
