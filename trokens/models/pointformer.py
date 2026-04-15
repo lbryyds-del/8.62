@@ -177,7 +177,9 @@ class Pointformer(nn.Module):
         self.apply(self._init_weights)
         if cfg.MODEL.FEAT_EXTRACTOR == "dino":
             dino_config  = cfg.MODEL.DINO_CONFIG
-            local_path = os.path.join(os.environ['TORCH_HOME'], 'hub')
+            torch_home = os.environ.get("TORCH_HOME", os.path.join(os.getcwd(), ".torch-cache"))
+            os.environ.setdefault("TORCH_HOME", torch_home)
+            local_path = os.path.join(torch_home, 'hub')
             if 'v2' in dino_config:
                 local_path = os.path.join(local_path , 'facebookresearch_dinov2_main')
                 self.dino = torch.hub.load(local_path, dino_config, source='local')

@@ -84,6 +84,10 @@ paths.yaml
 old_cmds/
 /stdout*
 /out/
+/auth.json
+/auth(a).json
+/auth(b).json
+/auth(c).json
 
 # Project-specific local scripts and temporary notebooks/data
 point_tracking/slurm_extract_pt.py

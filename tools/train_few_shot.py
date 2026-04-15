@@ -10,6 +10,17 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from fvcore.common.config import CfgNode
+from few_shot_multilabel import (
+    compute_base_novel_hm,
+    empty_ap_storage,
+    is_multilabel_episode,
+    mean_or_nan,
+    merge_ap_storage,
+    multilabel_classification_loss,
+    multilabel_top1_accuracy,
+    support_query_split_multilabel,
+    update_ap_storage,
+)
 import trokens.models.losses as losses
 import trokens.models.optimizer as optim
 import trokens.utils.checkpoint as cu
@@ -281,26 +292,38 @@ def train_epoch(
 
             preds, patch_tokens = model(input_dict)
 
-            preds = preds / cfg.SOLVER.TEMPRATURE
-
             if isinstance(preds, tuple):
                 preds, _ = preds
+            preds = preds / cfg.SOLVER.TEMPRATURE
 
             # Explicitly declare reduction to mean.
             loss_fun = losses.get_loss_func(cfg)(
                 reduction="mean"
             )
 
-            classfication_loss = loss_fun(preds, labels)
+            multilabel_episode = is_multilabel_episode(cfg, labels, meta)
+            if multilabel_episode:
+                classfication_loss = multilabel_classification_loss(
+                    preds, labels, cfg, loss_fun)
+            else:
+                classfication_loss = loss_fun(preds, labels)
             loss_dict = {'classfication_loss':classfication_loss}
-            patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
+            if multilabel_episode:
+                patch_support_query_dict = support_query_split_multilabel(
+                    patch_tokens, labels, meta)
+            else:
+                patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
             patch_q2s_logits = process_patch_tokens(
                                         cfg,
                                         patch_support_query_dict['support_preds'],
                                         patch_support_query_dict['query_preds'])
             q2s_labels = patch_support_query_dict['query_batch_labels']
             patch_q2s_logits = patch_q2s_logits / cfg.SOLVER.TEMPRATURE
-            q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
+            if multilabel_episode:
+                q2s_loss = F.binary_cross_entropy_with_logits(
+                    patch_q2s_logits, q2s_labels.float())
+            else:
+                q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
             loss_dict['q2s_loss'] = q2s_loss
         loss = (cfg.FEW_SHOT.CLASS_LOSS_LAMBDA * classfication_loss +
                 cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss)
@@ -326,14 +349,32 @@ def train_epoch(
         scaler.update()
 
         top1_err, top5_err = None, None
-        top1_err, top5_err = None, None
+        classification_loss = loss_dict['classfication_loss']
+        q2s_loss = loss_dict['q2s_loss']
 
-
-        if cfg.DATA.MULTI_LABEL:
-            # Gather all the predictions across all the devices.
+        if multilabel_episode:
+            few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
             if cfg.NUM_GPUS > 1:
-                [loss] = du.all_reduce([loss])
+                loss, classification_loss, q2s_loss, few_shot_top1_acc = du.all_reduce(
+                    [loss, classification_loss, q2s_loss, few_shot_top1_acc]
+                )
             loss = loss.item()
+            classification_loss = classification_loss.item()
+            q2s_loss = q2s_loss.item()
+            few_shot_top1_acc = few_shot_top1_acc.item()
+
+            epoch_cls_loss.append(classification_loss)
+            epoch_q2s_loss.append(q2s_loss)
+            epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
+            global_iter = data_size * cur_epoch + cur_iter
+            wandb_iter_dict = {
+                'iter_cls_loss': classification_loss,
+                'iter_q2s_loss': q2s_loss,
+                'iteration': global_iter,
+                'iter_top1_acc_few_shot': few_shot_top1_acc,
+            }
+            if wandb_run:
+                wandb_run.log(wandb_iter_dict)
 
         else:
             # Compute the errors.
@@ -348,13 +389,12 @@ def train_epoch(
             ]
 
             # Gather all the predictions across all the devices.
-            classification_loss = loss_dict['classfication_loss']
-            q2s_loss = loss_dict['q2s_loss']
             if cfg.NUM_GPUS > 1:
                 classification_loss, top1_err, top5_err, few_shot_top1_acc = du.all_reduce(
                     [classification_loss, top1_err, top5_err, few_shot_top1_acc]
                 )
                 q2s_loss = du.all_reduce([q2s_loss])[0]
+                loss = du.all_reduce([loss])[0]
 
             # Copy the stats from GPU to CPU (sync point).
             classification_loss, top1_err, top5_err = (
@@ -365,6 +405,7 @@ def train_epoch(
             q2s_loss = q2s_loss.item()
 
             few_shot_top1_acc = few_shot_top1_acc.item()
+            loss = loss.item()
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
@@ -410,14 +451,19 @@ def train_epoch(
     train_meter.log_epoch_stats(cur_epoch)
     train_meter.reset()
 
-    wandb_iter_dict = {'train_cls_loss':np.mean(epoch_cls_loss),
-                    'train_q2s_loss':np.mean(epoch_q2s_loss),
-                    'train_top1_err':np.mean(epoch_top_1_err),
-                    'train_top5_err':np.mean(epoch_top_5_err),
-                    'train_top5_acc':100-np.mean(epoch_top_5_err),
-                    'train_top1_acc':100-np.mean(epoch_top_1_err),
-                    'train_top1_acc_few_shot':np.mean(epoch_top_1_acc_few_shot),
-                    'epoch':cur_epoch}
+    wandb_iter_dict = {
+        'train_cls_loss': mean_or_nan(epoch_cls_loss),
+        'train_q2s_loss': mean_or_nan(epoch_q2s_loss),
+        'train_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
+        'epoch': cur_epoch,
+    }
+    if epoch_top_1_err:
+        wandb_iter_dict.update({
+            'train_top1_err': np.mean(epoch_top_1_err),
+            'train_top5_err': np.mean(epoch_top_5_err),
+            'train_top5_acc': 100 - np.mean(epoch_top_5_err),
+            'train_top1_acc': 100 - np.mean(epoch_top_1_err),
+        })
 
     if wandb_run:
         wandb_run.log(wandb_iter_dict)
@@ -444,6 +490,7 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
     val_meter.iter_tic()
     epoch_top_1_acc_few_shot = []
     epoch_q2s_loss = []
+    ap_storage = empty_ap_storage(cfg.MODEL.NUM_CLASSES) if cfg.DATA.MULTI_LABEL else None
     shot_acc_name = shot_metric_name(cfg)
     progress_bar = create_progress_bar(
         len(val_loader),
@@ -460,30 +507,42 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
         val_meter.data_toc()
         input_dict = {'video':inputs, 'metadata':meta}
         preds, patch_tokens = model(input_dict)
+        if isinstance(preds, tuple):
+            preds, _ = preds
 
-        patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
+        multilabel_episode = is_multilabel_episode(cfg, labels, meta)
+        if multilabel_episode:
+            patch_support_query_dict = support_query_split_multilabel(
+                patch_tokens, labels, meta)
+        else:
+            patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
         patch_q2s_logits = process_patch_tokens(
                                     cfg,
                                     patch_support_query_dict['support_preds'],
                                     patch_support_query_dict['query_preds'])
         q2s_labels = patch_support_query_dict['query_batch_labels']
-        q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
+        if multilabel_episode:
+            q2s_loss = F.binary_cross_entropy_with_logits(
+                patch_q2s_logits, q2s_labels.float())
+            few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
+            update_ap_storage(
+                ap_storage,
+                patch_q2s_logits,
+                q2s_labels,
+                patch_support_query_dict['episode_class_ids'],
+            )
+        else:
+            q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
 
-        if isinstance(preds, tuple):
-            preds, _ = preds
-
-
-        few_shotk_correct = metrics.topks_correct(patch_q2s_logits,
-                                                    q2s_labels, (1, 5))
-        few_shot_top1_acc, _ = [
-            (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
-        ]
+            few_shotk_correct = metrics.topks_correct(patch_q2s_logits,
+                                                        q2s_labels, (1, 5))
+            few_shot_top1_acc, _ = [
+                (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
+            ]
 
 
         if cfg.NUM_GPUS > 1:
             few_shot_top1_acc, q2s_loss = du.all_reduce([few_shot_top1_acc, q2s_loss])
-
-            q2s_loss = du.all_reduce([q2s_loss])[0]
 
         # Copy the errors from GPU to CPU (sync point).
         few_shot_top1_acc = few_shot_top1_acc.item()
@@ -520,12 +579,27 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
     val_meter.log_epoch_stats(cur_epoch)
 
     log_dict = {
-        'val_q2s_loss': np.mean(epoch_q2s_loss),
-        'val_top1_acc_few_shot': np.mean(epoch_top_1_acc_few_shot),
+        'val_q2s_loss': mean_or_nan(epoch_q2s_loss),
+        'val_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch}
+    epoch_mean_acc = mean_or_nan(epoch_top_1_acc_few_shot)
+    if cfg.DATA.MULTI_LABEL:
+        ap_storage = merge_ap_storage(ap_storage)
+        base_map, novel_map, hm_map, _ = compute_base_novel_hm(ap_storage, cfg)
+        logger.info(
+            "base mAP: %.2f, novel mAP: %.2f, hm mAP: %.2f",
+            base_map,
+            novel_map,
+            hm_map,
+        )
+        log_dict.update({
+            'val_base_map': base_map,
+            'val_novel_map': novel_map,
+            'val_hm_map': hm_map,
+        })
+        epoch_mean_acc = hm_map
     if wandb_run:
         wandb_run.log(log_dict)
-    epoch_mean_acc = np.mean(epoch_top_1_acc_few_shot)
     val_meter.reset()
     return epoch_mean_acc
 

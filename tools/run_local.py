@@ -93,7 +93,7 @@ def parse_args():
     parser.add_argument(
         "--torch-home",
         default=os.environ.get("TORCH_HOME"),
-        help="Optional TORCH_HOME environment override.",
+        help="Optional TORCH_HOME environment override. Defaults to repo .torch-cache.",
     )
     parser.add_argument(
         "--train-enable",
@@ -140,13 +140,17 @@ def main():
             output_dir = repo_root / output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    torch_home = Path(args.torch_home) if args.torch_home else repo_root / ".torch-cache"
+    if not torch_home.is_absolute():
+        torch_home = repo_root / torch_home
+    torch_home.mkdir(parents=True, exist_ok=True)
+
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = ",".join(gpu_ids)
     env["MASTER_PORT"] = str(args.master_port)
+    env["TORCH_HOME"] = str(torch_home)
     if args.wandb_mode:
         env["WANDB_MODE"] = args.wandb_mode
-    if args.torch_home:
-        env["TORCH_HOME"] = args.torch_home
 
     cfg_overrides = []
     _append_override(cfg_overrides, "MASTER_PORT", args.master_port)
@@ -183,8 +187,7 @@ def main():
     print(f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
     if output_dir:
         print(f"OUTPUT_DIR={output_dir}")
-    if args.torch_home:
-        print(f"TORCH_HOME={args.torch_home}")
+    print(f"TORCH_HOME={torch_home}")
     print("Launching:")
     print(" ".join(shlex.quote(part) for part in command))
 

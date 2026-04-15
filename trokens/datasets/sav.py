@@ -4,6 +4,7 @@
 
 import os
 
+import numpy as np
 import pandas as pd
 
 import trokens.utils.logging as logging
@@ -13,6 +14,28 @@ from .build import DATASET_REGISTRY
 
 
 logger = logging.get_logger(__name__)
+
+
+def _parse_label_combo(label_combo):
+    """Parse SAV label combo strings like '1_3_10' into 0-based ids."""
+    label_ids = []
+    for label in str(label_combo).split("_"):
+        label = label.strip()
+        if label:
+            label_ids.append(int(label) - 1)
+    return label_ids
+
+
+def _multi_hot(label_ids, num_classes):
+    """Create a multi-hot vector for SAV atomic labels."""
+    label_vec = np.zeros(num_classes, dtype=np.float32)
+    for label_id in label_ids:
+        if label_id < 0 or label_id >= num_classes:
+            raise ValueError(
+                f"SAV label id {label_id} is outside [0, {num_classes})."
+            )
+        label_vec[label_id] = 1.0
+    return label_vec
 
 
 @DATASET_REGISTRY.register()
@@ -25,7 +48,7 @@ class Sav(BaseDataset):
     def _construct_loader(self):
         """Construct the SAV video loader from sav_point_tracking.csv."""
         self.data_root = self.cfg.DATA.PATH_TO_DATA_DIR
-        csv_name_to_use = "sav_point_tracking.csv"
+        csv_name_to_use = self.cfg.DATA.DATA_CSV_NAME or "sav_point_tracking.csv"
         self.dataset_csv_path = os.path.join(self.splits_root, csv_name_to_use)
         self.dataset_df = pd.read_csv(self.dataset_csv_path)
 
@@ -88,11 +111,38 @@ class Sav(BaseDataset):
                 f"and point features under {self.base_feature_path}."
             )
 
-        unique_labels = sorted(self.split_df["label_id"].astype(str).unique())
-        label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
-        self.split_df["label_id"] = self.split_df["label_id"].astype(str).map(label_to_index)
+        if self.cfg.DATA.MULTI_LABEL:
+            num_classes = self.cfg.MODEL.NUM_CLASSES
+            self.split_df["label_combo"] = self.split_df["label_id"].astype(str)
+            self.split_df["atomic_label_ids"] = self.split_df["label_combo"].apply(
+                _parse_label_combo
+            )
+            self.split_df["label_id"] = self.split_df["atomic_label_ids"].apply(
+                lambda labels: _multi_hot(labels, num_classes)
+            )
+            class_counts_all = {
+                class_id: int(
+                    self.split_df["atomic_label_ids"].apply(
+                        lambda labels, cid=class_id: cid in labels
+                    ).sum()
+                )
+                for class_id in range(num_classes)
+            }
+            class_counts = {
+                class_id: count
+                for class_id, count in class_counts_all.items()
+                if count > 0
+            }
+            class_counts_to_check = list(class_counts.values())
+        else:
+            unique_labels = sorted(self.split_df["label_id"].astype(str).unique())
+            label_to_index = {label: idx for idx, label in enumerate(unique_labels)}
+            self.split_df["label_id"] = self.split_df["label_id"].astype(str).map(
+                label_to_index
+            )
+            class_counts = self.split_df["label_id"].value_counts()
+            class_counts_to_check = class_counts.tolist()
 
-        class_counts = self.split_df["label_id"].value_counts()
         samples_per_class = self.cfg.FEW_SHOT.K_SHOT + (
             self.cfg.FEW_SHOT.TRAIN_QUERY_PER_CLASS
             if self.mode == "train"
@@ -105,7 +155,7 @@ class Sav(BaseDataset):
                 len(class_counts),
                 self.cfg.FEW_SHOT.N_WAY,
             )
-        if (class_counts < samples_per_class).any():
+        if any(count < samples_per_class for count in class_counts_to_check):
             logger.warning(
                 "SAV split %s has classes with fewer than %s samples after filtering.",
                 self.mode,
@@ -114,3 +164,9 @@ class Sav(BaseDataset):
 
         self._path_to_videos = []
         self._make_final_lists()
+        if self.cfg.DATA.MULTI_LABEL:
+            self._atomic_labels_singles = self.split_df["atomic_label_ids"].tolist()
+            self._atomic_labels = []
+            for labels in self._atomic_labels_singles:
+                for _ in range(self._num_clips):
+                    self._atomic_labels.append(tuple(labels))

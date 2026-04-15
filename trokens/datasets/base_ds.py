@@ -144,10 +144,15 @@ class BaseDataset(torch.utils.data.Dataset):
             index (int): the index of the video.
         """
         if self.cfg.TASK == 'few_shot':
-            index, batch_label, sample_type = index
+            if len(index) == 4:
+                index, batch_label, sample_type, episode_class_ids = index
+            else:
+                index, batch_label, sample_type = index
+                episode_class_ids = None
         else:
             sample_type = ''
             batch_label = 0
+            episode_class_ids = None
         vid_id = index // self._num_clips
         feat_path = self._feat_paths[index]
         pt_dict = pickle.load(open(feat_path, 'rb'))
@@ -168,6 +173,7 @@ class BaseDataset(torch.utils.data.Dataset):
         video = utils.read_video(self._path_to_videos[index],
                                     total_frames=pred_tracks.shape[0],
                                     indices_to_take=index_select)
+        video = self._ensure_rgb_video(video)
 
 
 
@@ -289,6 +295,8 @@ class BaseDataset(torch.utils.data.Dataset):
         metadata['video_name'] = self._video_names[index]
         metadata['batch_label'] = batch_label
         metadata['sample_type'] = sample_type
+        if episode_class_ids is not None:
+            metadata['episode_class_ids'] = episode_class_ids
 
 
         if self.cfg.DATA.BOTH_DIRECTION:
@@ -308,6 +316,21 @@ class BaseDataset(torch.utils.data.Dataset):
             (int): the number of videos in the dataset.
         """
         return self.num_videos
+
+    def _ensure_rgb_video(self, video):
+        """Normalize decoded videos to T x H x W x 3 RGB."""
+        if video.ndim != 4:
+            raise RuntimeError(f"Expected video with 4 dims, got shape {video.shape}.")
+        num_channels = video.shape[-1]
+        if num_channels == 3:
+            return video
+        if num_channels == 4:
+            return video[..., :3]
+        if num_channels == 1:
+            return np.repeat(video, 3, axis=-1)
+        raise RuntimeError(
+            f"Expected decoded video to have 1, 3, or 4 channels, got {num_channels}."
+        )
 
 
     @property

@@ -10,6 +10,16 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from einops import rearrange
+from few_shot_multilabel import (
+    compute_base_novel_hm,
+    empty_ap_storage,
+    is_multilabel_episode,
+    mean_or_nan,
+    merge_ap_storage,
+    multilabel_top1_accuracy,
+    support_query_split_multilabel,
+    update_ap_storage,
+)
 import trokens.utils.checkpoint as cu
 import trokens.utils.distributed as du
 import trokens.utils.logging as logging
@@ -186,10 +196,14 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
     val_meter.iter_tic()
     epoch_top_1_acc_few_shot = []
     epoch_q2s_loss = []
-    num_test_classes = len(val_loader.batch_sampler.class_ids)
-    if cfg.TRAIN.DATASET == 'FINEGYM':
-        num_test_classes = 100
-    confusion_matrix = np.zeros((num_test_classes, num_test_classes))
+    multi_label = cfg.DATA.MULTI_LABEL
+    if multi_label:
+        ap_storage = empty_ap_storage(cfg.MODEL.NUM_CLASSES)
+    else:
+        num_test_classes = len(val_loader.batch_sampler.class_ids)
+        if cfg.TRAIN.DATASET == 'FINEGYM':
+            num_test_classes = 100
+        confusion_matrix = np.zeros((num_test_classes, num_test_classes))
     all_df = []
     shot_acc_name = shot_metric_name(cfg)
     progress_bar = create_progress_bar(
@@ -208,21 +222,60 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
         input_dict = {'video':inputs, 'metadata':meta}
         # for few shot, patch tokens are also returning
         preds, patch_tokens = model(input_dict)
+        if isinstance(preds, tuple):
+            preds, _ = preds
 
-        patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
+        multilabel_episode = is_multilabel_episode(cfg, labels, meta)
+        if multilabel_episode:
+            patch_support_query_dict = support_query_split_multilabel(
+                patch_tokens, labels, meta)
+        else:
+            patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
         patch_q2s_logits = process_patch_tokens(
                                     cfg,
                                     patch_support_query_dict['support_preds'],
                                     patch_support_query_dict['query_preds'])
         q2s_labels = patch_support_query_dict['query_batch_labels']
-        q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
+        if multilabel_episode:
+            q2s_loss = F.binary_cross_entropy_with_logits(
+                patch_q2s_logits, q2s_labels.float())
+            few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
+            update_ap_storage(
+                ap_storage,
+                patch_q2s_logits,
+                q2s_labels,
+                patch_support_query_dict['episode_class_ids'],
+            )
 
-        # Explicitly declare reduction to mean.
-        few_shotk_correct = metrics.topks_correct(patch_q2s_logits,
-                                                    q2s_labels, (1, 5))
-        few_shot_top1_acc, _ = [
-            (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
-        ]
+            query_mask = patch_support_query_dict['query_condition'].detach().cpu().numpy()
+            video_names = np.array(meta['video_name'])[query_mask]
+            episode_class_ids = (
+                patch_support_query_dict['episode_class_ids']
+                .detach()
+                .long()
+                .cpu()
+                .numpy()
+                .tolist()
+            )
+            scores = patch_q2s_logits.detach().float().cpu().numpy()
+            targets = q2s_labels.detach().float().cpu().numpy()
+            for query_idx, video_name in enumerate(video_names):
+                for episode_idx, class_id in enumerate(episode_class_ids):
+                    all_df.append({
+                        'video_name': video_name,
+                        'class_id': int(class_id),
+                        'score': float(scores[query_idx, episode_idx]),
+                        'label': float(targets[query_idx, episode_idx]),
+                    })
+        else:
+            q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
+
+            # Explicitly declare reduction to mean.
+            few_shotk_correct = metrics.topks_correct(patch_q2s_logits,
+                                                        q2s_labels, (1, 5))
+            few_shot_top1_acc, _ = [
+                (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
+            ]
         if cfg['wandb']:
             cfg['wandb'].log({
                 'iteration': cur_iter,
@@ -231,7 +284,6 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
 
         if cfg.NUM_GPUS > 1:
             few_shot_top1_acc, q2s_loss = du.all_reduce([few_shot_top1_acc, q2s_loss])
-            q2s_loss = du.all_reduce([q2s_loss])[0]
 
         # Copy the errors from GPU to CPU (sync point).
         few_shot_top1_acc = few_shot_top1_acc.item()
@@ -239,21 +291,22 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
         epoch_q2s_loss.append(q2s_loss)
         epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
 
-        support_labels = patch_support_query_dict['support_labels']
-        query_labels = patch_support_query_dict['query_labels']
-        # pylint: disable=unbalanced-tuple-unpacking
-        if cfg.NUM_GPUS > 1:
-            patch_q2s_logits, support_labels, query_labels = du.all_gather(
-                [patch_q2s_logits, support_labels, query_labels]
-            )
-        patch_q2s_logits = patch_q2s_logits.cpu().numpy()
-        support_labels = support_labels.cpu().numpy()
-        query_labels = query_labels.cpu().numpy()
-        pred_query_batch_labels = patch_q2s_logits.argmax(axis=1)
-        pred_query_labels = support_labels[pred_query_batch_labels]
-        confusion_matrix[query_labels, pred_query_labels] += 1
-        batch_df = pd.DataFrame({'y_true':query_labels, 'y_preds':pred_query_labels})
-        all_df.append(batch_df)
+        if not multilabel_episode:
+            support_labels = patch_support_query_dict['support_labels']
+            query_labels = patch_support_query_dict['query_labels']
+            # pylint: disable=unbalanced-tuple-unpacking
+            if cfg.NUM_GPUS > 1:
+                patch_q2s_logits, support_labels, query_labels = du.all_gather(
+                    [patch_q2s_logits, support_labels, query_labels]
+                )
+            patch_q2s_logits = patch_q2s_logits.cpu().numpy()
+            support_labels = support_labels.cpu().numpy()
+            query_labels = query_labels.cpu().numpy()
+            pred_query_batch_labels = patch_q2s_logits.argmax(axis=1)
+            pred_query_labels = support_labels[pred_query_batch_labels]
+            confusion_matrix[query_labels, pred_query_labels] += 1
+            batch_df = pd.DataFrame({'y_true':query_labels, 'y_preds':pred_query_labels})
+            all_df.append(batch_df)
 
         val_meter.iter_toc()
         # Update and log stats.
@@ -282,12 +335,34 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
         progress_bar.close()
     val_meter.log_epoch_stats(cur_epoch)
     log_dict = {
-        'test_q2s_loss': np.mean(epoch_q2s_loss),
-        'test_top1_acc_few_shot': np.mean(epoch_top_1_acc_few_shot),
+        'test_q2s_loss': mean_or_nan(epoch_q2s_loss),
+        'test_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch}
+    if multi_label:
+        ap_storage = merge_ap_storage(ap_storage)
+        base_map, novel_map, hm_map, class_aps = compute_base_novel_hm(ap_storage, cfg)
+        logger.info(
+            "test base mAP: %.2f, novel mAP: %.2f, hm mAP: %.2f",
+            base_map,
+            novel_map,
+            hm_map,
+        )
+        for class_id, class_ap in sorted(class_aps.items()):
+            logger.info("test class %s AP: %.2f", class_id, class_ap * 100.0)
+        log_dict.update({
+            'test_base_map': base_map,
+            'test_novel_map': novel_map,
+            'test_hm_map': hm_map,
+        })
     if cfg['wandb']:
         cfg['wandb'].log(log_dict)
-    all_df = pd.concat(all_df)
+    if multi_label:
+        if cfg.NUM_GPUS > 1:
+            gathered_rows = du.all_gather_unaligned(all_df)
+            all_df = [row for rank_rows in gathered_rows for row in rank_rows]
+        all_df = pd.DataFrame(all_df)
+    else:
+        all_df = pd.concat(all_df)
     all_df.to_csv(os.path.join(cfg.OUTPUT_DIR,cfg['csv_dump_name']))
 
     val_meter.reset()
@@ -341,6 +416,10 @@ def test_few_shot(cfg, args, wandb_run=None):
         wandb_instance = wandb_run
         wandb_instance.define_metric("test*", step_metric="epoch")
         wandb_instance.define_metric("test_top1_acc_few_shot", summary="max")
+        if cfg.DATA.MULTI_LABEL:
+            wandb_instance.define_metric("test_base_map", summary="max")
+            wandb_instance.define_metric("test_novel_map", summary="max")
+            wandb_instance.define_metric("test_hm_map", summary="max")
     else:
         if du.get_rank() == 0 and wandb is not None:
             wandb_config_dict = wandb_init_dict(cfg)
@@ -361,10 +440,16 @@ def test_few_shot(cfg, args, wandb_run=None):
             wandb_instance.define_metric("val_top5_acc", summary="max")
             wandb_instance.define_metric("val_top1_acc", summary="max")
             wandb_instance.define_metric("test_top1_acc_few_shot", summary="max")
+            if cfg.DATA.MULTI_LABEL:
+                wandb_instance.define_metric("test_base_map", summary="max")
+                wandb_instance.define_metric("test_novel_map", summary="max")
+                wandb_instance.define_metric("test_hm_map", summary="max")
         else:
             wandb_instance = None
     cfg['wandb'] = wandb_instance
-    cfg['csv_dump_name'] = 'confusion_matrix.csv'
+    cfg['csv_dump_name'] = (
+        'multilabel_predictions.csv' if cfg.DATA.MULTI_LABEL else 'confusion_matrix.csv'
+    )
 
     # Init multigrid.
     logger.info("Test with config:")

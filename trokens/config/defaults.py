@@ -149,6 +149,11 @@ _C.TEST.SAVE_RESULTS_PATH = ""
 
 _C.TEST.TEST_EPOCH_NUM = -1
 
+# Zero-based label ids used to report base/novel few-shot mAP for multi-label
+# episodes.
+_C.TEST.SEEN_LABELS = []
+_C.TEST.NOVEL_LABELS = []
+
 _C.MODEL = CfgNode()
 
 # Model architecture.
