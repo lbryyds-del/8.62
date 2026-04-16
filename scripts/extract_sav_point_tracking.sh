@@ -9,6 +9,7 @@ TRACKING_CSV="${TRACKING_CSV:-$TROKENS_PT_DATA/few_shot_info/sav_point_tracking.
 SPLITS="${SPLITS:-train test}"
 CLUSTERING_METHOD="${CLUSTERING_METHOD:-bipartite}"
 FPS="${FPS:-10}"
+SEMANTIC_FEAT_EXTRACTOR="${SEMANTIC_FEAT_EXTRACTOR:-dino}"
 
 prepare_args=(
   "$REPO_ROOT/tools/prepare_sav_point_tracking_csv.py"
@@ -29,6 +30,7 @@ track_args=(
   --clustering_method "$CLUSTERING_METHOD"
   --csv_path "$TRACKING_CSV"
   --base_feat_path "$TROKENS_PT_DATA"
+  --semantic_feat_extractor "$SEMANTIC_FEAT_EXTRACTOR"
   --continue_on_error
   --failure_csv "$TROKENS_PT_DATA/few_shot_info/sav_point_tracking_failures.csv"
 )

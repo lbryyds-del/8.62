@@ -24,7 +24,7 @@ import numpy as np
 from einops import rearrange
 import pandas as pd
 from utils import convert_points_for_tracking, save_video
-from feat_extractor import feature_extract
+from feat_extractor import VALID_MODEL_TYPES, feature_extract
 from get_semantic_points import get_points_from_clustering
 from new_video_loader import load_video_pyvideo_reader
 from omni_vis import vis_trail
@@ -79,7 +79,7 @@ def extract_points(args, cotracker, feat_extractor, video_path, ds_dump_path,
     Returns:
         bool: True if the points were extracted, False otherwise
     """
-    # load video for DINO feat extractor
+    # load video for semantic feature extraction
     vid_name = video_path.split('/')[-1].split('.')[0]
     debug_vis_dump_root = os.path.join(ds_dump_path, 'debug_vis', vid_name)
     feat_dump_path = os.path.join(ds_dump_path, 'feat_dump', f'{vid_name}.pkl')
@@ -196,6 +196,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--base_feat_path", type=str, default=BASE_PATH,
                         help="Base path for feature dumps")
+    parser.add_argument(
+        "--semantic_feat_extractor",
+        type=str,
+        default="dino",
+        choices=sorted(VALID_MODEL_TYPES),
+        help="Semantic feature extractor used before clustering",
+    )
 
     parser.add_argument("--make_vis", action="store_true",
                         help="Make gifs")
@@ -231,6 +238,8 @@ if __name__ == "__main__":
         dump_name += f'_m{args.merge_ratio}_i{args.num_iters}'
     if use_connected_components:
         dump_name += '_concomp'
+    if args.semantic_feat_extractor == "clip_vit_b16":
+        dump_name += '_feat_clip_vitb16'
     if args.fps is not None:
         dump_name += f'_fps_{args.fps}'
 
@@ -243,7 +252,7 @@ if __name__ == "__main__":
         trust_repo=True,
         skip_validation=True,
     ).to(device)
-    feat_extractor = feature_extract()
+    feat_extractor = feature_extract(model_type=args.semantic_feat_extractor)
     failures = []
     total_videos = len(df)
     for video_index, vid_info_row in df.iterrows():

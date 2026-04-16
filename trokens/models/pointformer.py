@@ -28,7 +28,8 @@ class Pointformer(nn.Module):
         super().__init__()
         self.img_size = cfg.DATA.TRAIN_CROP_SIZE
         # self.patch_size = cfg.MF.PATCH_SIZE
-        if cfg.MODEL.FEAT_EXTRACTOR == "dino":
+        self.feat_extractor_type = cfg.MODEL.FEAT_EXTRACTOR
+        if self.feat_extractor_type == "dino":
             dino_config  = cfg.MODEL.DINO_CONFIG
             vit_mode = dino_config.split("_")[1]
             if 'vits' in vit_mode:
@@ -44,6 +45,9 @@ class Pointformer(nn.Module):
             else:
                 raise NotImplementedError("Only supports ViT-B and ViT-S for DINO")
             self.patch_size = int(vit_mode.replace(vit_type, ""))
+        elif self.feat_extractor_type == "clip_vit_b16":
+            self.embed_dim = 768
+            self.patch_size = 16
         else:
             raise NotImplementedError('Feature extractor not implemented')
 
@@ -147,10 +151,10 @@ class Pointformer(nn.Module):
         else:
             self.head = (nn.Linear(self.embed_dim, self.num_classes)
                 if self.num_classes > 0 else nn.Identity())
-        self.dino_num_patch_side = 224 // self.patch_size
+        self.patch_num_side = 224 // self.patch_size
         self.spatial_pos_embed = nn.Parameter(
-            torch.zeros(1, self.embed_dim, self.dino_num_patch_side,
-                                                        self.dino_num_patch_side))
+            torch.zeros(1, self.embed_dim, self.patch_num_side,
+                                                        self.patch_num_side))
 
         trunc_normal_(self.spatial_pos_embed, std=.02)
         if cfg.MODEL.FEAT_EXTRACTOR == 'resnet':
@@ -175,7 +179,7 @@ class Pointformer(nn.Module):
         # Initialize weights
         self.init_weights()
         self.apply(self._init_weights)
-        if cfg.MODEL.FEAT_EXTRACTOR == "dino":
+        if self.feat_extractor_type == "dino":
             dino_config  = cfg.MODEL.DINO_CONFIG
             torch_home = os.environ.get("TORCH_HOME", os.path.join(os.getcwd(), ".torch-cache"))
             os.environ.setdefault("TORCH_HOME", torch_home)
@@ -197,7 +201,14 @@ class Pointformer(nn.Module):
             # Set all DINO parameters to not require gradients
             for param in self.dino.parameters():
                 param.requires_grad = False
+        elif self.feat_extractor_type == "clip_vit_b16":
+            import clip
 
+            clip_model, _ = clip.load("ViT-B/16", device="cuda", jit=False)
+            self.clip_visual = clip_model.visual
+            self.clip_visual.cuda()
+            for param in self.clip_visual.parameters():
+                param.requires_grad = False
         else:
             raise NotImplementedError('Feature extractor not implemented')
 
@@ -298,10 +309,47 @@ class Pointformer(nn.Module):
         feat = self.feat_dict['dino'][:, self.dino.num_register_tokens + 1 :]
         feat_size = feat.shape[-1]
         #dino patch side is fine
-        feat = feat.view(batch_size, num_frames, self.dino_num_patch_side,
-                         self.dino_num_patch_side, feat_size)
+        feat = feat.view(batch_size, num_frames, self.patch_num_side,
+                         self.patch_num_side, feat_size)
 
         return feat
+
+    def get_clip_features(self, x):
+        """Get CLIP ViT-B/16 patch features."""
+        self.clip_visual.eval()
+        batch_size, num_frames, channel, height, width = x.shape
+        x = x.view(-1, channel, height, width)
+        x = x.type(self.clip_visual.conv1.weight.dtype)
+        if self.cfg.MODEL.TRAIN_BACKBONE:
+            feat = self._forward_clip_visual(x)
+        else:
+            with torch.no_grad():
+                feat = self._forward_clip_visual(x)
+        feat = feat.float()
+        feat = feat.view(batch_size, num_frames, self.patch_num_side,
+                         self.patch_num_side, feat.shape[-1])
+        return feat
+
+    def _forward_clip_visual(self, x):
+        """Return raw CLIP patch tokens before ln_post/proj."""
+        visual = self.clip_visual
+        x = visual.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        cls_token = visual.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0],
+            1,
+            x.shape[-1],
+            dtype=x.dtype,
+            device=x.device,
+        )
+        x = torch.cat([cls_token, x], dim=1)
+        x = x + visual.positional_embedding.to(x.dtype)
+        x = visual.ln_pre(x)
+        x = x.permute(1, 0, 2)
+        x = visual.transformer(x)
+        x = x.permute(1, 0, 2)
+        return x[:, 1:, :]
 
 
     def pt_forward(self, x, metadata):
@@ -409,13 +457,17 @@ class Pointformer(nn.Module):
                                             int(self.num_patches**0.5),
                                             embed_dim).to(x.device)
             else:
-                if self.cfg.MODEL.FEAT_EXTRACTOR == "dino":
+                if self.feat_extractor_type == "dino":
                     feat_to_use = self.get_dino_features(x)
                     if self.cfg.POINT_INFO.USE_CORRELATION:
                         # for ablation study without point tracking module
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)
-
+                elif self.feat_extractor_type == "clip_vit_b16":
+                    feat_to_use = self.get_clip_features(x)
+                    if self.cfg.POINT_INFO.USE_CORRELATION:
+                        new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
+                        metadata.update(new_metadata)
                 else:
                     raise NotImplementedError('Feature extractor not implemented')
 
@@ -548,10 +600,14 @@ def get_points_using_correlation(cfg, features):
     extra_indices = torch.arange(max_indices.shape[-1]).to(max_indices.device)
     extra_indices = extra_indices.unsqueeze(0).unsqueeze(0).expand(max_indices.shape[0], -1, -1)
     max_indices = torch.cat([extra_indices, max_indices], dim=1)
-    if cfg.MODEL.DINO_CONFIG=="dinov2_vitb14":
+    if cfg.MODEL.FEAT_EXTRACTOR == "dino" and cfg.MODEL.DINO_CONFIG == "dinov2_vitb14":
         grid_points = create_normalized_grid(image_size=224, grid_size=16)
+    elif cfg.MODEL.FEAT_EXTRACTOR == "clip_vit_b16":
+        grid_points = create_normalized_grid(image_size=224, grid_size=14)
     else:
-        raise NotImplementedError(f'Grid points dim not set for {cfg.MODEL.DINO_CONFIG}')
+        raise NotImplementedError(
+            f'Grid points dim not set for extractor {cfg.MODEL.FEAT_EXTRACTOR}'
+        )
     grid_points = grid_points.to(max_indices.device)
     grid_points = rearrange(grid_points, 'n d -> 1 1 n d')
     grid_points = repeat(grid_points, '1 1 n d -> b t n d', b=bs, t=num_frames)

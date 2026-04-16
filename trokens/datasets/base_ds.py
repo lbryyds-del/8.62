@@ -82,7 +82,7 @@ class BaseDataset(torch.utils.data.Dataset):
             self.aug = True
             if self.cfg.AUG.RE_PROB > 0:
                 self.rand_erase = True
-        if self.cfg.MODEL.FEAT_EXTRACTOR in ['dino', 'resnet', 'vit', 'conv']:
+        if self.cfg.MODEL.FEAT_EXTRACTOR in ['dino', 'clip_vit_b16', 'resnet', 'vit', 'conv']:
 
             self.data_mean = [ 0.48145466, 0.4578275, 0.40821073]
             self.data_std = [0.26862954, 0.26130258, 0.27577711]

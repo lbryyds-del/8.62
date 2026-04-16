@@ -14,7 +14,7 @@ FEW_SHOT:
   TRAIN_OG_EPISODES: True
 
 POINT_INFO:
-  NAME: cotracker3_bip_fr_32_fps_10
+  NAME: cotracker3_bip_fr_32_feat_clip_vitb16_fps_10
   PT_FIX_SAMPLING_TRAIN: True
   PT_FIX_SAMPLING_TEST: True
   USE_PT_QUERY_MASK: True
@@ -82,7 +82,7 @@ MODEL:
   ARCH: slow
   MODEL_NAME: Pointformer
   LOSS_FUNC: bce_logit
-  FEAT_EXTRACTOR: dino
+  FEAT_EXTRACTOR: clip_vit_b16
   DINO_CONFIG: dinov2_vitb14
   VIT_TYPE: None
   RESNET_TYPE: None

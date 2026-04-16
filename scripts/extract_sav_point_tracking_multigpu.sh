@@ -14,6 +14,7 @@ GPUS="${GPUS:-0 1 2 3 4 5}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 CLUSTERING_METHOD="${CLUSTERING_METHOD:-bipartite}"
 FPS="${FPS:-10}"
+SEMANTIC_FEAT_EXTRACTOR="${SEMANTIC_FEAT_EXTRACTOR:-dino}"
 
 read -r -a gpu_args <<< "$GPUS"
 expanded_gpu_args=()
@@ -65,6 +66,7 @@ for shard_id in "${!gpu_args[@]}"; do
     --clustering_method "$CLUSTERING_METHOD"
     --csv_path "$shard_csv"
     --base_feat_path "$TROKENS_PT_DATA"
+    --semantic_feat_extractor "$SEMANTIC_FEAT_EXTRACTOR"
     --continue_on_error
     --failure_csv "$LOG_DIR/failures_shard_$(printf "%02d" "$shard_id").csv"
   )

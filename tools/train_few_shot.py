@@ -101,7 +101,7 @@ def count_parameters(model):
     count = 0
     for name, param in model.named_parameters():
         if param.requires_grad:
-            if 'dino' in name or 'resnet' in name:
+            if 'dino' in name or 'clip' in name or 'resnet' in name:
                 print(name)
                 continue
             count += param.numel()
