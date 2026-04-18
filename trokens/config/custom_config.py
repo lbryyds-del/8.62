@@ -30,6 +30,11 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.TRAIN_OG_EPISODES = False
     cfg.FEW_SHOT.CLASS_LOSS_LAMBDA = 1.0
     cfg.FEW_SHOT.Q2S_LOSS_LAMBDA = 1.0
+    cfg.FEW_SHOT.TEXT_CLUSTER = CfgNode()
+    cfg.FEW_SHOT.TEXT_CLUSTER.ENABLE = False
+    cfg.FEW_SHOT.TEXT_CLUSTER.TOP_M = 3
+    cfg.FEW_SHOT.TEXT_CLUSTER.TAU = 0.07
+    cfg.FEW_SHOT.TEXT_CLUSTER.PROMPT_BANK_PATH = ""
 
     # point info config
     cfg.POINT_INFO = CfgNode()

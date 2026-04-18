@@ -13,11 +13,14 @@ from einops import rearrange
 from few_shot_multilabel import (
     compute_base_novel_hm,
     empty_ap_storage,
+    episode_labels_from_global,
+    get_episode_class_ids,
     is_multilabel_episode,
     mean_or_nan,
     merge_ap_storage,
     multilabel_top1_accuracy,
     support_query_split_multilabel,
+    support_query_split_multilabel_conditioned,
     update_ap_storage,
 )
 import trokens.utils.checkpoint as cu
@@ -224,16 +227,39 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
             inputs, labels, meta = misc.iter_to_cuda([inputs, labels, meta])
 
         val_meter.data_toc()
+        if is_multilabel_episode(cfg, labels, meta):
+            meta['support_mask'] = torch.as_tensor(
+                np.array(meta['sample_type']) == 'support',
+                device=labels.device,
+                dtype=torch.bool,
+            )
+            episode_class_ids = get_episode_class_ids(meta, labels.device)
+            meta['episode_positive_labels'] = episode_labels_from_global(
+                labels.to(labels.device),
+                episode_class_ids,
+            )
         input_dict = {'video':inputs, 'metadata':meta}
         # for few shot, patch tokens are also returning
-        preds, patch_tokens = model(input_dict)
+        model_out = model(input_dict)
+        if isinstance(model_out, tuple) and len(model_out) == 3:
+            preds, patch_tokens, few_shot_aux = model_out
+        else:
+            preds, patch_tokens = model_out
+            few_shot_aux = None
         if isinstance(preds, tuple):
             preds, _ = preds
 
         multilabel_episode = is_multilabel_episode(cfg, labels, meta)
         if multilabel_episode:
-            patch_support_query_dict = support_query_split_multilabel(
+            base_support_query_dict = support_query_split_multilabel(
                 patch_tokens, labels, meta)
+            if few_shot_aux is not None:
+                patch_support_query_dict = support_query_split_multilabel_conditioned(
+                    base_support_query_dict,
+                    few_shot_aux,
+                )
+            else:
+                patch_support_query_dict = base_support_query_dict
         else:
             patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
         patch_q2s_logits = process_patch_tokens(

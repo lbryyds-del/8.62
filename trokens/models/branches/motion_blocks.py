@@ -22,7 +22,11 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-def cross_patch_motion_v1_allneighbors(point_trajs_gt_coord, point_trajs_visibility_mask):
+def cross_patch_motion_v1_allneighbors(
+    point_trajs_gt_coord,
+    point_trajs_visibility_mask,
+    point_selection_mask=None,
+):
     """
     Computes cross-patch motion features for each spatio-temporal tokens.
 
@@ -67,6 +71,13 @@ def cross_patch_motion_v1_allneighbors(point_trajs_gt_coord, point_trajs_visibil
     distances_relative = distances_relative * vis_mask_pair.unsqueeze(-1)
 
     # (B, M, T, M, 2) -> (B, M, T, D)
+    if point_selection_mask is not None:
+        point_selection_mask = point_selection_mask.to(distances_relative.device).float()
+        center_selection = point_selection_mask.unsqueeze(2).unsqueeze(3)
+        neighbor_selection = point_selection_mask.unsqueeze(1).unsqueeze(2)
+        distances_relative = distances_relative * center_selection.unsqueeze(-1)
+        distances_relative = distances_relative * neighbor_selection.unsqueeze(-1)
+
     feature_dim = num_points * 2
     cross_path_motion_fea = distances_relative.reshape(batch_size, num_points,
                                                         temporal_len, feature_dim)
@@ -99,7 +110,12 @@ class CrossMotionModule(nn.Module):
         print('verbose...CrossMotionModules')
 
 
-    def forward(self, point_trajs_gt_coord, point_trajs_visibility_mask):
+    def forward(
+        self,
+        point_trajs_gt_coord,
+        point_trajs_visibility_mask,
+        point_selection_mask=None,
+    ):
         '''
         Args:
         point_trajs_gt_coord: Tensor of shape (B, T, M, 2) -> M trajectories point coordinates,
@@ -134,7 +150,10 @@ class CrossMotionModule(nn.Module):
 
       ########## self motion delta within a trajectory
         point_trajs_delta_coords_full = cross_patch_motion_v1_allneighbors(
-            point_trajs_gt_coord, point_trajs_visibility_mask)
+            point_trajs_gt_coord,
+            point_trajs_visibility_mask,
+            point_selection_mask=point_selection_mask,
+        )
         selfmotion_feas = self.ln2(
                     self.fc2(point_trajs_delta_coords_full))
         motion_out_feas = rearrange(selfmotion_feas, 'b m t d -> b t m d')

@@ -158,6 +158,8 @@ class BaseDataset(torch.utils.data.Dataset):
         pt_dict = pickle.load(open(feat_path, 'rb'))
         pred_tracks = pt_dict['pred_tracks'].squeeze(0)
         pred_visibility = pt_dict['pred_visibility'].squeeze(0)
+        obj_ids = pt_dict[self.cfg.POINT_INFO.OBJ_ID_KEY].clone().long()
+        point_indices = torch.arange(pred_tracks.shape[1], dtype=torch.long)
         if 'per_point_queries' in pt_dict:
             per_point_queries = pt_dict['per_point_queries']
         else:
@@ -220,16 +222,22 @@ class BaseDataset(torch.utils.data.Dataset):
             pred_tracks_to_take = pred_tracks[:, filtered_points]
             pred_visibility_to_take = pred_visibility[:, filtered_points]
             per_point_queries_to_take = per_point_queries[filtered_points]
+            obj_ids_to_take = obj_ids[filtered_points]
+            point_indices_to_take = point_indices[filtered_points]
         else:
             pred_tracks_to_take = pred_tracks
             pred_visibility_to_take = pred_visibility
             per_point_queries_to_take = per_point_queries
+            obj_ids_to_take = obj_ids
+            point_indices_to_take = point_indices
             filtered_points = np.ones(num_points, dtype=bool)
 
         if pred_tracks_to_take.shape[1] == self.cfg.POINT_INFO.NUM_POINTS_TO_SAMPLE:
             pred_tracks = pred_tracks_to_take
             pred_visibility = pred_visibility_to_take
             per_point_queries = per_point_queries_to_take
+            obj_ids = obj_ids_to_take
+            point_indices = point_indices_to_take
 
 
         else:
@@ -249,6 +257,10 @@ class BaseDataset(torch.utils.data.Dataset):
                                         dim=1)
             per_point_queries = np.concatenate([per_point_queries_to_take,
                                                 per_point_queries[random_indices]])
+            obj_ids = torch.cat([obj_ids_to_take, obj_ids[random_indices]], dim=0)
+            point_indices = torch.cat(
+                [point_indices_to_take, point_indices[random_indices]], dim=0
+            )
 
         pt_query_mask = torch.ones_like(pred_visibility, dtype=torch.bool)
 
@@ -291,6 +303,8 @@ class BaseDataset(torch.utils.data.Dataset):
         metadata['pred_tracks'] = pt_to_take
         metadata['pred_visibility'] = pred_visibility
         metadata['pred_query_mask'] = pt_query_mask
+        metadata['obj_ids'] = obj_ids
+        metadata['point_indices'] = point_indices
 
         metadata['video_name'] = self._video_names[index]
         metadata['batch_label'] = batch_label

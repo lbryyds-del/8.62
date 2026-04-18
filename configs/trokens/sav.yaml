@@ -11,7 +11,12 @@ FEW_SHOT:
   TEST_EPISODES: 10000
   PATCH_TOKENS_AGG: spatial
   DIST_NORM: none
-  TRAIN_OG_EPISODES: True
+  TRAIN_OG_EPISODES: False
+  TEXT_CLUSTER:
+    ENABLE:   False
+    TOP_M: 3
+    TAU: 0.07
+    PROMPT_BANK_PATH: data/sav/clip_label_prompt_bank.json
 
 POINT_INFO:
   NAME: cotracker3_bip_fr_32_feat_clip_vitb16_fps_10
