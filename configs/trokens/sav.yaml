@@ -19,7 +19,7 @@ FEW_SHOT:
     PROMPT_BANK_PATH: data/sav/clip_label_prompt_bank.json
 
 POINT_INFO:
-  NAME: cotracker3_bip_fr_32_feat_clip_vitb16_fps_10
+  NAME: cotracker3_bip_fr_32_feat_dinotxt_vitl14reg4_fps_10
   PT_FIX_SAMPLING_TRAIN: True
   PT_FIX_SAMPLING_TEST: True
   USE_PT_QUERY_MASK: True
@@ -33,7 +33,9 @@ TRAIN:
   BATCH_SIZE: 32
   EVAL_PERIOD: 1
   CHECKPOINT_PERIOD: 1
-  AUTO_RESUME: True
+  AUTO_RESUME: False
+  CHECKPOINT_FILE_PATH: output/sav/checkpoints/checkpoint_epoch_00012.pyth
+  NEW_TRAIN: False
   MIXED_PRECISION: True
 
 DATA:
@@ -87,8 +89,8 @@ MODEL:
   ARCH: slow
   MODEL_NAME: Pointformer
   LOSS_FUNC: bce_logit
-  FEAT_EXTRACTOR: clip_vit_b16
-  DINO_CONFIG: dinov2_vitb14
+  FEAT_EXTRACTOR: dinotxt_vitl14_reg4
+  DINO_CONFIG: None
   VIT_TYPE: None
   RESNET_TYPE: None
   MOTION_MODULE:

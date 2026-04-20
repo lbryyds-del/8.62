@@ -1,3 +1,6 @@
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -5,7 +8,7 @@ from torchvision import transforms
 from einops import rearrange
 from clustering import TorchKMeansVectorizedCluster
 
-VALID_MODEL_TYPES = {"dino", "clip_vit_b16"}
+VALID_MODEL_TYPES = {"dino", "clip_vit_b16", "dinotxt_vitl14_reg4"}
 
 class feature_extract(nn.Module):
     def __init__(self, model_type="dino"):
@@ -19,10 +22,71 @@ class feature_extract(nn.Module):
                                    else "cpu")
         self.dinov2 = None
         self.clip_model = None
+        self.dinotxt_visual_model = None
         self.dino_transform = None
         self.clip_transform = None
+        self.dinotxt_transform = None
 
         self._load_model(model_type)
+
+    @staticmethod
+    def _build_dino_style_transform():
+        return transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+
+    def _load_dinotxt_visual_model(self):
+        hub_repo = Path(torch.hub.get_dir()) / "facebookresearch_dinov2_main"
+        if not hub_repo.exists():
+            torch.hub.load(
+                'facebookresearch/dinov2',
+                'dinov2_vits14',
+                trust_repo=True,
+                skip_validation=True,
+            )
+            hub_repo = Path(torch.hub.get_dir()) / "facebookresearch_dinov2_main"
+        if not hub_repo.exists():
+            raise FileNotFoundError(
+                f"Could not locate the cached DINOv2 hub repo at {hub_repo}."
+            )
+
+        hub_repo_str = str(hub_repo)
+        if hub_repo_str not in sys.path:
+            sys.path.insert(0, hub_repo_str)
+
+        from dinov2.hub.backbones import dinov2_vitl14_reg
+        from dinov2.hub.text.dinov2_wrapper import DINOv2Wrapper
+        from dinov2.hub.text.vision_tower import VisionTower
+        from dinov2.hub.utils import _DINOV2_BASE_URL
+
+        visual_model = VisionTower(
+            backbone=DINOv2Wrapper(dinov2_vitl14_reg()),
+            freeze_backbone=True,
+            embed_dim=2048,
+            num_head_blocks=2,
+            head_blocks_block_drop_path=0.3,
+            use_class_token=True,
+            use_patch_tokens=True,
+            patch_token_layer=1,
+            patch_tokens_pooler_type="mean",
+            use_linear_projection=False,
+        )
+        vision_head_state_dict = torch.hub.load_state_dict_from_url(
+            _DINOV2_BASE_URL
+            + "/dinov2_vitl14/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth",
+            map_location="cpu",
+        )
+        visual_model.head.load_state_dict(vision_head_state_dict, strict=True)
+        visual_model.to(self.device)
+        visual_model.eval()
+        for param in visual_model.parameters():
+            param.requires_grad = False
+        return visual_model
 
     def _load_model(self, model_type):
         if model_type == "dino":
@@ -34,14 +98,7 @@ class feature_extract(nn.Module):
             )
             self.dinov2.to(self.device)
             self.dinov2.eval()
-            self.dino_transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225],
-                ),
-            ])
+            self.dino_transform = self._build_dino_style_transform()
         elif model_type == "clip_vit_b16":
             import clip
             self.clip_model, self.clip_transform = clip.load(
@@ -50,6 +107,9 @@ class feature_extract(nn.Module):
                 jit=False,
             )
             self.clip_model.eval()
+        elif model_type == "dinotxt_vitl14_reg4":
+            self.dinotxt_visual_model = self._load_dinotxt_visual_model()
+            self.dinotxt_transform = self._build_dino_style_transform()
         else:
             raise ValueError(f"Invalid model type: {model_type}")
 
@@ -89,13 +149,18 @@ class feature_extract(nn.Module):
         x = x.permute(1, 0, 2)
         return x[:, 1:, :]
 
+    def _get_dinotxt_patch_tokens(self, frames):
+        x = self._process_frames(frames, self.dinotxt_transform).to(self.device)
+        _, patch_tokens = self.dinotxt_visual_model.get_class_and_patch_tokens(x)
+        return patch_tokens
+
 
     @torch.no_grad()
     def forward(self, frames, model_type=None):
         """
         Args:
             frames: numpy array of shape (bs, num_frames, height, width, channel).
-            model_type: one of 'dino' or 'clip_vit_b16'
+            model_type: one of 'dino', 'clip_vit_b16', or 'dinotxt_vitl14_reg4'
         """
         batch_size, num_frames, _, _, _ = frames.shape
         model_type = model_type or self.model_type
@@ -109,6 +174,8 @@ class feature_extract(nn.Module):
             feat = self._get_dino_features(frames)
         elif model_type == "clip_vit_b16":
             feat = self._get_clip_patch_tokens(frames)
+        elif model_type == "dinotxt_vitl14_reg4":
+            feat = self._get_dinotxt_patch_tokens(frames)
         else:
             raise ValueError(f"Invalid model type: {model_type}")
 

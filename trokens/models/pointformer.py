@@ -1,8 +1,10 @@
 """Pointformer model."""
 import os
+import sys
 import json
 from functools import partial
 from collections import OrderedDict
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -49,6 +51,9 @@ class Pointformer(nn.Module):
         elif self.feat_extractor_type == "clip_vit_b16":
             self.embed_dim = 768
             self.patch_size = 16
+        elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
+            self.embed_dim = 1024
+            self.patch_size = 14
         else:
             raise NotImplementedError('Feature extractor not implemented')
 
@@ -230,6 +235,8 @@ class Pointformer(nn.Module):
                     prompt_embeddings,
                     persistent=False,
                 )
+        elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
+            self.dinotxt_visual_model = self._load_dinotxt_visual_model()
         else:
             raise NotImplementedError('Feature extractor not implemented')
 
@@ -339,6 +346,101 @@ class Pointformer(nn.Module):
                 class_embedding = F.normalize(prompt_features.mean(dim=0), dim=-1)
                 text_embeddings.append(class_embedding.unsqueeze(0))
         return torch.cat(text_embeddings, dim=0)
+
+    def _torchhub_dirs(self):
+        """Return candidate torch hub dirs for cached DINOv2 assets."""
+        candidates = [
+            Path(torch.hub.get_dir()),
+            Path(os.getcwd()) / ".torch-cache" / "hub",
+            Path.home() / ".cache" / "torch" / "hub",
+        ]
+        unique_candidates = []
+        for candidate in candidates:
+            if candidate not in unique_candidates:
+                unique_candidates.append(candidate)
+        return unique_candidates
+
+    def _find_torchhub_checkpoint(self, filename):
+        """Find a non-empty checkpoint in known torch hub cache dirs."""
+        for hub_dir in self._torchhub_dirs():
+            checkpoint_path = hub_dir / "checkpoints" / filename
+            if checkpoint_path.exists() and checkpoint_path.stat().st_size > 0:
+                return checkpoint_path
+        return None
+
+    def _find_dinov2_hub_repo(self):
+        """Find or populate the cached DINOv2 hub repository."""
+        for hub_dir in self._torchhub_dirs():
+            hub_repo = hub_dir / "facebookresearch_dinov2_main"
+            if hub_repo.exists():
+                return hub_repo
+
+        torch.hub.load(
+            "facebookresearch/dinov2",
+            "dinov2_vits14",
+            trust_repo=True,
+            skip_validation=True,
+        )
+        for hub_dir in self._torchhub_dirs():
+            hub_repo = hub_dir / "facebookresearch_dinov2_main"
+            if hub_repo.exists():
+                return hub_repo
+        raise FileNotFoundError("Could not locate the cached DINOv2 hub repository.")
+
+    def _load_dinotxt_visual_model(self):
+        """Load the DinoTxt visual tower without loading the text encoder."""
+        hub_repo = self._find_dinov2_hub_repo()
+        hub_repo_str = str(hub_repo)
+        if hub_repo_str not in sys.path:
+            sys.path.insert(0, hub_repo_str)
+
+        from dinov2.hub.backbones import dinov2_vitl14_reg
+        from dinov2.hub.text.dinov2_wrapper import DINOv2Wrapper
+        from dinov2.hub.text.vision_tower import VisionTower
+        from dinov2.hub.utils import _DINOV2_BASE_URL
+
+        backbone_checkpoint = self._find_torchhub_checkpoint(
+            "dinov2_vitl14_reg4_pretrain.pth"
+        )
+        if backbone_checkpoint is not None:
+            backbone = dinov2_vitl14_reg(weights=str(backbone_checkpoint))
+        else:
+            backbone = dinov2_vitl14_reg()
+
+        visual_model = VisionTower(
+            backbone=DINOv2Wrapper(backbone),
+            freeze_backbone=True,
+            embed_dim=2048,
+            num_head_blocks=2,
+            head_blocks_block_drop_path=0.3,
+            use_class_token=True,
+            use_patch_tokens=True,
+            patch_token_layer=1,
+            patch_tokens_pooler_type="mean",
+            use_linear_projection=False,
+        )
+
+        vision_head_checkpoint = self._find_torchhub_checkpoint(
+            "dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth"
+        )
+        if vision_head_checkpoint is not None:
+            vision_head_state_dict = torch.load(
+                vision_head_checkpoint,
+                map_location="cpu",
+            )
+        else:
+            vision_head_state_dict = torch.hub.load_state_dict_from_url(
+                _DINOV2_BASE_URL
+                + "/dinov2_vitl14/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_vision_head.pth",
+                map_location="cpu",
+            )
+
+        visual_model.head.load_state_dict(vision_head_state_dict, strict=True)
+        visual_model.cuda()
+        visual_model.eval()
+        for param in visual_model.parameters():
+            param.requires_grad = False
+        return visual_model
 
     def _sample_point_features(self, feat_to_use, pred_tracks, add_pt_pos_embed=False):
         """Sample point features from a dense patch feature map."""
@@ -723,6 +825,25 @@ class Pointformer(nn.Module):
         projected_patch = (visual.ln_post(x) @ visual.proj)[:, 1:, :]
         return raw_patch, projected_patch
 
+    def get_dinotxt_features(self, x):
+        """Get DinoTxt ViT-L/14 visual patch features."""
+        self.dinotxt_visual_model.eval()
+        batch_size, num_frames, channel, height, width = x.shape
+        x = x.view(-1, channel, height, width)
+        if self.cfg.MODEL.TRAIN_BACKBONE:
+            _, patch_tokens = self.dinotxt_visual_model.get_class_and_patch_tokens(x)
+        else:
+            with torch.no_grad():
+                _, patch_tokens = self.dinotxt_visual_model.get_class_and_patch_tokens(x)
+        patch_tokens = patch_tokens.float()
+        return patch_tokens.view(
+            batch_size,
+            num_frames,
+            self.patch_num_side,
+            self.patch_num_side,
+            patch_tokens.shape[-1],
+        )
+
 
     def pt_forward(self, x, metadata):
         """ Forward pass for point tracking based transformer model.
@@ -845,6 +966,11 @@ class Pointformer(nn.Module):
                         )
                     else:
                         feat_to_use = self.get_clip_features(x)
+                    if self.cfg.POINT_INFO.USE_CORRELATION:
+                        new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
+                        metadata.update(new_metadata)
+                elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
+                    feat_to_use = self.get_dinotxt_features(x)
                     if self.cfg.POINT_INFO.USE_CORRELATION:
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)
@@ -993,6 +1119,8 @@ def get_points_using_correlation(cfg, features):
         grid_points = create_normalized_grid(image_size=224, grid_size=16)
     elif cfg.MODEL.FEAT_EXTRACTOR == "clip_vit_b16":
         grid_points = create_normalized_grid(image_size=224, grid_size=14)
+    elif cfg.MODEL.FEAT_EXTRACTOR == "dinotxt_vitl14_reg4":
+        grid_points = create_normalized_grid(image_size=224, grid_size=16)
     else:
         raise NotImplementedError(
             f'Grid points dim not set for extractor {cfg.MODEL.FEAT_EXTRACTOR}'

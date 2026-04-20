@@ -14,7 +14,27 @@ GPUS="${GPUS:-0 1 2 3 4 5}"
 WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"
 CLUSTERING_METHOD="${CLUSTERING_METHOD:-bipartite}"
 FPS="${FPS:-10}"
-SEMANTIC_FEAT_EXTRACTOR="${SEMANTIC_FEAT_EXTRACTOR:-dino}"
+SAV_FEATURE_VERSION="${SAV_FEATURE_VERSION:-}"
+
+if [[ -n "${SEMANTIC_FEAT_EXTRACTOR:-}" ]]; then
+  SEMANTIC_FEAT_EXTRACTOR="${SEMANTIC_FEAT_EXTRACTOR}"
+else
+  case "${SAV_FEATURE_VERSION:-dino}" in
+    dino)
+      SEMANTIC_FEAT_EXTRACTOR="dino"
+      ;;
+    clip)
+      SEMANTIC_FEAT_EXTRACTOR="clip_vit_b16"
+      ;;
+    dinotxt)
+      SEMANTIC_FEAT_EXTRACTOR="dinotxt_vitl14_reg4"
+      ;;
+    *)
+      echo "Unsupported SAV_FEATURE_VERSION: ${SAV_FEATURE_VERSION}. Use dino, clip, or dinotxt." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 read -r -a gpu_args <<< "$GPUS"
 expanded_gpu_args=()

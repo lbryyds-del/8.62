@@ -240,6 +240,8 @@ if __name__ == "__main__":
         dump_name += '_concomp'
     if args.semantic_feat_extractor == "clip_vit_b16":
         dump_name += '_feat_clip_vitb16'
+    elif args.semantic_feat_extractor == "dinotxt_vitl14_reg4":
+        dump_name += '_feat_dinotxt_vitl14reg4'
     if args.fps is not None:
         dump_name += f'_fps_{args.fps}'
 
