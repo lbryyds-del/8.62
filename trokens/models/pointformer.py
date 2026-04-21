@@ -83,7 +83,7 @@ class Pointformer(nn.Module):
         self.use_text_conditioned_support = (
             cfg.TASK == 'few_shot'
             and cfg.DATA.MULTI_LABEL
-            and self.feat_extractor_type == "clip_vit_b16"
+            and self.feat_extractor_type in ("clip_vit_b16", "dinotxt_vitl14_reg4")
             and self.text_cluster_cfg.ENABLE
             and not cfg.MODEL.APPEARANCE_MODULE_DISABLE
         )
@@ -237,6 +237,18 @@ class Pointformer(nn.Module):
                 )
         elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
             self.dinotxt_visual_model = self._load_dinotxt_visual_model()
+            if self.use_text_conditioned_support:
+                self.dinotxt_text_model = self._load_dinotxt_text_model()
+                self.dinotxt_tokenizer = self._load_dinotxt_tokenizer()
+                prompt_bank_path = self._resolve_prompt_bank_path(
+                    self.text_cluster_cfg.PROMPT_BANK_PATH
+                )
+                prompt_embeddings = self._load_prompt_bank_embeddings(prompt_bank_path)
+                self.register_buffer(
+                    "text_cluster_prompt_embeddings",
+                    prompt_embeddings,
+                    persistent=False,
+                )
         else:
             raise NotImplementedError('Feature extractor not implemented')
 
@@ -329,10 +341,24 @@ class Pointformer(nn.Module):
             "Prompt bank path is not set and default SAV prompt bank was not found."
         )
 
-    def _load_prompt_bank_embeddings(self, prompt_bank_path):
-        """Load and encode the prompt bank into CLIP text space."""
+    def _load_prompt_bank(self, prompt_bank_path):
+        """Load the class prompt bank for text-conditioned cluster selection."""
         with open(prompt_bank_path, "r", encoding="utf-8") as handle:
-            prompt_bank = json.load(handle)
+            return json.load(handle)
+
+    def _load_prompt_bank_embeddings(self, prompt_bank_path):
+        """Load and encode the prompt bank into the active text-visual space."""
+        if self.feat_extractor_type == "clip_vit_b16":
+            return self._load_clip_prompt_bank_embeddings(prompt_bank_path)
+        if self.feat_extractor_type == "dinotxt_vitl14_reg4":
+            return self._load_dinotxt_prompt_bank_embeddings(prompt_bank_path)
+        raise NotImplementedError(
+            f"Text cluster is not supported for {self.feat_extractor_type}."
+        )
+
+    def _load_clip_prompt_bank_embeddings(self, prompt_bank_path):
+        """Load and encode the prompt bank into CLIP text space."""
+        prompt_bank = self._load_prompt_bank(prompt_bank_path)
         text_embeddings = []
         self.clip_model.eval()
         with torch.no_grad():
@@ -344,6 +370,24 @@ class Pointformer(nn.Module):
                 prompt_features = self.clip_model.encode_text(tokenized).float()
                 prompt_features = F.normalize(prompt_features, dim=-1)
                 class_embedding = F.normalize(prompt_features.mean(dim=0), dim=-1)
+                text_embeddings.append(class_embedding.unsqueeze(0))
+        return torch.cat(text_embeddings, dim=0)
+
+    def _load_dinotxt_prompt_bank_embeddings(self, prompt_bank_path):
+        """Load and encode the prompt bank into DinoTxt patch text space."""
+        prompt_bank = self._load_prompt_bank(prompt_bank_path)
+        text_embeddings = []
+        self.dinotxt_text_model.eval()
+        with torch.no_grad():
+            for class_id in range(self.num_classes):
+                prompts = prompt_bank.get(str(class_id))
+                if not prompts:
+                    raise KeyError(f"Missing prompt list for class id {class_id}")
+                tokenized = self.dinotxt_tokenizer.tokenize(prompts).cuda(non_blocking=True)
+                prompt_features = self.dinotxt_text_model(tokenized).float()
+                patch_prompt_features = prompt_features[:, prompt_features.shape[-1] // 2 :]
+                patch_prompt_features = F.normalize(patch_prompt_features, dim=-1)
+                class_embedding = F.normalize(patch_prompt_features.mean(dim=0), dim=-1)
                 text_embeddings.append(class_embedding.unsqueeze(0))
         return torch.cat(text_embeddings, dim=0)
 
@@ -387,12 +431,24 @@ class Pointformer(nn.Module):
                 return hub_repo
         raise FileNotFoundError("Could not locate the cached DINOv2 hub repository.")
 
-    def _load_dinotxt_visual_model(self):
-        """Load the DinoTxt visual tower without loading the text encoder."""
+    def _get_dinov2_hub_modules(self):
+        """Make DINOv2 hub modules importable and return the hub repo path."""
         hub_repo = self._find_dinov2_hub_repo()
         hub_repo_str = str(hub_repo)
         if hub_repo_str not in sys.path:
             sys.path.insert(0, hub_repo_str)
+        return hub_repo
+
+    def _download_torchhub_checkpoint(self, filename, url):
+        """Download a checkpoint-like asset into the active torch hub cache."""
+        target_path = Path(torch.hub.get_dir()) / "checkpoints" / filename
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.hub.download_url_to_file(url, str(target_path), progress=True)
+        return target_path
+
+    def _load_dinotxt_visual_model(self):
+        """Load the DinoTxt visual tower without loading the text encoder."""
+        self._get_dinov2_hub_modules()
 
         from dinov2.hub.backbones import dinov2_vitl14_reg
         from dinov2.hub.text.dinov2_wrapper import DINOv2Wrapper
@@ -441,6 +497,71 @@ class Pointformer(nn.Module):
         for param in visual_model.parameters():
             param.requires_grad = False
         return visual_model
+
+    def _load_dinotxt_text_model(self):
+        """Load the DinoTxt text tower for prompt embeddings."""
+        self._get_dinov2_hub_modules()
+
+        from dinov2.hub.text.text_tower import TextTower
+        from dinov2.hub.text.text_transformer import TextTransformer
+        from dinov2.hub.utils import _DINOV2_BASE_URL
+
+        text_backbone = TextTransformer(
+            context_length=77,
+            vocab_size=49408,
+            dim=1280,
+            num_heads=20,
+            num_layers=24,
+            ffn_ratio=4,
+            is_causal=True,
+            ls_init_value=None,
+            dropout_prob=0.0,
+        )
+        text_model = TextTower(
+            backbone=text_backbone,
+            freeze_backbone=False,
+            embed_dim=2048,
+            num_head_blocks=0,
+            head_blocks_is_causal=False,
+            head_blocks_block_drop_prob=0.0,
+            tokens_pooler_type="argmax",
+            use_linear_projection=True,
+        )
+
+        text_checkpoint = self._find_torchhub_checkpoint(
+            "dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth"
+        )
+        if text_checkpoint is not None:
+            text_state_dict = torch.load(text_checkpoint, map_location="cpu")
+        else:
+            text_state_dict = torch.hub.load_state_dict_from_url(
+                _DINOV2_BASE_URL
+                + "/dinov2_vitl14/dinov2_vitl14_reg4_dinotxt_tet1280d20h24l_text_encoder.pth",
+                map_location="cpu",
+            )
+
+        text_model.load_state_dict(text_state_dict, strict=True)
+        text_model.cuda()
+        text_model.eval()
+        for param in text_model.parameters():
+            param.requires_grad = False
+        return text_model
+
+    def _load_dinotxt_tokenizer(self):
+        """Load the DinoTxt tokenizer, caching the BPE vocabulary if needed."""
+        self._get_dinov2_hub_modules()
+
+        from dinov2.hub.text.tokenizer import Tokenizer
+        from dinov2.hub.utils import _DINOV2_BASE_URL
+
+        vocab_filename = "bpe_simple_vocab_16e6.txt.gz"
+        vocab_path = self._find_torchhub_checkpoint(vocab_filename)
+        if vocab_path is None:
+            vocab_path = self._download_torchhub_checkpoint(
+                vocab_filename,
+                _DINOV2_BASE_URL + f"/thirdparty/{vocab_filename}",
+            )
+        return Tokenizer(vocab_path=str(vocab_path))
 
     def _sample_point_features(self, feat_to_use, pred_tracks, add_pt_pos_embed=False):
         """Sample point features from a dense patch feature map."""
@@ -971,6 +1092,8 @@ class Pointformer(nn.Module):
                         metadata.update(new_metadata)
                 elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
                     feat_to_use = self.get_dinotxt_features(x)
+                    if self.use_text_conditioned_support:
+                        projected_feat_to_use = feat_to_use
                     if self.cfg.POINT_INFO.USE_CORRELATION:
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)

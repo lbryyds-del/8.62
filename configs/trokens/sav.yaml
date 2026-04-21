@@ -13,7 +13,7 @@ FEW_SHOT:
   DIST_NORM: none
   TRAIN_OG_EPISODES: False
   TEXT_CLUSTER:
-    ENABLE:   False
+    ENABLE:   True
     TOP_M: 3
     TAU: 0.07
     PROMPT_BANK_PATH: data/sav/clip_label_prompt_bank.json
@@ -34,8 +34,8 @@ TRAIN:
   EVAL_PERIOD: 1
   CHECKPOINT_PERIOD: 1
   AUTO_RESUME: False
-  CHECKPOINT_FILE_PATH: output/sav/checkpoints/checkpoint_epoch_00012.pyth
-  NEW_TRAIN: False
+  CHECKPOINT_FILE_PATH: ""
+  NEW_TRAIN: True
   MIXED_PRECISION: True
 
 DATA:

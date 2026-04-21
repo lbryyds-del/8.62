@@ -18,6 +18,21 @@ from trokens.utils.env import checkpoint_pathmgr as pathmgr
 logger = logging.get_logger(__name__)
 
 
+_CHECKPOINT_EXCLUDE_PREFIXES = (
+    "dinotxt_visual_model.",
+    "dinotxt_text_model.",
+)
+
+
+def _filter_checkpoint_state_dict(state_dict):
+    """Drop frozen external backbones that are reloaded from their source weights."""
+    return OrderedDict(
+        (key, value)
+        for key, value in state_dict.items()
+        if not key.startswith(_CHECKPOINT_EXCLUDE_PREFIXES)
+    )
+
+
 def make_checkpoint_dir(path_to_job):
     """
     Creates the checkpoint directory (if not present already).
@@ -71,6 +86,20 @@ def get_last_checkpoint(path_to_job):
     # Sort the checkpoints by epoch.
     name = sorted(names)[-1]
     return os.path.join(d, name)
+
+
+def get_best_checkpoint(path_to_job):
+    """
+    Get the checkpoint saved from the best validation metric.
+    """
+    return os.path.join(get_checkpoint_dir(path_to_job), "checkpoint_best.pyth")
+
+
+def has_best_checkpoint(path_to_job):
+    """
+    Determine if the best validation checkpoint exists.
+    """
+    return pathmgr.exists(get_best_checkpoint(path_to_job))
 
 
 def has_checkpoint(path_to_job):
@@ -127,7 +156,7 @@ def save_checkpoint(path_to_job, model, optimizer, epoch, cfg, scaler=None, best
     # Omit the DDP wrapper in the multi-gpu setting.
 
     sd = model.module.state_dict() if cfg.NUM_GPUS > 1 else model.state_dict()
-    normalized_sd = sub_to_normal_bn(sd)
+    normalized_sd = _filter_checkpoint_state_dict(sub_to_normal_bn(sd))
 
     # Record the state.
     checkpoint = {
@@ -503,8 +532,19 @@ def load_test_checkpoint(cfg, model):
             convert_from_caffe2=cfg.TEST.CHECKPOINT_TYPE == "caffe2",
             should_split_qkv = cfg.SPLIT_QKV_CHECKPOINT,
         )
+    elif has_best_checkpoint(cfg.OUTPUT_DIR):
+        best_checkpoint = get_best_checkpoint(cfg.OUTPUT_DIR)
+        logger.info(
+            "Loading best validation checkpoint for testing: %s",
+            best_checkpoint,
+        )
+        epoch = load_checkpoint(best_checkpoint, model, cfg.NUM_GPUS > 1)
     elif has_checkpoint(cfg.OUTPUT_DIR):
         last_checkpoint = get_last_checkpoint(cfg.OUTPUT_DIR)
+        logger.info(
+            "Best validation checkpoint not found. Loading last checkpoint for testing: %s",
+            last_checkpoint,
+        )
         epoch = load_checkpoint(last_checkpoint, model, cfg.NUM_GPUS > 1)
     elif cfg.TRAIN.CHECKPOINT_FILE_PATH != "":
         # If no checkpoint found in TEST.CHECKPOINT_FILE_PATH or in the current
