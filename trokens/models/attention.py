@@ -216,6 +216,26 @@ class TrajectoryAttentionBlock(nn.Module):
                                   use_mask=use_pt_visibility)
         else:
             raise NotImplementedError(f"Unsupported attention type {pt_attention}")
+        self.use_text_conditioning = (
+            cfg is not None
+            and cfg.TASK == 'few_shot'
+            and cfg.DATA.MULTI_LABEL
+            and cfg.MODEL.FEAT_EXTRACTOR in ("clip_vit_b16", "dinotxt_vitl14_reg4")
+            and cfg.FEW_SHOT.TEXT_CLUSTER.ENABLE
+            and not cfg.MODEL.APPEARANCE_MODULE_DISABLE
+        )
+        if self.use_text_conditioning:
+            self.text_query_norm = norm_layer(dim)
+            self.text_kv_norm = norm_layer(dim)
+            self.text_cross_attn = CrossAttention(
+                dim,
+                num_heads=num_heads,
+                qkv_bias=qkv_bias,
+                attn_drop=attn_drop,
+                proj_drop=drop,
+                use_mask=True,
+            )
+            self.text_cross_gamma = nn.Parameter(torch.tensor(0.1))
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         self.mlp = []
@@ -315,6 +335,149 @@ class TrajectoryAttentionBlock(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported attention type {self.pt_attention}")
 
+
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x, thw
+
+    def forward_text_conditioned(self, x, thw, pt_mask, text_tokens, text_mask):
+        """Forward pass with Time-SA -> text cross-attn -> Traj-SA."""
+        if not self.use_text_conditioning:
+            raise RuntimeError("Text-conditioned support branch is not enabled.")
+        if self.pt_attention != 'divided_space_time':
+            raise NotImplementedError(
+                f"Unsupported text-conditioned attention type {self.pt_attention}"
+            )
+
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            xt = x[:, 1:, :]
+            temporal_mask = pt_mask[:, 1:].clone()
+        else:
+            xt = x
+            temporal_mask = pt_mask.clone()
+        num_frames, height, width = thw
+        batch_size = x.shape[0]
+        spatial_mask = None
+
+        xt = rearrange(
+            xt,
+            'b (h w t) m -> (b h w) t m',
+            b=batch_size,
+            h=height,
+            w=width,
+            t=num_frames,
+        )
+        if self.use_pt_visibility:
+            temporal_mask = rearrange(
+                temporal_mask,
+                'b (h w t) -> (b h w) t',
+                b=batch_size,
+                h=height,
+                w=width,
+                t=num_frames,
+            )
+        res_temporal = self.drop_path(
+            self.temporal_attn(self.temporal_norm1(xt), temporal_mask)
+        )
+        res_temporal = rearrange(
+            res_temporal,
+            '(b h w) t m -> b (h w t) m',
+            b=batch_size,
+            h=height,
+            w=width,
+            t=num_frames,
+        )
+        res_temporal = self.temporal_fc(res_temporal)
+
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            xt = x[:, 1:, :] + res_temporal
+            init_cls_token = x[:, 0, :].unsqueeze(1)
+            cls_token = init_cls_token.repeat(1, num_frames, 1)
+            if self.use_pt_visibility:
+                intit_cls_pt_mask = pt_mask[:, 0].unsqueeze(1)
+                spatial_mask = pt_mask[:, 1:].clone()
+                intit_cls_pt_mask = intit_cls_pt_mask.repeat(1, num_frames)
+            cls_token = rearrange(
+                cls_token,
+                'b t m -> (b t) 1 m',
+                b=batch_size,
+                t=num_frames,
+            )
+        else:
+            xt = x + res_temporal
+            if self.use_pt_visibility:
+                spatial_mask = pt_mask.clone()
+
+        text_delta = self.drop_path(
+            self.text_cross_attn(
+                self.text_kv_norm(text_tokens),
+                self.text_query_norm(xt),
+                text_mask,
+            )
+        )
+        xt = xt + self.text_cross_gamma * text_delta
+
+        xs = rearrange(
+            xt,
+            'b (h w t) m -> (b t) (h w) m',
+            b=batch_size,
+            h=height,
+            w=width,
+            t=num_frames,
+        )
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            xs = torch.cat((cls_token, xs), 1)
+            if self.use_pt_visibility:
+                intit_cls_pt_mask = rearrange(
+                    intit_cls_pt_mask,
+                    'b t -> (b t) 1',
+                    b=batch_size,
+                    t=num_frames,
+                )
+                spatial_mask = rearrange(
+                    spatial_mask,
+                    'b (h w t) -> (b t) (h w)',
+                    b=batch_size,
+                    h=height,
+                    w=width,
+                    t=num_frames,
+                )
+                spatial_mask = torch.cat((intit_cls_pt_mask, spatial_mask), 1)
+        elif self.use_pt_visibility:
+            spatial_mask = rearrange(
+                spatial_mask,
+                'b (h w t) -> (b t) (h w)',
+                b=batch_size,
+                h=height,
+                w=width,
+                t=num_frames,
+            )
+
+        res_spatial = self.drop_path(self.attn(self.norm1(xs), spatial_mask))
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            cls_token = res_spatial[:, 0, :]
+            cls_token = rearrange(
+                cls_token,
+                '(b t) m -> b t m',
+                b=batch_size,
+                t=num_frames,
+            )
+            cls_token = torch.mean(cls_token, 1, True)
+            res_spatial = res_spatial[:, 1:, :]
+        res_spatial = rearrange(
+            res_spatial,
+            '(b t) (h w) m -> b (h w t) m',
+            b=batch_size,
+            h=height,
+            w=width,
+            t=num_frames,
+        )
+
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            x = torch.cat((init_cls_token, xt), 1) + torch.cat(
+                (cls_token, res_spatial), 1
+            )
+        else:
+            x = xt + res_spatial
 
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x, thw

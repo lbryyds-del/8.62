@@ -88,7 +88,6 @@ def support_query_split_multilabel_conditioned(base_split, few_shot_aux):
     """Replace support prototypes with text-conditioned support branches."""
     support_preds = base_split["support_preds"]
     branch_tokens = few_shot_aux["support_conditioned_patch_tokens"]
-    branch_point_weights = few_shot_aux["support_branch_point_weights"]
     branch_class_indices = few_shot_aux["support_branch_class_indices"].long()
 
     conditioned_support = []
@@ -97,8 +96,6 @@ def support_query_split_multilabel_conditioned(base_split, few_shot_aux):
         class_mask = branch_class_indices == class_idx
         if class_mask.any():
             class_tokens = branch_tokens[class_mask]
-            class_point_weights = branch_point_weights[class_mask].to(class_tokens.dtype)
-            class_tokens = class_tokens * class_point_weights[:, None, :, None]
             conditioned_support.append(class_tokens.mean(dim=0, keepdim=True))
         else:
             conditioned_support.append(support_preds[class_idx:class_idx + 1])

@@ -189,6 +189,27 @@ class Pointformer(nn.Module):
 
         self.spatial_pos_embed_drop = nn.Dropout(p=cfg.MF.POS_DROPOUT)
         self.layer_to_use = None
+        if self.use_text_conditioned_support:
+            if self.feat_extractor_type == "clip_vit_b16":
+                self.text_feature_dim = 512
+            elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
+                self.text_feature_dim = self.embed_dim
+            else:
+                raise NotImplementedError(
+                    f"Text support branch is not supported for {self.feat_extractor_type}."
+                )
+            if self.text_feature_dim == self.embed_dim:
+                self.text_to_model_proj = nn.Identity()
+            else:
+                self.text_to_model_proj = nn.Linear(self.text_feature_dim, self.embed_dim)
+            self.text_gate_mlp = nn.Sequential(
+                norm_layer(self.embed_dim),
+                nn.Linear(self.embed_dim, self.embed_dim),
+                nn.GELU(),
+                nn.Linear(self.embed_dim, self.embed_dim),
+            )
+            self.text_inject_alpha = nn.Parameter(torch.tensor(0.1))
+            self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
 
         # Initialize weights
         self.init_weights()
@@ -229,10 +250,17 @@ class Pointformer(nn.Module):
                 prompt_bank_path = self._resolve_prompt_bank_path(
                     self.text_cluster_cfg.PROMPT_BANK_PATH
                 )
-                prompt_embeddings = self._load_prompt_bank_embeddings(prompt_bank_path)
+                prompt_embeddings, prompt_mask = self._load_prompt_bank_embeddings(
+                    prompt_bank_path
+                )
                 self.register_buffer(
-                    "text_cluster_prompt_embeddings",
+                    "text_prompt_embeddings",
                     prompt_embeddings,
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "text_prompt_mask",
+                    prompt_mask,
                     persistent=False,
                 )
         elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
@@ -243,10 +271,17 @@ class Pointformer(nn.Module):
                 prompt_bank_path = self._resolve_prompt_bank_path(
                     self.text_cluster_cfg.PROMPT_BANK_PATH
                 )
-                prompt_embeddings = self._load_prompt_bank_embeddings(prompt_bank_path)
+                prompt_embeddings, prompt_mask = self._load_prompt_bank_embeddings(
+                    prompt_bank_path
+                )
                 self.register_buffer(
-                    "text_cluster_prompt_embeddings",
+                    "text_prompt_embeddings",
                     prompt_embeddings,
+                    persistent=False,
+                )
+                self.register_buffer(
+                    "text_prompt_mask",
+                    prompt_mask,
                     persistent=False,
                 )
         else:
@@ -347,7 +382,7 @@ class Pointformer(nn.Module):
             return json.load(handle)
 
     def _load_prompt_bank_embeddings(self, prompt_bank_path):
-        """Load and encode the prompt bank into the active text-visual space."""
+        """Load and encode prompt text as per-class prompt sequences."""
         if self.feat_extractor_type == "clip_vit_b16":
             return self._load_clip_prompt_bank_embeddings(prompt_bank_path)
         if self.feat_extractor_type == "dinotxt_vitl14_reg4":
@@ -355,6 +390,24 @@ class Pointformer(nn.Module):
         raise NotImplementedError(
             f"Text cluster is not supported for {self.feat_extractor_type}."
         )
+
+    def _pad_prompt_embeddings(self, per_class_embeddings):
+        """Pad variable-length prompt lists into one tensor plus a bool mask."""
+        max_prompts = max(embeddings.shape[0] for embeddings in per_class_embeddings)
+        feat_dim = per_class_embeddings[0].shape[-1]
+        padded = per_class_embeddings[0].new_zeros(
+            (len(per_class_embeddings), max_prompts, feat_dim)
+        )
+        mask = torch.zeros(
+            (len(per_class_embeddings), max_prompts),
+            device=padded.device,
+            dtype=torch.bool,
+        )
+        for class_id, embeddings in enumerate(per_class_embeddings):
+            num_prompts = embeddings.shape[0]
+            padded[class_id, :num_prompts] = embeddings
+            mask[class_id, :num_prompts] = True
+        return padded, mask
 
     def _load_clip_prompt_bank_embeddings(self, prompt_bank_path):
         """Load and encode the prompt bank into CLIP text space."""
@@ -369,9 +422,8 @@ class Pointformer(nn.Module):
                 tokenized = self.clip_tokenize(prompts).cuda(non_blocking=True)
                 prompt_features = self.clip_model.encode_text(tokenized).float()
                 prompt_features = F.normalize(prompt_features, dim=-1)
-                class_embedding = F.normalize(prompt_features.mean(dim=0), dim=-1)
-                text_embeddings.append(class_embedding.unsqueeze(0))
-        return torch.cat(text_embeddings, dim=0)
+                text_embeddings.append(prompt_features)
+        return self._pad_prompt_embeddings(text_embeddings)
 
     def _load_dinotxt_prompt_bank_embeddings(self, prompt_bank_path):
         """Load and encode the prompt bank into DinoTxt patch text space."""
@@ -387,9 +439,8 @@ class Pointformer(nn.Module):
                 prompt_features = self.dinotxt_text_model(tokenized).float()
                 patch_prompt_features = prompt_features[:, prompt_features.shape[-1] // 2 :]
                 patch_prompt_features = F.normalize(patch_prompt_features, dim=-1)
-                class_embedding = F.normalize(patch_prompt_features.mean(dim=0), dim=-1)
-                text_embeddings.append(class_embedding.unsqueeze(0))
-        return torch.cat(text_embeddings, dim=0)
+                text_embeddings.append(patch_prompt_features)
+        return self._pad_prompt_embeddings(text_embeddings)
 
     def _torchhub_dirs(self):
         """Return candidate torch hub dirs for cached DINOv2 assets."""
@@ -590,90 +641,10 @@ class Pointformer(nn.Module):
         sampled_feat = sampled_feat.squeeze(-2)
         return rearrange(sampled_feat, '(b t) p d -> b t p d', t=num_frames)
 
-    def _first_occurrence_mask(self, point_indices, valid_point_mask):
-        """Keep the first copy of each repeated point index."""
-        num_points = point_indices.numel()
-        if num_points == 0:
-            return torch.zeros_like(valid_point_mask, dtype=torch.bool)
-        previous_points = torch.tril(
-            torch.ones(
-                (num_points, num_points),
-                device=point_indices.device,
-                dtype=torch.bool,
-            ),
-            diagonal=-1,
-        )
-        duplicate_previous = (
-            (point_indices.unsqueeze(1) == point_indices.unsqueeze(0))
-            & previous_points
-            & valid_point_mask.unsqueeze(0)
-        )
-        return valid_point_mask & ~duplicate_previous.any(dim=1)
-
-    def _masked_cluster_mean(self, point_features, point_mask, cluster_point_mask):
-        """Average projected point features for one cluster over valid frames/points."""
-        cluster_feat = point_features[:, cluster_point_mask, :]
-        cluster_mask = point_mask[:, cluster_point_mask]
-        weights = cluster_mask.float().unsqueeze(-1)
-        denom = weights.sum().clamp_min(1.0)
-        return (cluster_feat * weights).sum(dim=(0, 1)) / denom
-
-    def _aggregate_cluster_repr(self, point_features, point_mask, point_clusters):
-        """Aggregate projected point features into per-cluster representations."""
-        point_weights = point_mask.float()
-        point_feature_sum = (point_features * point_weights.unsqueeze(-1)).sum(dim=0)
-        point_weight_sum = point_weights.sum(dim=0)
-        cluster_ids, cluster_inverse = torch.unique(
-            point_clusters,
-            sorted=True,
-            return_inverse=True,
-        )
-        cluster_feature_sum = point_feature_sum.new_zeros(
-            (cluster_ids.shape[0], point_feature_sum.shape[-1])
-        )
-        cluster_feature_sum.index_add_(0, cluster_inverse, point_feature_sum)
-        cluster_weight_sum = point_weight_sum.new_zeros(cluster_ids.shape[0])
-        cluster_weight_sum.index_add_(0, cluster_inverse, point_weight_sum)
-        cluster_repr = cluster_feature_sum / cluster_weight_sum.clamp_min(1.0).unsqueeze(-1)
-        cluster_point_counts = torch.bincount(
-            cluster_inverse,
-            minlength=cluster_ids.shape[0],
-        )
-        return F.normalize(cluster_repr, dim=-1), cluster_ids, cluster_inverse, cluster_point_counts
-
-    def _repeat_selected_points(self, branch_feature, branch_mask, point_weights):
-        """Pad a selected branch back to the configured point count using repeated valid points."""
-        points_to_sample = self.cfg.POINT_INFO.NUM_POINTS_TO_SAMPLE
-        valid_indices = torch.nonzero(branch_mask.any(dim=0), as_tuple=False).flatten()
-        if valid_indices.numel() == 0:
-            return None
-        if valid_indices.numel() >= points_to_sample:
-            indices_to_use = valid_indices[:points_to_sample]
-        else:
-            repeats_needed = points_to_sample - valid_indices.numel()
-            repeat_indices = valid_indices[
-                torch.arange(repeats_needed, device=valid_indices.device) % valid_indices.numel()
-            ]
-            indices_to_use = torch.cat([valid_indices, repeat_indices], dim=0)
-
-        repeated_feature = branch_feature[:, :, indices_to_use, :]
-        repeated_mask = branch_mask[:, indices_to_use]
-        repeated_weights = point_weights[indices_to_use].clone()
-        _, inverse_indices, counts = torch.unique(
-            indices_to_use,
-            sorted=True,
-            return_inverse=True,
-            return_counts=True,
-        )
-        repeated_weights = repeated_weights / counts[inverse_indices].to(repeated_weights.dtype)
-        return repeated_feature, repeated_mask, repeated_weights
-
     def _build_support_conditioned_branches(
         self,
-        appearance_feat,
-        projected_point_feat,
+        fused_feat,
         metadata,
-        hod_motion_feat=None,
     ):
         """Build support-only label-conditioned branches for q2s few-shot matching."""
         support_mask = metadata['support_mask'].bool()
@@ -683,14 +654,12 @@ class Pointformer(nn.Module):
             if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
             else metadata['pred_visibility']
         ).bool()
-        obj_ids = metadata['obj_ids'].long()
-        point_indices = metadata['point_indices'].long()
         episode_class_ids = metadata['episode_class_ids'].long()
 
         branch_features = []
         branch_masks = []
-        branch_point_weights = []
         branch_class_indices = []
+        branch_global_class_indices = []
         branch_sample_indices = []
         support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
         for sample_idx in support_indices.tolist():
@@ -700,153 +669,62 @@ class Pointformer(nn.Module):
             if sample_positive_labels.numel() == 0:
                 continue
 
-            sample_mask = base_pt_mask[sample_idx]
-            valid_points = sample_mask.any(dim=0)
-            unique_points = self._first_occurrence_mask(
-                point_indices[sample_idx], valid_points
-            )
-            present_points = valid_points & unique_points
-            sample_obj_ids = obj_ids[sample_idx]
-            present_clusters = torch.unique(sample_obj_ids[present_points])
-            if present_clusters.numel() == 0:
-                continue
-
-            present_point_feat = projected_point_feat[sample_idx][:, present_points, :]
-            present_point_mask = sample_mask[:, present_points]
-            present_cluster_ids = sample_obj_ids[present_points]
-            cluster_repr, cluster_ids, cluster_inverse, cluster_point_counts = (
-                self._aggregate_cluster_repr(
-                    present_point_feat,
-                    present_point_mask,
-                    present_cluster_ids,
-                )
-            )
-
             sample_episode_class_ids = (
                 episode_class_ids[sample_idx]
                 if episode_class_ids.ndim == 2
                 else episode_class_ids
             )
             global_class_indices = sample_episode_class_ids.index_select(0, sample_positive_labels)
-            text_embeddings = self.text_cluster_prompt_embeddings.index_select(
-                0,
-                global_class_indices,
-            )
-            scores = torch.matmul(text_embeddings, cluster_repr.transpose(0, 1))
-            top_k = min(self.text_cluster_cfg.TOP_M, scores.shape[1])
-            top_scores, top_indices = torch.topk(scores, k=top_k, dim=1)
-            cluster_weights = F.softmax(top_scores / self.text_cluster_cfg.TAU, dim=1)
-            selected_cluster_ids = cluster_ids[top_indices]
-
-            selected_point_mask = (
-                sample_obj_ids.view(1, 1, -1) == selected_cluster_ids.unsqueeze(-1)
-            ).any(dim=1)
-            point_group_counts = torch.unique(
-                point_indices[sample_idx],
-                sorted=True,
-                return_inverse=False,
-                return_counts=True,
-            )[1]
-            _, point_group_inverse = torch.unique(
-                point_indices[sample_idx],
-                sorted=True,
-                return_inverse=True,
-                return_counts=False,
-            )
-            present_group_ids = point_group_inverse[present_points]
-            selected_cluster_weights = cluster_weights / cluster_point_counts[top_indices].to(
-                cluster_weights.dtype
-            )
-            weights_per_cluster = cluster_weights.new_zeros(
-                (cluster_weights.shape[0], cluster_ids.shape[0])
-            )
-            weights_per_cluster.scatter_(1, top_indices, selected_cluster_weights)
-            present_point_weights = weights_per_cluster.gather(
-                1,
-                cluster_inverse.unsqueeze(0).expand(weights_per_cluster.shape[0], -1),
-            )
-            group_weights = cluster_weights.new_zeros(
-                (cluster_weights.shape[0], point_group_counts.shape[0])
-            )
-            group_weights.scatter_(
-                1,
-                present_group_ids.unsqueeze(0).expand(cluster_weights.shape[0], -1),
-                present_point_weights,
-            )
-            point_weights = group_weights.gather(
-                1,
-                point_group_inverse.unsqueeze(0).expand(cluster_weights.shape[0], -1),
-            )
-            point_weights = point_weights / point_group_counts[point_group_inverse].unsqueeze(0).to(
-                point_weights.dtype
-            )
-
-            branch_mask = sample_mask.unsqueeze(0) & selected_point_mask.unsqueeze(1)
-            valid_branch_mask = branch_mask.reshape(branch_mask.shape[0], -1).any(dim=1)
-            if not valid_branch_mask.any():
-                continue
-
-            sample_positive_labels = sample_positive_labels[valid_branch_mask]
-            selected_point_mask = selected_point_mask[valid_branch_mask]
-            point_weights = point_weights[valid_branch_mask]
-            branch_mask = branch_mask[valid_branch_mask]
-
-            branch_mask_float = branch_mask.unsqueeze(-1).to(appearance_feat.dtype)
-            sample_appearance_feat = appearance_feat[sample_idx].unsqueeze(0)
-            branch_feature = sample_appearance_feat * branch_mask_float
-            if hod_motion_feat is not None:
-                sample_hod_motion_feat = hod_motion_feat[sample_idx].unsqueeze(0)
-                branch_feature = branch_feature + sample_hod_motion_feat * branch_mask_float
-            if self.cfg.MODEL.MOTION_MODULE.USE_CROSS_MOTION_MODULE:
-                num_sample_branches = branch_mask.shape[0]
-                pred_tracks_batch = metadata['pred_tracks'][sample_idx:sample_idx + 1].repeat(
+            num_sample_branches = sample_positive_labels.shape[0]
+            branch_features.append(
+                fused_feat[sample_idx:sample_idx + 1].repeat(
                     num_sample_branches,
                     1,
                     1,
                     1,
                 )
-                pred_visibility_batch = metadata['pred_visibility'][
-                    sample_idx:sample_idx + 1
-                ].repeat(num_sample_branches, 1, 1)
-                cross_motion_feat = self.cross_motion_module(
-                    pred_tracks_batch,
-                    pred_visibility_batch,
-                    point_selection_mask=selected_point_mask,
+            )
+            branch_masks.append(
+                base_pt_mask[sample_idx:sample_idx + 1].repeat(
+                    num_sample_branches,
+                    1,
+                    1,
                 )
-                branch_feature = branch_feature + cross_motion_feat * branch_mask_float
-
-            for branch_idx in range(branch_mask.shape[0]):
-                repeated_branch = self._repeat_selected_points(
-                    branch_feature[branch_idx:branch_idx + 1],
-                    branch_mask[branch_idx],
-                    point_weights[branch_idx],
-                )
-                if repeated_branch is None:
-                    continue
-                repeated_feature, repeated_mask, repeated_weights = repeated_branch
-                branch_features.append(repeated_feature)
-                branch_masks.append(repeated_mask.unsqueeze(0))
-                branch_point_weights.append(repeated_weights.unsqueeze(0))
-                branch_class_indices.append(int(sample_positive_labels[branch_idx].item()))
-                branch_sample_indices.append(sample_idx)
+            )
+            branch_class_indices.append(sample_positive_labels)
+            branch_global_class_indices.append(global_class_indices)
+            branch_sample_indices.extend([sample_idx] * num_sample_branches)
 
         if not branch_features:
             return None
 
         branch_feature_tensor = torch.cat(branch_features, dim=0)
         branch_mask_tensor = torch.cat(branch_masks, dim=0)
-        _, branch_patch_tokens = self.pt_forward(
+        branch_class_indices = torch.cat(branch_class_indices, dim=0)
+        branch_global_class_indices = torch.cat(branch_global_class_indices, dim=0)
+        text_tokens, text_mask, text_global = self._get_branch_text_features(
+            branch_global_class_indices,
+            branch_feature_tensor.dtype,
+        )
+        branch_feature_tensor = self._inject_text_condition(
+            branch_feature_tensor,
+            text_global,
+        )
+        _, branch_patch_tokens = self.text_conditioned_pt_forward(
             branch_feature_tensor,
             {
                 'pred_visibility': branch_mask_tensor,
                 'pred_query_mask': branch_mask_tensor,
             },
+            text_tokens,
+            text_mask,
         )
         return {
             'support_conditioned_patch_tokens': branch_patch_tokens,
-            'support_branch_point_weights': torch.cat(branch_point_weights, dim=0),
-            'support_branch_class_indices': torch.tensor(
-                branch_class_indices,
+            'support_branch_point_weights': branch_patch_tokens.new_ones(
+                (branch_patch_tokens.shape[0], branch_patch_tokens.shape[2])
+            ),
+            'support_branch_class_indices': branch_class_indices.to(
                 device=branch_patch_tokens.device,
                 dtype=torch.long,
             ),
@@ -856,6 +734,27 @@ class Pointformer(nn.Module):
                 dtype=torch.long,
             ),
         }
+
+    def _get_branch_text_features(self, global_class_indices, dtype):
+        """Return projected prompt sequence, mask, and pooled text for branches."""
+        text_tokens = self.text_prompt_embeddings.index_select(0, global_class_indices)
+        text_mask = self.text_prompt_mask.index_select(0, global_class_indices)
+        text_tokens = self.text_to_model_proj(text_tokens)
+        text_tokens = F.normalize(text_tokens, dim=-1).to(dtype=dtype)
+        text_weights = text_mask.to(dtype=text_tokens.dtype).unsqueeze(-1)
+        text_global = (text_tokens * text_weights).sum(dim=1)
+        text_global = text_global / text_weights.sum(dim=1).clamp_min(1.0)
+        return text_tokens, text_mask, text_global
+
+    def _inject_text_condition(self, branch_features, text_global):
+        """Inject pooled label text through channel-wise gating."""
+        text_gate = torch.sigmoid(self.text_gate_mlp(text_global)).unsqueeze(1).unsqueeze(1)
+        text_bias = text_global.unsqueeze(1).unsqueeze(1)
+        return (
+            branch_features
+            * (1.0 + self.text_inject_alpha.to(branch_features.dtype) * text_gate)
+            + self.text_inject_beta.to(branch_features.dtype) * text_bias
+        )
 
 
     def get_dino_features(self, x):
@@ -1033,6 +932,59 @@ class Pointformer(nn.Module):
             print("WARNING: nan in features out")
         return cls_x, patch_x
 
+    def text_conditioned_pt_forward(self, x, metadata, text_tokens, text_mask):
+        """Support branch forward with text injection inside each trajectory block."""
+        if self.cfg.POINT_INFO.USE_PT_QUERY_MASK:
+            pt_mask = metadata['pred_query_mask']
+        else:
+            pt_mask = metadata['pred_visibility']
+
+        bs, temporal_dim, num_points, _ = x.shape
+        x = rearrange(x, 'b t n d -> b n t d')
+        pt_mask = rearrange(pt_mask, 'b t n -> b n t')
+        x = rearrange(x, 'b n t d -> b (n t) d')
+        pt_mask = rearrange(pt_mask, 'b n t -> b (n t)')
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            cls_tokens = self.cls_token.expand(bs, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            cls_token_mask = torch.ones(bs, 1).bool().to(x.device)
+            pt_mask = torch.cat((cls_token_mask, pt_mask), dim=1)
+
+        x = self.pos_drop(x)
+        thw = [
+            self.temporal_resolution,
+            self.point_grid_size,
+            int(num_points / self.point_grid_size),
+        ]
+        for _, blk in enumerate(self.blocks):
+            x, _ = blk.forward_text_conditioned(
+                x,
+                thw,
+                pt_mask,
+                text_tokens,
+                text_mask,
+            )
+
+        if self.cfg.MODEL.ADAPOOLING.ENABLE:
+            raise NotImplementedError(
+                "Text-conditioned support branch does not support adaptive pooling."
+            )
+
+        x = self.norm(x)
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            cls_x, patch_x = x[:, 0], x[:, 1:]
+            if self.cfg.MODEL.USE_PATCH_AS_CLS:
+                cls_x = patch_x.mean(dim=1)
+        else:
+            cls_x = x.mean(dim=1)
+            patch_x = x
+
+        cls_x = self.pre_logits(cls_x)
+        patch_x = rearrange(patch_x, 'b (n t) d -> b t n d', t=temporal_dim)
+        if not torch.isfinite(x).all():
+            print("WARNING: nan in text-conditioned features out")
+        return cls_x, patch_x
+
     def add_st_pos_embeddings(self, x):
         """ Add spatial and temporal positional embeddings to the input features.
 
@@ -1063,7 +1015,6 @@ class Pointformer(nn.Module):
             skip_feat_extractor = input_to_use['skip_feat_extractor']
         else:
             skip_feat_extractor = False
-        projected_feat_to_use = None
         if not self.cfg.MODEL.APPEARANCE_MODULE_DISABLE:
             if skip_feat_extractor:
                 embed_dim = self.embed_dim
@@ -1080,20 +1031,12 @@ class Pointformer(nn.Module):
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)
                 elif self.feat_extractor_type == "clip_vit_b16":
-                    if self.use_text_conditioned_support:
-                        feat_to_use, projected_feat_to_use = self.get_clip_features(
-                            x,
-                            return_projected=True,
-                        )
-                    else:
-                        feat_to_use = self.get_clip_features(x)
+                    feat_to_use = self.get_clip_features(x)
                     if self.cfg.POINT_INFO.USE_CORRELATION:
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)
                 elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
                     feat_to_use = self.get_dinotxt_features(x)
-                    if self.use_text_conditioned_support:
-                        projected_feat_to_use = feat_to_use
                     if self.cfg.POINT_INFO.USE_CORRELATION:
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)
@@ -1115,24 +1058,13 @@ class Pointformer(nn.Module):
                         and not self.cfg.MF.USE_BASE_POS_EMBED
                     ),
                 )
-                if projected_feat_to_use is not None:
-                    projected_point_feat = self._sample_point_features(
-                        projected_feat_to_use,
-                        pred_tracks,
-                        add_pt_pos_embed=False,
-                    )
-                else:
-                    projected_point_feat = None
 
             else:
                 sampled_feat = rearrange(feat_to_use, 'b t p q d -> b t (p q) d')
                 self.point_grid_size = int(sampled_feat.shape[2] ** 0.5)
-                projected_point_feat = None
         else:
             sampled_feat = 0
-            projected_point_feat = None
 
-        appearance_feat = sampled_feat
         hod_motion_feat = None
         if self.cfg.MODEL.MOTION_MODULE.USE_HOD_MOTION_MODULE:
             hod_motion_feat = self.hod_motion_module(metadata['hod_feat'].float())
@@ -1146,17 +1078,12 @@ class Pointformer(nn.Module):
         cls_x, patch_x = self.pt_forward(sampled_feat, metadata)
         if (
             self.use_text_conditioned_support
-            and projected_point_feat is not None
             and 'support_mask' in metadata
             and 'episode_positive_labels' in metadata
-            and 'obj_ids' in metadata
-            and 'point_indices' in metadata
         ):
             few_shot_aux = self._build_support_conditioned_branches(
-                appearance_feat,
-                projected_point_feat,
+                sampled_feat,
                 metadata,
-                hod_motion_feat=hod_motion_feat,
             )
         # x = self.forward_features(x, metadata) # [BS, d]
         x = self.head_drop(cls_x)

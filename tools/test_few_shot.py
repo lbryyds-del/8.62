@@ -44,6 +44,13 @@ try:
 except ImportError:
     tqdm = None
 
+def autocast_context(enabled):
+    """Create a CUDA autocast context that works across torch versions."""
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast("cuda", enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
 def wandb_init_dict(cfg_node):
     """Convert a config node to dictionary.
     """
@@ -238,39 +245,50 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                 labels.to(labels.device),
                 episode_class_ids,
             )
-        input_dict = {'video':inputs, 'metadata':meta}
-        # for few shot, patch tokens are also returning
-        model_out = model(input_dict)
-        if isinstance(model_out, tuple) and len(model_out) == 3:
-            preds, patch_tokens, few_shot_aux = model_out
-        else:
-            preds, patch_tokens = model_out
-            few_shot_aux = None
-        if isinstance(preds, tuple):
-            preds, _ = preds
-
-        multilabel_episode = is_multilabel_episode(cfg, labels, meta)
-        if multilabel_episode:
-            base_support_query_dict = support_query_split_multilabel(
-                patch_tokens, labels, meta)
-            if few_shot_aux is not None:
-                patch_support_query_dict = support_query_split_multilabel_conditioned(
-                    base_support_query_dict,
-                    few_shot_aux,
-                )
+        with autocast_context(cfg.TRAIN.MIXED_PRECISION):
+            input_dict = {'video':inputs, 'metadata':meta}
+            # for few shot, patch tokens are also returning
+            model_out = model(input_dict)
+            if isinstance(model_out, tuple) and len(model_out) == 3:
+                preds, patch_tokens, few_shot_aux = model_out
             else:
-                patch_support_query_dict = base_support_query_dict
-        else:
-            patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
-        patch_q2s_logits = process_patch_tokens(
-                                    cfg,
-                                    patch_support_query_dict['support_preds'],
-                                    patch_support_query_dict['query_preds'])
-        q2s_labels = patch_support_query_dict['query_batch_labels']
+                preds, patch_tokens = model_out
+                few_shot_aux = None
+            if isinstance(preds, tuple):
+                preds, _ = preds
+
+            multilabel_episode = is_multilabel_episode(cfg, labels, meta)
+            if multilabel_episode:
+                base_support_query_dict = support_query_split_multilabel(
+                    patch_tokens, labels, meta)
+                if few_shot_aux is not None:
+                    patch_support_query_dict = support_query_split_multilabel_conditioned(
+                        base_support_query_dict,
+                        few_shot_aux,
+                    )
+                else:
+                    patch_support_query_dict = base_support_query_dict
+            else:
+                patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
+            patch_q2s_logits = process_patch_tokens(
+                                        cfg,
+                                        patch_support_query_dict['support_preds'],
+                                        patch_support_query_dict['query_preds'])
+            q2s_labels = patch_support_query_dict['query_batch_labels']
+            if multilabel_episode:
+                q2s_loss = F.binary_cross_entropy_with_logits(
+                    patch_q2s_logits, q2s_labels.float())
+                few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
+            else:
+                q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
+
+                # Explicitly declare reduction to mean.
+                few_shotk_correct = metrics.topks_correct(patch_q2s_logits,
+                                                            q2s_labels, (1, 5))
+                few_shot_top1_acc, _ = [
+                    (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
+                ]
         if multilabel_episode:
-            q2s_loss = F.binary_cross_entropy_with_logits(
-                patch_q2s_logits, q2s_labels.float())
-            few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
             update_ap_storage(
                 ap_storage,
                 patch_q2s_logits,
@@ -298,15 +316,6 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                         'score': float(scores[query_idx, episode_idx]),
                         'label': float(targets[query_idx, episode_idx]),
                     })
-        else:
-            q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
-
-            # Explicitly declare reduction to mean.
-            few_shotk_correct = metrics.topks_correct(patch_q2s_logits,
-                                                        q2s_labels, (1, 5))
-            few_shot_top1_acc, _ = [
-                (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
-            ]
         if cfg['wandb']:
             cfg['wandb'].log({
                 'iteration': cur_iter,
