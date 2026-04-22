@@ -20,6 +20,8 @@ from few_shot_multilabel import (
     merge_ap_storage,
     multilabel_classification_loss,
     multilabel_top1_accuracy,
+    class_conditioned_q2s_logits,
+    query_semantic_alignment_loss,
     support_query_split_multilabel,
     support_query_split_multilabel_conditioned,
     update_ap_storage,
@@ -263,6 +265,7 @@ def train_epoch(
     epoch_top_1_acc_few_shot = []
     epoch_cls_loss = []
     epoch_q2s_loss = []
+    epoch_query_align_loss = []
 
     if cfg.MIXUP.ENABLE:
         mixup_fn = MixUp(
@@ -344,10 +347,17 @@ def train_epoch(
                     patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
-            patch_q2s_logits = process_patch_tokens(
-                                        cfg,
-                                        patch_support_query_dict['support_preds'],
-                                        patch_support_query_dict['query_preds'])
+            if patch_support_query_dict.get('query_label_preds') is not None:
+                patch_q2s_logits = class_conditioned_q2s_logits(
+                    cfg,
+                    patch_support_query_dict['support_preds'],
+                    patch_support_query_dict['query_label_preds'],
+                )
+            else:
+                patch_q2s_logits = process_patch_tokens(
+                                            cfg,
+                                            patch_support_query_dict['support_preds'],
+                                            patch_support_query_dict['query_preds'])
             q2s_labels = patch_support_query_dict['query_batch_labels']
             patch_q2s_logits = patch_q2s_logits / cfg.SOLVER.TEMPRATURE
             if multilabel_episode:
@@ -356,8 +366,15 @@ def train_epoch(
             else:
                 q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
             loss_dict['q2s_loss'] = q2s_loss
-        loss = (cfg.FEW_SHOT.CLASS_LOSS_LAMBDA * classfication_loss +
-                cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss)
+            query_align_loss = query_semantic_alignment_loss(few_shot_aux, cfg)
+            if query_align_loss is None:
+                query_align_loss = q2s_loss.new_zeros(())
+            loss_dict['query_align_loss'] = query_align_loss
+        loss = (
+            cfg.FEW_SHOT.CLASS_LOSS_LAMBDA * classfication_loss
+            + cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss
+            + cfg.FEW_SHOT.QUERY_ALIGN.LAMBDA * query_align_loss
+        )
 
         misc.check_nan_losses(loss)
         # Perform the backward pass.
@@ -382,25 +399,41 @@ def train_epoch(
         top1_err, top5_err = None, None
         classification_loss = loss_dict['classfication_loss']
         q2s_loss = loss_dict['q2s_loss']
+        query_align_loss = loss_dict['query_align_loss']
 
         if multilabel_episode:
             few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
             if cfg.NUM_GPUS > 1:
-                loss, classification_loss, q2s_loss, few_shot_top1_acc = du.all_reduce(
-                    [loss, classification_loss, q2s_loss, few_shot_top1_acc]
+                (
+                    loss,
+                    classification_loss,
+                    q2s_loss,
+                    query_align_loss,
+                    few_shot_top1_acc,
+                ) = du.all_reduce(
+                    [
+                        loss,
+                        classification_loss,
+                        q2s_loss,
+                        query_align_loss,
+                        few_shot_top1_acc,
+                    ]
                 )
             loss = loss.item()
             classification_loss = classification_loss.item()
             q2s_loss = q2s_loss.item()
+            query_align_loss = query_align_loss.item()
             few_shot_top1_acc = few_shot_top1_acc.item()
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
+            epoch_query_align_loss.append(query_align_loss)
             epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
             global_iter = data_size * cur_epoch + cur_iter
             wandb_iter_dict = {
                 'iter_cls_loss': classification_loss,
                 'iter_q2s_loss': q2s_loss,
+                'iter_query_align_loss': query_align_loss,
                 'iteration': global_iter,
                 'iter_top1_acc_few_shot': few_shot_top1_acc,
             }
@@ -434,12 +467,14 @@ def train_epoch(
                 top5_err.item(),
             )
             q2s_loss = q2s_loss.item()
+            query_align_loss = query_align_loss.item()
 
             few_shot_top1_acc = few_shot_top1_acc.item()
             loss = loss.item()
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
+            epoch_query_align_loss.append(query_align_loss)
 
             epoch_top_1_err.append(top1_err)
             epoch_top_5_err.append(top5_err)
@@ -447,6 +482,7 @@ def train_epoch(
             global_iter = data_size * cur_epoch + cur_iter
             wandb_iter_dict = {'iter_cls_loss':classification_loss,
                                 'iter_q2s_loss':q2s_loss,
+                                'iter_query_align_loss': query_align_loss,
                                 'iter_top1_err':top1_err,
                                 'iter_top5_err':top5_err,
                             'iteration':global_iter,
@@ -486,6 +522,7 @@ def train_epoch(
     wandb_iter_dict = {
         'train_cls_loss': mean_or_nan(epoch_cls_loss),
         'train_q2s_loss': mean_or_nan(epoch_q2s_loss),
+        'train_query_align_loss': mean_or_nan(epoch_query_align_loss),
         'train_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch,
     }
@@ -572,10 +609,17 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
                     patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
-            patch_q2s_logits = process_patch_tokens(
-                                        cfg,
-                                        patch_support_query_dict['support_preds'],
-                                        patch_support_query_dict['query_preds'])
+            if patch_support_query_dict.get('query_label_preds') is not None:
+                patch_q2s_logits = class_conditioned_q2s_logits(
+                    cfg,
+                    patch_support_query_dict['support_preds'],
+                    patch_support_query_dict['query_label_preds'],
+                )
+            else:
+                patch_q2s_logits = process_patch_tokens(
+                                            cfg,
+                                            patch_support_query_dict['support_preds'],
+                                            patch_support_query_dict['query_preds'])
             q2s_labels = patch_support_query_dict['query_batch_labels']
             if multilabel_episode:
                 q2s_loss = F.binary_cross_entropy_with_logits(

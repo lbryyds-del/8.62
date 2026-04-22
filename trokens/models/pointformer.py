@@ -13,7 +13,7 @@ from sympy import divisors
 import numpy as np
 from torch.nn.init import trunc_normal_
 
-from trokens.models.attention import TrajectoryAttentionBlock
+from trokens.models.attention import CrossAttention, TrajectoryAttentionBlock
 from trokens.models.branches.motion_blocks import (
     CrossMotionModule,
     HODMotionModule
@@ -210,6 +210,28 @@ class Pointformer(nn.Module):
             )
             self.text_inject_alpha = nn.Parameter(torch.tensor(0.1))
             self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
+            self.use_query_alignment = cfg.FEW_SHOT.QUERY_ALIGN.ENABLE
+            if self.use_query_alignment:
+                self.query_token_proj = nn.Linear(self.embed_dim, self.embed_dim)
+                self.query_token_reader = CrossAttention(
+                    self.embed_dim,
+                    num_heads=self.num_heads,
+                    qkv_bias=self.qkv_bias,
+                    attn_drop=self.attn_drop_rate,
+                    proj_drop=self.drop_rate,
+                    use_mask=True,
+                )
+                self.query_gate_mlp = nn.Sequential(
+                    norm_layer(self.embed_dim),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                    nn.GELU(),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                )
+                self.query_gate_eta = nn.Parameter(
+                    torch.tensor(float(cfg.FEW_SHOT.QUERY_ALIGN.ETA_INIT))
+                )
+        else:
+            self.use_query_alignment = False
 
         # Initialize weights
         self.init_weights()
@@ -735,6 +757,84 @@ class Pointformer(nn.Module):
             ),
         }
 
+    def _build_query_aligned_branches(self, patch_tokens, metadata):
+        """Build label-conditioned query tokens using lightweight semantic readers."""
+        if not self.use_query_alignment:
+            return None
+        sample_info = np.array(metadata['sample_type'])
+        query_mask_np = sample_info != 'support'
+        if not query_mask_np.any():
+            return None
+        query_mask = torch.as_tensor(
+            query_mask_np,
+            device=patch_tokens.device,
+            dtype=torch.bool,
+        )
+        query_tokens = patch_tokens[query_mask]
+        query_targets = metadata['episode_positive_labels'][query_mask].float()
+        episode_class_ids = metadata['episode_class_ids'].long()
+        if episode_class_ids.ndim == 2:
+            query_episode_class_ids = episode_class_ids[query_mask]
+        else:
+            query_episode_class_ids = episode_class_ids.unsqueeze(0).expand(
+                query_tokens.shape[0],
+                -1,
+            )
+
+        num_queries, num_episode_classes = query_episode_class_ids.shape
+        flat_class_ids = query_episode_class_ids.reshape(-1)
+        _, _, text_global = self._get_branch_text_features(
+            flat_class_ids,
+            query_tokens.dtype,
+        )
+        text_global = text_global.view(num_queries, num_episode_classes, -1)
+        semantic_tokens = self.query_token_proj(text_global)
+        flat_semantic_tokens = semantic_tokens.reshape(-1, 1, semantic_tokens.shape[-1])
+
+        flat_query_tokens = query_tokens.unsqueeze(1).expand(
+            -1,
+            num_episode_classes,
+            -1,
+            -1,
+            -1,
+        )
+        flat_query_tokens = flat_query_tokens.reshape(
+            num_queries * num_episode_classes,
+            query_tokens.shape[1] * query_tokens.shape[2],
+            query_tokens.shape[3],
+        )
+        query_kv_mask = torch.ones(
+            flat_query_tokens.shape[:2],
+            device=flat_query_tokens.device,
+            dtype=torch.bool,
+        )
+        query_delta = self.query_token_reader(
+            flat_query_tokens,
+            flat_semantic_tokens,
+            query_kv_mask,
+        )
+        query_semantic_tokens = (flat_semantic_tokens + query_delta).squeeze(1)
+        query_semantic_tokens = query_semantic_tokens.view(
+            num_queries,
+            num_episode_classes,
+            -1,
+        )
+        query_gates = torch.sigmoid(self.query_gate_mlp(query_semantic_tokens))
+        query_label_tokens = (
+            query_tokens.unsqueeze(1)
+            * (
+                1.0
+                + self.query_gate_eta.to(query_tokens.dtype)
+                * query_gates.unsqueeze(2).unsqueeze(2)
+            )
+        )
+        return {
+            'query_label_tokens': query_label_tokens,
+            'query_semantic_tokens': query_semantic_tokens,
+            'query_text_embeddings': text_global,
+            'query_text_targets': query_targets,
+        }
+
     def _get_branch_text_features(self, global_class_indices, dtype):
         """Return projected prompt sequence, mask, and pooled text for branches."""
         text_tokens = self.text_prompt_embeddings.index_select(0, global_class_indices)
@@ -1085,6 +1185,11 @@ class Pointformer(nn.Module):
                 sampled_feat,
                 metadata,
             )
+            query_aux = self._build_query_aligned_branches(patch_x, metadata)
+            if query_aux is not None:
+                if few_shot_aux is None:
+                    few_shot_aux = {}
+                few_shot_aux.update(query_aux)
         # x = self.forward_features(x, metadata) # [BS, d]
         x = self.head_drop(cls_x)
 

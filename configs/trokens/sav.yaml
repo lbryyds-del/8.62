@@ -17,6 +17,11 @@ FEW_SHOT:
     TOP_M: 3
     TAU: 0.07
     PROMPT_BANK_PATH: data/sav/clip_label_prompt_bank.json
+  QUERY_ALIGN:
+    ENABLE: True
+    LAMBDA: 0.05
+    TAU: 0.07
+    ETA_INIT: 0.1
 
 POINT_INFO:
   NAME: cotracker3_bip_fr_32_feat_dinotxt_vitl14reg4_fps_10

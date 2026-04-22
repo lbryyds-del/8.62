@@ -35,6 +35,11 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.TEXT_CLUSTER.TOP_M = 3
     cfg.FEW_SHOT.TEXT_CLUSTER.TAU = 0.07
     cfg.FEW_SHOT.TEXT_CLUSTER.PROMPT_BANK_PATH = ""
+    cfg.FEW_SHOT.QUERY_ALIGN = CfgNode()
+    cfg.FEW_SHOT.QUERY_ALIGN.ENABLE = True
+    cfg.FEW_SHOT.QUERY_ALIGN.LAMBDA = 0.05
+    cfg.FEW_SHOT.QUERY_ALIGN.TAU = 0.07
+    cfg.FEW_SHOT.QUERY_ALIGN.ETA_INIT = 0.1
 
     # point info config
     cfg.POINT_INFO = CfgNode()
