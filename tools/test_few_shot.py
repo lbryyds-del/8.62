@@ -19,7 +19,6 @@ from few_shot_multilabel import (
     mean_or_nan,
     merge_ap_storage,
     multilabel_top1_accuracy,
-    class_conditioned_q2s_logits,
     support_query_split_multilabel,
     support_query_split_multilabel_conditioned,
     update_ap_storage,
@@ -73,6 +72,8 @@ def process_patch_tokens(cfg, support_tokens, query_tokens):
         query_tokens: (num_query, temp_len, num_patches, embed_dim)
     """
     #Putting an activation here, may be not needed
+    support_tokens = torch.nan_to_num(support_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+    query_tokens = torch.nan_to_num(query_tokens, nan=0.0, posinf=0.0, neginf=0.0)
     support_tokens = F.relu(support_tokens)
     query_tokens = F.relu(query_tokens)
     num_supports = support_tokens.shape[0]
@@ -94,6 +95,7 @@ def process_patch_tokens(cfg, support_tokens, query_tokens):
     support_tokens = rearrange(support_tokens, 'b p e -> (b p) e')
     query_tokens = rearrange(query_tokens, 'b p e -> (b p) e')
     sim_matrix = cos_sim(query_tokens, support_tokens)
+    sim_matrix = torch.nan_to_num(sim_matrix, nan=0.0, posinf=1.0, neginf=-1.0)
     dist_matrix = 1 - sim_matrix
 
     dist_rearranged = rearrange(dist_matrix, '(q qt) (s st) -> q s qt st',
@@ -106,6 +108,7 @@ def process_patch_tokens(cfg, support_tokens, query_tokens):
     elif cfg.FEW_SHOT.DIST_NORM == 'max_sub':
         max_dist = dist_logits.max(dim=1, keepdim=True)[0]
         dist_logits = max_dist - dist_logits
+    dist_logits = torch.nan_to_num(dist_logits, nan=0.0, posinf=1e4, neginf=-1e4)
     return - dist_logits
 
 def cos_sim(x, y, epsilon=0.01):
@@ -271,17 +274,10 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
-            if patch_support_query_dict.get('query_label_preds') is not None:
-                patch_q2s_logits = class_conditioned_q2s_logits(
-                    cfg,
-                    patch_support_query_dict['support_preds'],
-                    patch_support_query_dict['query_label_preds'],
-                )
-            else:
-                patch_q2s_logits = process_patch_tokens(
-                                            cfg,
-                                            patch_support_query_dict['support_preds'],
-                                            patch_support_query_dict['query_preds'])
+            patch_q2s_logits = process_patch_tokens(
+                                        cfg,
+                                        patch_support_query_dict['support_preds'],
+                                        patch_support_query_dict['query_preds'])
             q2s_labels = patch_support_query_dict['query_batch_labels']
             if multilabel_episode:
                 q2s_loss = F.binary_cross_entropy_with_logits(
@@ -297,6 +293,12 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     (x / patch_q2s_logits.size(0)) * 100.0 for x in few_shotk_correct
                 ]
         if multilabel_episode:
+            patch_q2s_logits = torch.nan_to_num(
+                patch_q2s_logits,
+                nan=0.0,
+                posinf=30.0,
+                neginf=-30.0,
+            )
             update_ap_storage(
                 ap_storage,
                 patch_q2s_logits,

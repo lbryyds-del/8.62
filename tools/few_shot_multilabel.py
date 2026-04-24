@@ -2,8 +2,6 @@
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from einops import rearrange
 from sklearn.metrics import average_precision_score
 
 import trokens.utils.distributed as du
@@ -105,78 +103,7 @@ def support_query_split_multilabel_conditioned(base_split, few_shot_aux):
     return {
         **base_split,
         "support_preds": torch.cat(conditioned_support, dim=0),
-        "query_label_preds": few_shot_aux.get("query_label_tokens"),
     }
-
-
-def _prepare_patch_tokens(cfg, tokens):
-    """Apply the same patch-token aggregation used by q2s matching."""
-    tokens = F.relu(tokens)
-    if not cfg.MODEL.USE_EXTRA_ENCODER:
-        if cfg.FEW_SHOT.PATCH_TOKENS_AGG == "temporal":
-            tokens = tokens.mean(dim=1)
-        elif cfg.FEW_SHOT.PATCH_TOKENS_AGG == "spatial":
-            tokens = tokens.mean(dim=2)
-        elif cfg.FEW_SHOT.PATCH_TOKENS_AGG == "no_agg":
-            tokens = rearrange(tokens, "b t p e -> b (t p) e")
-        else:
-            raise NotImplementedError(
-                f"Aggregation method {cfg.FEW_SHOT.PATCH_TOKENS_AGG} not implemented"
-            )
-    return tokens
-
-
-def _cos_sim(x, y, epsilon=0.01):
-    numerator = torch.matmul(x, y.transpose(-1, -2))
-    xnorm = torch.norm(x, dim=-1).unsqueeze(-1)
-    ynorm = torch.norm(y, dim=-1).unsqueeze(-1)
-    denominator = torch.matmul(xnorm, ynorm.transpose(-1, -2)) + epsilon
-    return torch.div(numerator, denominator)
-
-
-def class_conditioned_q2s_logits(cfg, support_tokens, query_label_tokens):
-    """Match support class prototypes against their label-conditioned query tokens."""
-    num_classes = support_tokens.shape[0]
-    class_logits = []
-    for class_idx in range(num_classes):
-        support_class = _prepare_patch_tokens(
-            cfg,
-            support_tokens[class_idx:class_idx + 1],
-        )
-        query_class = _prepare_patch_tokens(
-            cfg,
-            query_label_tokens[:, class_idx],
-        )
-        support_flat = rearrange(support_class, "b p e -> (b p) e")
-        query_flat = rearrange(query_class, "b p e -> (b p) e")
-        dist_matrix = 1 - _cos_sim(query_flat, support_flat)
-        dist_rearranged = rearrange(
-            dist_matrix,
-            "(q qt) (s st) -> q s qt st",
-            q=query_label_tokens.shape[0],
-            s=1,
-        )
-        dist_logits = (
-            dist_rearranged.min(3)[0].sum(2)
-            + dist_rearranged.min(2)[0].sum(2)
-        )
-        class_logits.append((-dist_logits.squeeze(1)).unsqueeze(1))
-    return torch.cat(class_logits, dim=1)
-
-
-def query_semantic_alignment_loss(few_shot_aux, cfg):
-    """BCE over query semantic tokens and their episode class text embeddings."""
-    if (
-        few_shot_aux is None
-        or not cfg.FEW_SHOT.QUERY_ALIGN.ENABLE
-        or "query_semantic_tokens" not in few_shot_aux
-    ):
-        return None
-    query_semantic = F.normalize(few_shot_aux["query_semantic_tokens"], dim=-1)
-    query_text = F.normalize(few_shot_aux["query_text_embeddings"], dim=-1)
-    logits = (query_semantic * query_text).sum(dim=-1) / cfg.FEW_SHOT.QUERY_ALIGN.TAU
-    targets = few_shot_aux["query_text_targets"].to(logits.dtype)
-    return F.binary_cross_entropy_with_logits(logits, targets)
 
 
 def multilabel_top1_accuracy(logits, labels):

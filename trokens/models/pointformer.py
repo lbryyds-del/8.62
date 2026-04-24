@@ -13,7 +13,7 @@ from sympy import divisors
 import numpy as np
 from torch.nn.init import trunc_normal_
 
-from trokens.models.attention import CrossAttention, TrajectoryAttentionBlock
+from trokens.models.attention import TrajectoryAttentionBlock
 from trokens.models.branches.motion_blocks import (
     CrossMotionModule,
     HODMotionModule
@@ -210,28 +210,24 @@ class Pointformer(nn.Module):
             )
             self.text_inject_alpha = nn.Parameter(torch.tensor(0.1))
             self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
-            self.use_query_alignment = cfg.FEW_SHOT.QUERY_ALIGN.ENABLE
-            if self.use_query_alignment:
-                self.query_token_proj = nn.Linear(self.embed_dim, self.embed_dim)
-                self.query_token_reader = CrossAttention(
-                    self.embed_dim,
-                    num_heads=self.num_heads,
-                    qkv_bias=self.qkv_bias,
-                    attn_drop=self.attn_drop_rate,
-                    proj_drop=self.drop_rate,
-                    use_mask=True,
-                )
-                self.query_gate_mlp = nn.Sequential(
-                    norm_layer(self.embed_dim),
-                    nn.Linear(self.embed_dim, self.embed_dim),
-                    nn.GELU(),
-                    nn.Linear(self.embed_dim, self.embed_dim),
-                )
-                self.query_gate_eta = nn.Parameter(
-                    torch.tensor(float(cfg.FEW_SHOT.QUERY_ALIGN.ETA_INIT))
-                )
+            self.use_soft_label_route = cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE
+            if self.use_soft_label_route:
+                self.soft_route_text_proj = nn.Linear(self.embed_dim, self.embed_dim)
+                self.soft_route_tag_proj = nn.Linear(self.embed_dim, self.embed_dim)
+                self.label_temporal_q = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
+                self.label_temporal_k = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
+                self.label_temporal_v = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
+                self.label_temporal_gq = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+                self.label_temporal_gk = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+                self.label_temporal_gv = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+                self.label_temporal_proj = nn.Linear(self.embed_dim, self.embed_dim)
+                self.label_traj_qkv = nn.Linear(self.embed_dim, self.embed_dim * 3, bias=self.qkv_bias)
+                self.label_traj_proj = nn.Linear(self.embed_dim, self.embed_dim)
+                self.label_slot_q = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
+                self.label_slot_kv = nn.Linear(self.embed_dim, self.embed_dim * 2, bias=self.qkv_bias)
+                self.label_slot_proj = nn.Linear(self.embed_dim, self.embed_dim)
         else:
-            self.use_query_alignment = False
+            self.use_soft_label_route = False
 
         # Initialize weights
         self.init_weights()
@@ -757,82 +753,221 @@ class Pointformer(nn.Module):
             ),
         }
 
-    def _build_query_aligned_branches(self, patch_tokens, metadata):
-        """Build label-conditioned query tokens using lightweight semantic readers."""
-        if not self.use_query_alignment:
-            return None
-        sample_info = np.array(metadata['sample_type'])
-        query_mask_np = sample_info != 'support'
-        if not query_mask_np.any():
-            return None
-        query_mask = torch.as_tensor(
-            query_mask_np,
-            device=patch_tokens.device,
-            dtype=torch.bool,
+    def _sharpen_route(self, route_weights):
+        """Sharpen soft label routing weights without making a hard assignment."""
+        num_labels = max(route_weights.shape[-1], 1)
+        route_weights = torch.nan_to_num(
+            route_weights,
+            nan=1.0 / num_labels,
+            posinf=1.0,
+            neginf=0.0,
         )
-        query_tokens = patch_tokens[query_mask]
-        query_targets = metadata['episode_positive_labels'][query_mask].float()
+        gamma = float(self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.SHARPEN_GAMMA)
+        if gamma == 1.0:
+            return route_weights
+        route_weights = route_weights.clamp_min(1e-6).pow(gamma)
+        route_weights = route_weights / route_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return torch.nan_to_num(
+            route_weights,
+            nan=1.0 / num_labels,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+    def _compute_soft_route(self, traj_repr, label_text):
+        """Compute trajectory-to-label soft routing weights."""
+        traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
+        label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
+        traj_repr = F.normalize(traj_repr, dim=-1)
+        label_text = F.normalize(label_text, dim=-1)
+        traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
+        label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
+        scores = torch.matmul(traj_repr, label_text.transpose(0, 1))
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
+        route = F.softmax(scores / self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ROUTE_TAU, dim=-1)
+        return self._sharpen_route(route)
+
+    def _label_aware_temporal_forward(self, x, label_tags, point_mask):
+        """Run temporal self-attention where Q/K/V receive label-tag modulation."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        label_tags = torch.nan_to_num(label_tags, nan=0.0, posinf=0.0, neginf=0.0)
+        bs, num_frames, num_points, feat_dim = x.shape
+        orig_dtype = x.dtype
+        q = self.label_temporal_q(x) + self.label_temporal_gq(label_tags).unsqueeze(1)
+        k = self.label_temporal_k(x) + self.label_temporal_gk(label_tags).unsqueeze(1)
+        v = self.label_temporal_v(x) + self.label_temporal_gv(label_tags).unsqueeze(1)
+        q = rearrange(q, 'b t m (h d) -> (b m) h t d', h=self.num_heads)
+        k = rearrange(k, 'b t m (h d) -> (b m) h t d', h=self.num_heads)
+        v = rearrange(v, 'b t m (h d) -> (b m) h t d', h=self.num_heads)
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        scale = (feat_dim // self.num_heads) ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        if point_mask is not None:
+            temporal_mask = rearrange(
+                point_mask,
+                'b t m -> (b m) t',
+            )
+            valid_rows = temporal_mask.any(dim=-1)
+            temporal_mask = temporal_mask.clone()
+            temporal_mask[~valid_rows] = True
+            attn = attn.masked_fill(
+                torch.logical_not(temporal_mask[:, None, None, :]),
+                float('-inf'),
+            )
+        attn = attn - attn.max(dim=-1, keepdim=True).values
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, '(b m) h t d -> b t m (h d)', b=bs, m=num_points)
+        if point_mask is not None:
+            valid_rows = rearrange(valid_rows, '(b m) -> b m', b=bs, m=num_points)
+            out = out * valid_rows[:, None, :, None].to(out.dtype)
+        out = self.label_temporal_proj(out.to(orig_dtype))
+        return torch.nan_to_num(x + out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _label_affinity_traj_forward(self, x, route_weights, point_mask):
+        """Run trajectory attention with an additive label-affinity bias."""
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        route_weights = torch.nan_to_num(route_weights, nan=0.0, posinf=1.0, neginf=0.0)
+        bs, num_frames, num_points, feat_dim = x.shape
+        orig_dtype = x.dtype
+        qkv = self.label_traj_qkv(x)
+        qkv = rearrange(qkv, 'b t m (three h d) -> three (b t) h m d',
+                        three=3, h=self.num_heads)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        scale = (feat_dim // self.num_heads) ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        affinity = torch.matmul(route_weights.float(), route_weights.float().transpose(-2, -1))
+        affinity = torch.nan_to_num(affinity, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
+        affinity = affinity.repeat_interleave(num_frames, dim=0)
+        attn = attn + self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.AFFINITY_ALPHA * affinity[:, None]
+        if point_mask is not None:
+            spatial_mask = rearrange(point_mask, 'b t m -> (b t) m')
+            valid_rows = spatial_mask.any(dim=-1)
+            spatial_mask = spatial_mask.clone()
+            spatial_mask[~valid_rows] = True
+            attn = attn.masked_fill(
+                torch.logical_not(spatial_mask[:, None, None, :]),
+                float('-inf'),
+            )
+        attn = attn - attn.max(dim=-1, keepdim=True).values
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, '(b t) h m d -> b t m (h d)', b=bs, t=num_frames)
+        if point_mask is not None:
+            valid_rows = rearrange(valid_rows, '(b t) -> b t', b=bs, t=num_frames)
+            out = out * valid_rows[:, :, None, None].to(out.dtype)
+        out = self.label_traj_proj(out.to(orig_dtype))
+        return torch.nan_to_num(x + out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _label_slot_prototypes(self, h_st, label_text):
+        """Use label text slots to aggregate all trajectory-time tokens."""
+        h_st = torch.nan_to_num(h_st, nan=0.0, posinf=0.0, neginf=0.0)
+        label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
+        bs, num_frames, num_points, feat_dim = h_st.shape
+        num_labels = label_text.shape[1]
+        tokens = rearrange(h_st, 'b t m c -> b (t m) c')
+        orig_dtype = tokens.dtype
+        query = self.label_slot_q(label_text)
+        kv = self.label_slot_kv(tokens)
+        q = rearrange(query, 'b z (h d) -> b h z d', h=self.num_heads)
+        kv = rearrange(kv, 'b n (two h d) -> two b h n d', two=2, h=self.num_heads)
+        k, v = kv[0], kv[1]
+        q = q.float()
+        k = k.float()
+        v = v.float()
+        scale = (feat_dim // self.num_heads) ** -0.5
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = attn - attn.max(dim=-1, keepdim=True).values
+        attn = F.softmax(attn / self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.SLOT_TAU, dim=-1)
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h z d -> b z (h d)')
+        out = self.label_slot_proj(out.to(orig_dtype))
+        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_soft_label_routed_support_prototypes(self, fused_feat, metadata):
+        """Build label-slot prototypes using one shared soft-routed support stream."""
+        support_mask = metadata['support_mask'].bool()
+        episode_positive_labels = metadata['episode_positive_labels'].bool()
+        base_pt_mask = (
+            metadata['pred_query_mask']
+            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
+            else metadata['pred_visibility']
+        ).bool()
         episode_class_ids = metadata['episode_class_ids'].long()
-        if episode_class_ids.ndim == 2:
-            query_episode_class_ids = episode_class_ids[query_mask]
-        else:
-            query_episode_class_ids = episode_class_ids.unsqueeze(0).expand(
-                query_tokens.shape[0],
-                -1,
+
+        slot_tokens = []
+        slot_class_indices = []
+        slot_sample_indices = []
+        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
+        for sample_idx in support_indices.tolist():
+            positive_labels = torch.nonzero(
+                episode_positive_labels[sample_idx],
+                as_tuple=False,
+            ).flatten()
+            if positive_labels.numel() == 0:
+                continue
+
+            sample_episode_class_ids = (
+                episode_class_ids[sample_idx]
+                if episode_class_ids.ndim == 2
+                else episode_class_ids
+            )
+            global_class_indices = sample_episode_class_ids.index_select(0, positive_labels)
+            _, _, label_text = self._get_branch_text_features(
+                global_class_indices,
+                fused_feat.dtype,
             )
 
-        num_queries, num_episode_classes = query_episode_class_ids.shape
-        flat_class_ids = query_episode_class_ids.reshape(-1)
-        _, _, text_global = self._get_branch_text_features(
-            flat_class_ids,
-            query_tokens.dtype,
-        )
-        text_global = text_global.view(num_queries, num_episode_classes, -1)
-        semantic_tokens = self.query_token_proj(text_global)
-        flat_semantic_tokens = semantic_tokens.reshape(-1, 1, semantic_tokens.shape[-1])
-
-        flat_query_tokens = query_tokens.unsqueeze(1).expand(
-            -1,
-            num_episode_classes,
-            -1,
-            -1,
-            -1,
-        )
-        flat_query_tokens = flat_query_tokens.reshape(
-            num_queries * num_episode_classes,
-            query_tokens.shape[1] * query_tokens.shape[2],
-            query_tokens.shape[3],
-        )
-        query_kv_mask = torch.ones(
-            flat_query_tokens.shape[:2],
-            device=flat_query_tokens.device,
-            dtype=torch.bool,
-        )
-        query_delta = self.query_token_reader(
-            flat_query_tokens,
-            flat_semantic_tokens,
-            query_kv_mask,
-        )
-        query_semantic_tokens = (flat_semantic_tokens + query_delta).squeeze(1)
-        query_semantic_tokens = query_semantic_tokens.view(
-            num_queries,
-            num_episode_classes,
-            -1,
-        )
-        query_gates = torch.sigmoid(self.query_gate_mlp(query_semantic_tokens))
-        query_label_tokens = (
-            query_tokens.unsqueeze(1)
-            * (
-                1.0
-                + self.query_gate_eta.to(query_tokens.dtype)
-                * query_gates.unsqueeze(2).unsqueeze(2)
+            support_feat = fused_feat[sample_idx:sample_idx + 1]
+            support_mask_i = base_pt_mask[sample_idx:sample_idx + 1]
+            traj_repr = support_feat.mean(dim=1).squeeze(0)
+            route = self._compute_soft_route(traj_repr, label_text)
+            cluster_text = torch.matmul(route, label_text)
+            h0 = support_feat + (
+                self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.TEXT_INJECT_ALPHA
+                * self.soft_route_text_proj(cluster_text).unsqueeze(0).unsqueeze(1)
             )
-        )
+
+            traj_repr_tag = h0.mean(dim=1).squeeze(0)
+            route_tag = self._compute_soft_route(traj_repr_tag, label_text)
+            label_tags = torch.matmul(route_tag, label_text)
+            h0 = h0 + (
+                self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.TAG_INJECT_ALPHA
+                * self.soft_route_tag_proj(label_tags).unsqueeze(0).unsqueeze(1)
+            )
+            h_time = self._label_aware_temporal_forward(h0, label_tags.unsqueeze(0), support_mask_i)
+            h_st = self._label_affinity_traj_forward(h_time, route_tag.unsqueeze(0), support_mask_i)
+            sample_slots = self._label_slot_prototypes(h_st, label_text.unsqueeze(0)).squeeze(0)
+            sample_slots = torch.nan_to_num(sample_slots, nan=0.0, posinf=0.0, neginf=0.0)
+            slot_tokens.append(sample_slots[:, None, None, :])
+            slot_class_indices.append(positive_labels)
+            slot_sample_indices.extend([sample_idx] * positive_labels.numel())
+
+        if not slot_tokens:
+            return None
+
+        support_tokens = torch.cat(slot_tokens, dim=0)
+        support_tokens = torch.nan_to_num(support_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+        class_indices = torch.cat(slot_class_indices, dim=0)
         return {
-            'query_label_tokens': query_label_tokens,
-            'query_semantic_tokens': query_semantic_tokens,
-            'query_text_embeddings': text_global,
-            'query_text_targets': query_targets,
+            'support_conditioned_patch_tokens': support_tokens,
+            'support_branch_point_weights': support_tokens.new_ones(
+                (support_tokens.shape[0], support_tokens.shape[2])
+            ),
+            'support_branch_class_indices': class_indices.to(
+                device=support_tokens.device,
+                dtype=torch.long,
+            ),
+            'support_branch_sample_indices': torch.tensor(
+                slot_sample_indices,
+                device=support_tokens.device,
+                dtype=torch.long,
+            ),
         }
 
     def _get_branch_text_features(self, global_class_indices, dtype):
@@ -1181,15 +1316,16 @@ class Pointformer(nn.Module):
             and 'support_mask' in metadata
             and 'episode_positive_labels' in metadata
         ):
-            few_shot_aux = self._build_support_conditioned_branches(
-                sampled_feat,
-                metadata,
-            )
-            query_aux = self._build_query_aligned_branches(patch_x, metadata)
-            if query_aux is not None:
-                if few_shot_aux is None:
-                    few_shot_aux = {}
-                few_shot_aux.update(query_aux)
+            if self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE:
+                few_shot_aux = self._build_soft_label_routed_support_prototypes(
+                    sampled_feat,
+                    metadata,
+                )
+            else:
+                few_shot_aux = self._build_support_conditioned_branches(
+                    sampled_feat,
+                    metadata,
+                )
         # x = self.forward_features(x, metadata) # [BS, d]
         x = self.head_drop(cls_x)
 

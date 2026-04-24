@@ -389,8 +389,14 @@ def load_checkpoint(
             ]
             # Log weights that are not loaded with the pre-trained weights.
             if not_load_layers:
-                for k in not_load_layers:
-                    logger.info("Network weights {} not loaded.".format(k))
+                preview = ", ".join(not_load_layers[:5])
+                if len(not_load_layers) > 5:
+                    preview = f"{preview}, ..."
+                logger.debug(
+                    "Skipped loading %d unmatched network weights. First few: %s",
+                    len(not_load_layers),
+                    preview,
+                )
             # Load pre-trained weights.
             ms.load_state_dict(pre_train_dict_match, strict=False)
             epoch = -1
@@ -399,9 +405,21 @@ def load_checkpoint(
         if "epoch" in checkpoint.keys() and not epoch_reset:
             epoch = checkpoint["epoch"]
             if optimizer:
-                optimizer.load_state_dict(checkpoint["optimizer_state"])
+                try:
+                    optimizer.load_state_dict(checkpoint["optimizer_state"])
+                except ValueError as err:
+                    logger.warning(
+                        "Skip optimizer state from checkpoint due to parameter group mismatch: %s",
+                        err,
+                    )
             if scaler:
-                scaler.load_state_dict(checkpoint["scaler_state"])
+                try:
+                    scaler.load_state_dict(checkpoint["scaler_state"])
+                except (ValueError, KeyError) as err:
+                    logger.warning(
+                        "Skip scaler state from checkpoint: %s",
+                        err,
+                    )
         else:
             epoch = -1
 
@@ -570,22 +588,7 @@ def load_train_checkpoint(cfg, model, optimizer, scaler=None):
     """
     Loading checkpoint logic for training.
     """
-    if cfg.TRAIN.AUTO_RESUME and has_checkpoint(cfg.OUTPUT_DIR):
-        if cfg.TRAIN.VAL_ONLY and cfg.TEST.TEST_EPOCH_NUM > 0:
-            n = cfg.TEST.TEST_EPOCH_NUM
-            last_checkpoint = os.path.join(cfg.OUTPUT_DIR, 'checkpoints', f'checkpoint_epoch_{n:05}.pyth')
-            logger.info("Load checkpoint epoch {}: {}.".format(n, last_checkpoint))
-        else:
-            last_checkpoint = get_last_checkpoint(cfg.OUTPUT_DIR)
-            logger.info("Load from last checkpoint, {}.".format(last_checkpoint))
-        checkpoint_epoch = load_checkpoint(
-            last_checkpoint, model, cfg.NUM_GPUS > 1, optimizer, scaler=scaler
-        )
-        start_epoch = checkpoint_epoch + 1
-    elif cfg.TRAIN.NEW_TRAIN:
-        logger.info("Start from scratch.")
-        start_epoch = 0
-    elif cfg.TRAIN.CHECKPOINT_FILE_PATH != "":
+    if cfg.TRAIN.CHECKPOINT_FILE_PATH != "":
         logger.info("Load from given checkpoint file.")
         checkpoint_epoch = load_checkpoint(
             cfg.TRAIN.CHECKPOINT_FILE_PATH,
@@ -601,6 +604,21 @@ def load_train_checkpoint(cfg, model, optimizer, scaler=None):
             should_split_qkv = cfg.SPLIT_QKV_CHECKPOINT,
         )
         start_epoch = checkpoint_epoch + 1
+    elif cfg.TRAIN.AUTO_RESUME and has_checkpoint(cfg.OUTPUT_DIR):
+        if cfg.TRAIN.VAL_ONLY and cfg.TEST.TEST_EPOCH_NUM > 0:
+            n = cfg.TEST.TEST_EPOCH_NUM
+            last_checkpoint = os.path.join(cfg.OUTPUT_DIR, 'checkpoints', f'checkpoint_epoch_{n:05}.pyth')
+            logger.info("Load checkpoint epoch {}: {}.".format(n, last_checkpoint))
+        else:
+            last_checkpoint = get_last_checkpoint(cfg.OUTPUT_DIR)
+            logger.info("Load from last checkpoint, {}.".format(last_checkpoint))
+        checkpoint_epoch = load_checkpoint(
+            last_checkpoint, model, cfg.NUM_GPUS > 1, optimizer, scaler=scaler
+        )
+        start_epoch = checkpoint_epoch + 1
+    elif cfg.TRAIN.NEW_TRAIN:
+        logger.info("Start from scratch.")
+        start_epoch = 0
     else:
         start_epoch = 0
 
