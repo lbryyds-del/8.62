@@ -890,6 +890,32 @@ class Pointformer(nn.Module):
         out = self.label_slot_proj(out.to(orig_dtype))
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _gate_weighted_visual_prototypes(self, h_st, gate, point_mask):
+        """Aggregate visual trajectory tokens with the precomputed trajectory gate."""
+        h_st = torch.nan_to_num(h_st, nan=0.0, posinf=0.0, neginf=0.0)
+        if gate.ndim == 1:
+            gate = gate.unsqueeze(0)
+        gate = torch.nan_to_num(
+            gate.to(device=h_st.device, dtype=h_st.dtype),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+
+        if point_mask is None:
+            point_mask = torch.ones(
+                h_st.shape[:3],
+                device=h_st.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=h_st.device).bool()
+
+        weights = gate[:, None, :, None] * point_mask[..., None].to(h_st.dtype)
+        denom = weights.sum(dim=(1, 2)).clamp_min(1e-6)
+        proto = (h_st * weights).sum(dim=(1, 2)) / denom
+        return torch.nan_to_num(proto.unsqueeze(1), nan=0.0, posinf=0.0, neginf=0.0)
+
     def _build_soft_label_routed_support_prototypes(self, fused_feat, metadata):
         """Build per-label Otsu relation-gated support prototypes."""
         support_mask = metadata['support_mask'].bool()
@@ -937,9 +963,10 @@ class Pointformer(nn.Module):
                     gate.unsqueeze(0),
                     support_mask_i,
                 )
-                sample_slot = self._label_slot_prototypes(
+                sample_slot = self._gate_weighted_visual_prototypes(
                     h_st,
-                    label_text_i.view(1, 1, -1),
+                    gate.unsqueeze(0),
+                    support_mask_i,
                 ).squeeze(0)
                 sample_slot = torch.nan_to_num(
                     sample_slot,
