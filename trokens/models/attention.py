@@ -51,6 +51,53 @@ class Attention(nn.Module):
             x = self.proj_drop(x)
         return x
 
+    def forward_text_relation(
+        self,
+        x,
+        text_mod,
+        relation_gate=None,
+        mask=None,
+        relation_eps=1e-6,
+    ):
+        """Forward pass with text-conditioned queries and relation gate bias."""
+        if not self.with_qkv:
+            raise RuntimeError("Text relation attention requires qkv projections.")
+
+        batch_size, seq_len, feat_dim = x.shape
+        head_dim = feat_dim // self.num_heads
+        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads,
+                                  head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        gamma, beta = text_mod
+        gamma = gamma.reshape(batch_size, self.num_heads, head_dim).unsqueeze(2)
+        beta = beta.reshape(batch_size, self.num_heads, head_dim).unsqueeze(2)
+        q = q * (1.0 + gamma.to(dtype=q.dtype)) + beta.to(dtype=q.dtype)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        if relation_gate is not None:
+            gate = relation_gate.to(device=x.device, dtype=attn.dtype)
+            gate = torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0)
+            gate = gate.clamp_min(relation_eps)
+            pair_gate = torch.sqrt(gate[:, :, None] * gate[:, None, :])
+            attn = attn + torch.log(pair_gate[:, None, :, :].clamp_min(relation_eps))
+
+        if self.use_mask and mask is not None:
+            if len(mask.shape) == 2:
+                attn = attn.masked_fill(torch.logical_not(mask[:, None, None, :]),
+                                        float('-inf'))
+            else:
+                attn = attn.masked_fill(torch.logical_not(mask[:, None, :, :]),
+                                        float('-inf'))
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(batch_size, seq_len, feat_dim)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
 class Block(nn.Module):
     """Block module"""
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False,
@@ -461,6 +508,153 @@ class TrajectoryAttentionBlock(nn.Module):
                 b=batch_size,
                 t=num_frames,
             )
+            cls_token = torch.mean(cls_token, 1, True)
+            res_spatial = res_spatial[:, 1:, :]
+        res_spatial = rearrange(
+            res_spatial,
+            '(b t) (h w) m -> b (h w t) m',
+            b=batch_size,
+            h=height,
+            w=width,
+            t=num_frames,
+        )
+
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            x = torch.cat((init_cls_token, xt), 1) + torch.cat(
+                (cls_token, res_spatial), 1
+            )
+        else:
+            x = xt + res_spatial
+
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x, thw
+
+    def forward_text_relation_conditioned(
+        self,
+        x,
+        thw,
+        pt_mask,
+        text_mod,
+        relation_gate,
+        relation_eps=1e-6,
+    ):
+        """Forward pass with standard Time-SA and text-gated relation Space-SA."""
+        if self.pt_attention != 'divided_space_time':
+            raise NotImplementedError(
+                f"Unsupported text-relation attention type {self.pt_attention}"
+            )
+
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            xt = x[:, 1:, :]
+            temporal_mask = pt_mask[:, 1:].clone()
+        else:
+            xt = x
+            temporal_mask = pt_mask.clone()
+        num_frames, height, width = thw
+        batch_size = x.shape[0]
+        spatial_mask = None
+
+        xt = rearrange(xt, 'b (h w t) m -> (b h w) t m',
+                       b=batch_size, h=height, w=width, t=num_frames)
+        if self.use_pt_visibility:
+            temporal_mask = rearrange(
+                temporal_mask,
+                'b (h w t) -> (b h w) t',
+                b=batch_size,
+                h=height,
+                w=width,
+                t=num_frames,
+            )
+        res_temporal = self.drop_path(
+            self.temporal_attn(self.temporal_norm1(xt), temporal_mask)
+        )
+        res_temporal = rearrange(
+            res_temporal,
+            '(b h w) t m -> b (h w t) m',
+            b=batch_size,
+            h=height,
+            w=width,
+            t=num_frames,
+        )
+        res_temporal = self.temporal_fc(res_temporal)
+
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            xt = x[:, 1:, :] + res_temporal
+            init_cls_token = x[:, 0, :].unsqueeze(1)
+            cls_token = init_cls_token.repeat(1, num_frames, 1)
+            if self.use_pt_visibility:
+                intit_cls_pt_mask = pt_mask[:, 0].unsqueeze(1)
+                spatial_mask = pt_mask[:, 1:].clone()
+                intit_cls_pt_mask = intit_cls_pt_mask.repeat(1, num_frames)
+            cls_token = rearrange(cls_token, 'b t m -> (b t) 1 m',
+                                  b=batch_size, t=num_frames)
+        else:
+            xt = x + res_temporal
+            if self.use_pt_visibility:
+                spatial_mask = pt_mask.clone()
+
+        xs = rearrange(xt, 'b (h w t) m -> (b t) (h w) m',
+                       b=batch_size, h=height, w=width, t=num_frames)
+        spatial_relation_gate = relation_gate
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            xs = torch.cat((cls_token, xs), 1)
+            cls_relation_gate = torch.ones(
+                spatial_relation_gate.shape[0],
+                1,
+                device=spatial_relation_gate.device,
+                dtype=spatial_relation_gate.dtype,
+            )
+            spatial_relation_gate = torch.cat(
+                (cls_relation_gate, spatial_relation_gate),
+                dim=1,
+            )
+            if self.use_pt_visibility:
+                intit_cls_pt_mask = rearrange(
+                    intit_cls_pt_mask,
+                    'b t -> (b t) 1',
+                    b=batch_size,
+                    t=num_frames,
+                )
+                spatial_mask = rearrange(
+                    spatial_mask,
+                    'b (h w t) -> (b t) (h w)',
+                    b=batch_size,
+                    h=height,
+                    w=width,
+                    t=num_frames,
+                )
+                spatial_mask = torch.cat((intit_cls_pt_mask, spatial_mask), 1)
+        elif self.use_pt_visibility:
+            spatial_mask = rearrange(
+                spatial_mask,
+                'b (h w t) -> (b t) (h w)',
+                b=batch_size,
+                h=height,
+                w=width,
+                t=num_frames,
+            )
+
+        spatial_relation_gate = spatial_relation_gate.repeat_interleave(
+            num_frames,
+            dim=0,
+        )
+        spatial_text_mod = (
+            text_mod[0].repeat_interleave(num_frames, dim=0),
+            text_mod[1].repeat_interleave(num_frames, dim=0),
+        )
+        res_spatial = self.drop_path(
+            self.attn.forward_text_relation(
+                self.norm1(xs),
+                spatial_text_mod,
+                spatial_relation_gate,
+                spatial_mask,
+                relation_eps,
+            )
+        )
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            cls_token = res_spatial[:, 0, :]
+            cls_token = rearrange(cls_token, '(b t) m -> b t m',
+                                  b=batch_size, t=num_frames)
             cls_token = torch.mean(cls_token, 1, True)
             res_spatial = res_spatial[:, 1:, :]
         res_spatial = rearrange(

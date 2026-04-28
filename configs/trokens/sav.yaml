@@ -25,6 +25,9 @@ FEW_SHOT:
     TAG_INJECT_ALPHA: 0.1
     AFFINITY_ALPHA: 0.1
     SLOT_TAU: 0.07
+    GATE_TEMPERATURE: 0.05
+    OTSU_BINS: 64
+    RELATION_EPS: 1e-6
 
 POINT_INFO:
   NAME: cotracker3_bip_fr_32_feat_dinotxt_vitl14reg4_fps_10

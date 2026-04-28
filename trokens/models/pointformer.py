@@ -212,17 +212,10 @@ class Pointformer(nn.Module):
             self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
             self.use_soft_label_route = cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE
             if self.use_soft_label_route:
-                self.soft_route_text_proj = nn.Linear(self.embed_dim, self.embed_dim)
-                self.soft_route_tag_proj = nn.Linear(self.embed_dim, self.embed_dim)
-                self.label_temporal_q = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
-                self.label_temporal_k = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
-                self.label_temporal_v = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
-                self.label_temporal_gq = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-                self.label_temporal_gk = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-                self.label_temporal_gv = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
-                self.label_temporal_proj = nn.Linear(self.embed_dim, self.embed_dim)
-                self.label_traj_qkv = nn.Linear(self.embed_dim, self.embed_dim * 3, bias=self.qkv_bias)
-                self.label_traj_proj = nn.Linear(self.embed_dim, self.embed_dim)
+                self.label_q_mod_mlp = nn.Sequential(
+                    norm_layer(self.embed_dim),
+                    nn.Linear(self.embed_dim, self.embed_dim * 2),
+                )
                 self.label_slot_q = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
                 self.label_slot_kv = nn.Linear(self.embed_dim, self.embed_dim * 2, bias=self.qkv_bias)
                 self.label_slot_proj = nn.Linear(self.embed_dim, self.embed_dim)
@@ -753,116 +746,124 @@ class Pointformer(nn.Module):
             ),
         }
 
-    def _sharpen_route(self, route_weights):
-        """Sharpen soft label routing weights without making a hard assignment."""
-        num_labels = max(route_weights.shape[-1], 1)
-        route_weights = torch.nan_to_num(
-            route_weights,
-            nan=1.0 / num_labels,
+    def _otsu_threshold(self, scores):
+        """Compute a detached Otsu threshold for one trajectory-label score vector."""
+        scores_detached = torch.nan_to_num(
+            scores.detach().float(),
+            nan=0.0,
             posinf=1.0,
-            neginf=0.0,
-        )
-        gamma = float(self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.SHARPEN_GAMMA)
-        if gamma == 1.0:
-            return route_weights
-        route_weights = route_weights.clamp_min(1e-6).pow(gamma)
-        route_weights = route_weights / route_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-        return torch.nan_to_num(
-            route_weights,
-            nan=1.0 / num_labels,
-            posinf=1.0,
-            neginf=0.0,
-        )
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        if scores_detached.numel() == 0:
+            return scores.new_tensor(0.0)
+        if torch.isclose(scores_detached.max(), scores_detached.min()):
+            return scores_detached.mean().to(device=scores.device, dtype=scores.dtype)
 
-    def _compute_soft_route(self, traj_repr, label_text):
-        """Compute trajectory-to-label soft routing weights."""
+        route_cfg = self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE
+        num_bins = max(int(getattr(route_cfg, "OTSU_BINS", 64)), 2)
+        hist = torch.histc(scores_detached, bins=num_bins, min=-1.0, max=1.0)
+        hist_sum = hist.sum()
+        if hist_sum <= 0:
+            return scores_detached.mean().to(device=scores.device, dtype=scores.dtype)
+
+        bin_width = 2.0 / num_bins
+        bin_centers = torch.linspace(
+            -1.0 + 0.5 * bin_width,
+            1.0 - 0.5 * bin_width,
+            num_bins,
+            device=scores_detached.device,
+            dtype=scores_detached.dtype,
+        )
+        prob = hist / hist_sum.clamp_min(1.0)
+        omega = prob.cumsum(dim=0)
+        mu = (prob * bin_centers).cumsum(dim=0)
+        mu_total = mu[-1]
+        denom = omega * (1.0 - omega)
+        valid = denom > 1e-12
+        if not bool(valid.any().item()):
+            return scores_detached.mean().to(device=scores.device, dtype=scores.dtype)
+
+        sigma_b = (mu_total * omega - mu).pow(2) / denom.clamp_min(1e-12)
+        sigma_b = sigma_b.masked_fill(~valid, -1.0)
+        threshold = bin_centers[sigma_b.argmax()]
+        return threshold.to(device=scores.device, dtype=scores.dtype)
+
+    def _compute_otsu_gate(self, traj_repr, label_text):
+        """Compute one label's trajectory relevance scores, Otsu threshold, and gate."""
         traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
         label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
+        if label_text.ndim == 1:
+            label_text = label_text.unsqueeze(0)
         traj_repr = F.normalize(traj_repr, dim=-1)
         label_text = F.normalize(label_text, dim=-1)
         traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
         label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
-        scores = torch.matmul(traj_repr, label_text.transpose(0, 1))
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=-1.0).clamp_(-1.0, 1.0)
-        route = F.softmax(scores / self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ROUTE_TAU, dim=-1)
-        return self._sharpen_route(route)
 
-    def _label_aware_temporal_forward(self, x, label_tags, point_mask):
-        """Run temporal self-attention where Q/K/V receive label-tag modulation."""
+        scores = torch.matmul(traj_repr, label_text.squeeze(0))
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        threshold = self._otsu_threshold(scores).detach()
+        route_cfg = self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE
+        temperature = max(float(getattr(route_cfg, "GATE_TEMPERATURE", 0.05)), 1e-6)
+        gate = torch.sigmoid((scores - threshold) / temperature)
+        gate = torch.nan_to_num(gate, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        return scores, threshold, gate
+
+    def _text_relation_spatial_forward(self, x, label_text, gate, point_mask):
+        """Run standard temporal attention and text-gated relation spatial attention."""
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        label_tags = torch.nan_to_num(label_tags, nan=0.0, posinf=0.0, neginf=0.0)
-        bs, num_frames, num_points, feat_dim = x.shape
-        orig_dtype = x.dtype
-        q = self.label_temporal_q(x) + self.label_temporal_gq(label_tags).unsqueeze(1)
-        k = self.label_temporal_k(x) + self.label_temporal_gk(label_tags).unsqueeze(1)
-        v = self.label_temporal_v(x) + self.label_temporal_gv(label_tags).unsqueeze(1)
-        q = rearrange(q, 'b t m (h d) -> (b m) h t d', h=self.num_heads)
-        k = rearrange(k, 'b t m (h d) -> (b m) h t d', h=self.num_heads)
-        v = rearrange(v, 'b t m (h d) -> (b m) h t d', h=self.num_heads)
-        q = q.float()
-        k = k.float()
-        v = v.float()
-        scale = (feat_dim // self.num_heads) ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        if point_mask is not None:
-            temporal_mask = rearrange(
+        if label_text.ndim == 1:
+            label_text = label_text.unsqueeze(0)
+        if gate.ndim == 1:
+            gate = gate.unsqueeze(0)
+
+        bs, temporal_dim, num_points, _ = x.shape
+        if point_mask is None:
+            point_mask = torch.ones(
+                bs,
+                temporal_dim,
+                num_points,
+                device=x.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.bool()
+
+        x = rearrange(x, 'b t n d -> b n t d')
+        point_mask = rearrange(point_mask, 'b t n -> b n t')
+        x = rearrange(x, 'b n t d -> b (n t) d')
+        point_mask = rearrange(point_mask, 'b n t -> b (n t)')
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            cls_tokens = self.cls_token.expand(bs, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            cls_token_mask = torch.ones(bs, 1, device=x.device, dtype=torch.bool)
+            point_mask = torch.cat((cls_token_mask, point_mask), dim=1)
+
+        text_mod = self.label_q_mod_mlp(label_text.to(dtype=x.dtype, device=x.device))
+        gamma, beta = text_mod.chunk(2, dim=-1)
+        gate = gate.to(device=x.device, dtype=x.dtype)
+        thw = [
+            temporal_dim,
+            self.point_grid_size,
+            int(num_points / self.point_grid_size),
+        ]
+        relation_eps = float(getattr(self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE, "RELATION_EPS", 1e-6))
+        for _, blk in enumerate(self.blocks):
+            x, _ = blk.forward_text_relation_conditioned(
+                x,
+                thw,
                 point_mask,
-                'b t m -> (b m) t',
+                (gamma, beta),
+                gate,
+                relation_eps,
             )
-            valid_rows = temporal_mask.any(dim=-1)
-            temporal_mask = temporal_mask.clone()
-            temporal_mask[~valid_rows] = True
-            attn = attn.masked_fill(
-                torch.logical_not(temporal_mask[:, None, None, :]),
-                float('-inf'),
-            )
-        attn = attn - attn.max(dim=-1, keepdim=True).values
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, '(b m) h t d -> b t m (h d)', b=bs, m=num_points)
-        if point_mask is not None:
-            valid_rows = rearrange(valid_rows, '(b m) -> b m', b=bs, m=num_points)
-            out = out * valid_rows[:, None, :, None].to(out.dtype)
-        out = self.label_temporal_proj(out.to(orig_dtype))
-        return torch.nan_to_num(x + out, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _label_affinity_traj_forward(self, x, route_weights, point_mask):
-        """Run trajectory attention with an additive label-affinity bias."""
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        route_weights = torch.nan_to_num(route_weights, nan=0.0, posinf=1.0, neginf=0.0)
-        bs, num_frames, num_points, feat_dim = x.shape
-        orig_dtype = x.dtype
-        qkv = self.label_traj_qkv(x)
-        qkv = rearrange(qkv, 'b t m (three h d) -> three (b t) h m d',
-                        three=3, h=self.num_heads)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        q = q.float()
-        k = k.float()
-        v = v.float()
-        scale = (feat_dim // self.num_heads) ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        affinity = torch.matmul(route_weights.float(), route_weights.float().transpose(-2, -1))
-        affinity = torch.nan_to_num(affinity, nan=0.0, posinf=1.0, neginf=0.0).clamp_(0.0, 1.0)
-        affinity = affinity.repeat_interleave(num_frames, dim=0)
-        attn = attn + self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.AFFINITY_ALPHA * affinity[:, None]
-        if point_mask is not None:
-            spatial_mask = rearrange(point_mask, 'b t m -> (b t) m')
-            valid_rows = spatial_mask.any(dim=-1)
-            spatial_mask = spatial_mask.clone()
-            spatial_mask[~valid_rows] = True
-            attn = attn.masked_fill(
-                torch.logical_not(spatial_mask[:, None, None, :]),
-                float('-inf'),
-            )
-        attn = attn - attn.max(dim=-1, keepdim=True).values
-        attn = attn.softmax(dim=-1)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, '(b t) h m d -> b t m (h d)', b=bs, t=num_frames)
-        if point_mask is not None:
-            valid_rows = rearrange(valid_rows, '(b t) -> b t', b=bs, t=num_frames)
-            out = out * valid_rows[:, :, None, None].to(out.dtype)
-        out = self.label_traj_proj(out.to(orig_dtype))
-        return torch.nan_to_num(x + out, nan=0.0, posinf=0.0, neginf=0.0)
+        x = self.norm(x)
+        if self.cfg.MODEL.USE_CLS_TOKEN:
+            patch_x = x[:, 1:]
+        else:
+            patch_x = x
+        patch_x = rearrange(patch_x, 'b (n t) d -> b t n d', t=temporal_dim)
+        return torch.nan_to_num(patch_x, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _label_slot_prototypes(self, h_st, label_text):
         """Use label text slots to aggregate all trajectory-time tokens."""
@@ -890,7 +891,7 @@ class Pointformer(nn.Module):
         return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _build_soft_label_routed_support_prototypes(self, fused_feat, metadata):
-        """Build label-slot prototypes using one shared soft-routed support stream."""
+        """Build per-label Otsu relation-gated support prototypes."""
         support_mask = metadata['support_mask'].bool()
         episode_positive_labels = metadata['episode_positive_labels'].bool()
         base_pt_mask = (
@@ -926,27 +927,29 @@ class Pointformer(nn.Module):
             support_feat = fused_feat[sample_idx:sample_idx + 1]
             support_mask_i = base_pt_mask[sample_idx:sample_idx + 1]
             traj_repr = support_feat.mean(dim=1).squeeze(0)
-            route = self._compute_soft_route(traj_repr, label_text)
-            cluster_text = torch.matmul(route, label_text)
-            h0 = support_feat + (
-                self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.TEXT_INJECT_ALPHA
-                * self.soft_route_text_proj(cluster_text).unsqueeze(0).unsqueeze(1)
-            )
 
-            traj_repr_tag = h0.mean(dim=1).squeeze(0)
-            route_tag = self._compute_soft_route(traj_repr_tag, label_text)
-            label_tags = torch.matmul(route_tag, label_text)
-            h0 = h0 + (
-                self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.TAG_INJECT_ALPHA
-                * self.soft_route_tag_proj(label_tags).unsqueeze(0).unsqueeze(1)
-            )
-            h_time = self._label_aware_temporal_forward(h0, label_tags.unsqueeze(0), support_mask_i)
-            h_st = self._label_affinity_traj_forward(h_time, route_tag.unsqueeze(0), support_mask_i)
-            sample_slots = self._label_slot_prototypes(h_st, label_text.unsqueeze(0)).squeeze(0)
-            sample_slots = torch.nan_to_num(sample_slots, nan=0.0, posinf=0.0, neginf=0.0)
-            slot_tokens.append(sample_slots[:, None, None, :])
-            slot_class_indices.append(positive_labels)
-            slot_sample_indices.extend([sample_idx] * positive_labels.numel())
+            for label_offset, positive_label in enumerate(positive_labels):
+                label_text_i = label_text[label_offset]
+                _, _, gate = self._compute_otsu_gate(traj_repr, label_text_i)
+                h_st = self._text_relation_spatial_forward(
+                    support_feat,
+                    label_text_i.unsqueeze(0),
+                    gate.unsqueeze(0),
+                    support_mask_i,
+                )
+                sample_slot = self._label_slot_prototypes(
+                    h_st,
+                    label_text_i.view(1, 1, -1),
+                ).squeeze(0)
+                sample_slot = torch.nan_to_num(
+                    sample_slot,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                slot_tokens.append(sample_slot[:, None, None, :])
+                slot_class_indices.append(positive_label.view(1))
+                slot_sample_indices.append(sample_idx)
 
         if not slot_tokens:
             return None
