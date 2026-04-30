@@ -2,9 +2,12 @@
 
 """Test a few shot classification model."""
 # pylint: disable=wrong-import-position,import-error,wrong-import-order
+import json
 import os
 import sys
 import pprint
+from datetime import datetime
+import logging as pylogging
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -167,6 +170,28 @@ def support_query_split(preds, labels, metadata):
     return return_dict
 
 logger = logging.get_logger(__name__)
+
+
+def attach_test_log_file(output_dir):
+    """Attach a dedicated per-test log file alongside stdout.log."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(output_dir, f"test_{timestamp}.log")
+    formatter = pylogging.Formatter(
+        "[%(asctime)s][%(levelname)s] %(filename)s: %(lineno)3d: %(message)s",
+        datefmt="%m/%d %H:%M:%S",
+    )
+    handler = pylogging.FileHandler(filename, mode="a", encoding="utf-8")
+    handler.setLevel(pylogging.DEBUG)
+    handler.setFormatter(formatter)
+    pylogging.getLogger().addHandler(handler)
+    return filename, handler
+
+
+def append_test_history(output_dir, payload):
+    """Append one JSON line per finished test run."""
+    history_path = os.path.join(output_dir, "test_history.jsonl")
+    with open(history_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 def conv_fp16(var):
     """Convert to float16.
@@ -405,6 +430,23 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
             'test_novel_map': novel_map,
             'test_hm_map': hm_map,
         })
+        if du.is_master_proc():
+            append_test_history(
+                cfg.OUTPUT_DIR,
+                {
+                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "test_log_file": cfg.get("test_log_file", ""),
+                    "checkpoint_path": cfg.TEST.CHECKPOINT_FILE_PATH,
+                    "epoch": int(cur_epoch),
+                    "base_map": float(base_map),
+                    "novel_map": float(novel_map),
+                    "hm_map": float(hm_map),
+                    "class_aps": {
+                        str(class_id): float(class_ap * 100.0)
+                        for class_id, class_ap in sorted(class_aps.items())
+                    },
+                },
+            )
     if cfg['wandb']:
         cfg['wandb'].log(log_dict)
     if multi_label:
@@ -462,6 +504,12 @@ def test_few_shot(cfg, args, wandb_run=None):
 
     # Setup logging format.
     logging.setup_logging(cfg.OUTPUT_DIR)
+    test_log_file = ""
+    test_log_handler = None
+    if du.is_master_proc():
+        test_log_file, test_log_handler = attach_test_log_file(cfg.OUTPUT_DIR)
+        logger.info("Dedicated test log file: %s", test_log_file)
+    cfg["test_log_file"] = test_log_file
 
     if wandb_run is not None:
         wandb_instance = wandb_run
@@ -521,6 +569,9 @@ def test_few_shot(cfg, args, wandb_run=None):
     )
 
     test_epoch(val_loader, model, val_meter, cur_epoch, cfg)
+    if test_log_handler is not None:
+        pylogging.getLogger().removeHandler(test_log_handler)
+        test_log_handler.close()
     # Close wandb logging
     if wandb_instance is not None:
         wandb_instance.finish()

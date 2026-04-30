@@ -916,6 +916,40 @@ class Pointformer(nn.Module):
         proto = (h_st * weights).sum(dim=(1, 2)) / denom
         return torch.nan_to_num(proto.unsqueeze(1), nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _masked_mean_visual_prototypes(self, h_st, point_mask):
+        """Aggregate visual trajectory tokens with uniform weights over valid points."""
+        h_st = torch.nan_to_num(h_st, nan=0.0, posinf=0.0, neginf=0.0)
+        if point_mask is None:
+            point_mask = torch.ones(
+                h_st.shape[:3],
+                device=h_st.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=h_st.device).bool()
+
+        weights = point_mask[..., None].to(h_st.dtype)
+        denom = weights.sum(dim=(1, 2)).clamp_min(1e-6)
+        proto = (h_st * weights).sum(dim=(1, 2)) / denom
+        return torch.nan_to_num(proto.unsqueeze(1), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _masked_temporal_mean_per_traj(self, feat, point_mask):
+        """Average each trajectory over valid temporal positions only."""
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        if point_mask is None:
+            point_mask = torch.ones(
+                feat.shape[:3],
+                device=feat.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=feat.device).bool()
+
+        weights = point_mask[..., None].to(feat.dtype)
+        denom = weights.sum(dim=1).clamp_min(1e-6)
+        traj_repr = (feat * weights).sum(dim=1) / denom
+        return torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
+
     def _build_soft_label_routed_support_prototypes(self, fused_feat, metadata):
         """Build per-label Otsu relation-gated support prototypes."""
         support_mask = metadata['support_mask'].bool()
@@ -952,7 +986,10 @@ class Pointformer(nn.Module):
 
             support_feat = fused_feat[sample_idx:sample_idx + 1]
             support_mask_i = base_pt_mask[sample_idx:sample_idx + 1]
-            traj_repr = support_feat.mean(dim=1).squeeze(0)
+            traj_repr = self._masked_temporal_mean_per_traj(
+                support_feat,
+                support_mask_i,
+            ).squeeze(0)
 
             for label_offset, positive_label in enumerate(positive_labels):
                 label_text_i = label_text[label_offset]
@@ -963,9 +1000,8 @@ class Pointformer(nn.Module):
                     gate.unsqueeze(0),
                     support_mask_i,
                 )
-                sample_slot = self._gate_weighted_visual_prototypes(
+                sample_slot = self._masked_mean_visual_prototypes(
                     h_st,
-                    gate.unsqueeze(0),
                     support_mask_i,
                 ).squeeze(0)
                 sample_slot = torch.nan_to_num(
