@@ -13,12 +13,12 @@ FEW_SHOT:
   DIST_NORM: none
   TRAIN_OG_EPISODES: False
   TEXT_CLUSTER:
-    ENABLE:   True
+    ENABLE:   False
     TOP_M: 3
     TAU: 0.07
     PROMPT_BANK_PATH: data/sav/clip_label_prompt_bank.json
   SOFT_LABEL_ROUTE:
-    ENABLE: True
+    ENABLE: False
     ROUTE_TAU: 0.05
     SHARPEN_GAMMA: 1.5
     TEXT_INJECT_ALPHA: 0.1
@@ -28,6 +28,20 @@ FEW_SHOT:
     GATE_TEMPERATURE: 0.05
     OTSU_BINS: 64
     RELATION_EPS: 1e-6
+  POT_ROUTE:
+    ENABLE: True
+    MU_LOGIT_SCALE: 10.0
+    RHO_MIN: 0.2
+    RHO_MAX: 0.9
+    AFFINITY_TAU: 0.07
+    KAPPA: 1.5
+    ENTROPIC_EPS: 0.01
+    MAX_ITERS: 50
+    STOP_TOL: 1e-4
+  TEXT_ALIGN:
+    ENABLE: True
+    LOSS_WEIGHT: 0.1
+    LOGIT_SCALE: 10.0
 
 POINT_INFO:
   NAME: cotracker3_bip_fr_32_feat_dinotxt_vitl14reg4_fps_10

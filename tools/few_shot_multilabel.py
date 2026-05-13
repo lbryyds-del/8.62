@@ -106,6 +106,25 @@ def support_query_split_multilabel_conditioned(base_split, few_shot_aux):
     }
 
 
+def few_shot_aux_has_support_tokens(few_shot_aux):
+    """Return True when few_shot_aux carries support replacement tokens."""
+    return (
+        isinstance(few_shot_aux, dict)
+        and "support_conditioned_patch_tokens" in few_shot_aux
+        and "support_branch_class_indices" in few_shot_aux
+    )
+
+
+def get_text_align_loss(few_shot_aux, ref_tensor):
+    """Return the text alignment loss scalar or a zero scalar on the right device."""
+    if isinstance(few_shot_aux, dict) and "text_align_loss" in few_shot_aux:
+        align_loss = few_shot_aux["text_align_loss"]
+        if not isinstance(align_loss, torch.Tensor):
+            align_loss = ref_tensor.new_tensor(float(align_loss))
+        return torch.nan_to_num(align_loss, nan=0.0, posinf=1e4, neginf=0.0)
+    return ref_tensor.new_zeros(())
+
+
 def multilabel_top1_accuracy(logits, labels):
     """Top-1 is correct if the highest scoring class is one of the positive labels."""
     pred_idx = logits.argmax(dim=1, keepdim=True)

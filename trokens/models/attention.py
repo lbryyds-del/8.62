@@ -59,7 +59,7 @@ class Attention(nn.Module):
         mask=None,
         relation_eps=1e-6,
     ):
-        """Forward pass with text-conditioned queries and relation gate bias."""
+        """Forward pass with plain self-attention; text relation inputs are ignored."""
         if not self.with_qkv:
             raise RuntimeError("Text relation attention requires qkv projections.")
 
@@ -69,19 +69,7 @@ class Attention(nn.Module):
                                   head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        gamma, beta = text_mod
-        gamma = gamma.reshape(batch_size, self.num_heads, head_dim).unsqueeze(2)
-        beta = beta.reshape(batch_size, self.num_heads, head_dim).unsqueeze(2)
-        q = q * (1.0 + gamma.to(dtype=q.dtype)) + beta.to(dtype=q.dtype)
-
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        if relation_gate is not None:
-            gate = relation_gate.to(device=x.device, dtype=attn.dtype)
-            gate = torch.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0)
-            gate = gate.clamp_min(relation_eps)
-            pair_gate = torch.sqrt(gate[:, :, None] * gate[:, None, :])
-            attn = attn + torch.log(pair_gate[:, None, :, :].clamp_min(relation_eps))
-
         if self.use_mask and mask is not None:
             if len(mask.shape) == 2:
                 attn = attn.masked_fill(torch.logical_not(mask[:, None, None, :]),
@@ -538,7 +526,7 @@ class TrajectoryAttentionBlock(nn.Module):
         relation_gate,
         relation_eps=1e-6,
     ):
-        """Forward pass with standard Time-SA and text-gated relation Space-SA."""
+        """Forward pass with standard Time-SA and plain Space-SA."""
         if self.pt_attention != 'divided_space_time':
             raise NotImplementedError(
                 f"Unsupported text-relation attention type {self.pt_attention}"
@@ -595,19 +583,8 @@ class TrajectoryAttentionBlock(nn.Module):
 
         xs = rearrange(xt, 'b (h w t) m -> (b t) (h w) m',
                        b=batch_size, h=height, w=width, t=num_frames)
-        spatial_relation_gate = relation_gate
         if self.cfg.MODEL.USE_CLS_TOKEN:
             xs = torch.cat((cls_token, xs), 1)
-            cls_relation_gate = torch.ones(
-                spatial_relation_gate.shape[0],
-                1,
-                device=spatial_relation_gate.device,
-                dtype=spatial_relation_gate.dtype,
-            )
-            spatial_relation_gate = torch.cat(
-                (cls_relation_gate, spatial_relation_gate),
-                dim=1,
-            )
             if self.use_pt_visibility:
                 intit_cls_pt_mask = rearrange(
                     intit_cls_pt_mask,
@@ -634,22 +611,8 @@ class TrajectoryAttentionBlock(nn.Module):
                 t=num_frames,
             )
 
-        spatial_relation_gate = spatial_relation_gate.repeat_interleave(
-            num_frames,
-            dim=0,
-        )
-        spatial_text_mod = (
-            text_mod[0].repeat_interleave(num_frames, dim=0),
-            text_mod[1].repeat_interleave(num_frames, dim=0),
-        )
         res_spatial = self.drop_path(
-            self.attn.forward_text_relation(
-                self.norm1(xs),
-                spatial_text_mod,
-                spatial_relation_gate,
-                spatial_mask,
-                relation_eps,
-            )
+            self.attn(self.norm1(xs), spatial_mask)
         )
         if self.cfg.MODEL.USE_CLS_TOKEN:
             cls_token = res_spatial[:, 0, :]

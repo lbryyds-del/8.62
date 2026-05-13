@@ -80,12 +80,48 @@ class Pointformer(nn.Module):
         self.head_act = cfg.MF.HEAD_ACT
         self.cfg = cfg
         self.text_cluster_cfg = cfg.FEW_SHOT.TEXT_CLUSTER
-        self.use_text_conditioned_support = (
+        self.pot_route_cfg = cfg.FEW_SHOT.POT_ROUTE
+        self.text_align_cfg = cfg.FEW_SHOT.TEXT_ALIGN
+        self.is_multilabel_few_shot = (
             cfg.TASK == 'few_shot'
             and cfg.DATA.MULTI_LABEL
+            and not cfg.MODEL.APPEARANCE_MODULE_DISABLE
+        )
+        self.use_text_conditioned_support = (
+            self.is_multilabel_few_shot
             and self.feat_extractor_type in ("clip_vit_b16", "dinotxt_vitl14_reg4")
             and self.text_cluster_cfg.ENABLE
-            and not cfg.MODEL.APPEARANCE_MODULE_DISABLE
+        )
+        self.use_pot_support_route = (
+            self.is_multilabel_few_shot
+            and self.feat_extractor_type == "dinotxt_vitl14_reg4"
+            and self.pot_route_cfg.ENABLE
+        )
+        self.use_text_alignment = (
+            self.is_multilabel_few_shot
+            and self.feat_extractor_type == "dinotxt_vitl14_reg4"
+            and self.text_align_cfg.ENABLE
+        )
+        if (
+            self.is_multilabel_few_shot
+            and self.pot_route_cfg.ENABLE
+            and self.feat_extractor_type != "dinotxt_vitl14_reg4"
+        ):
+            raise NotImplementedError(
+                "POT support routing currently requires the dinotxt_vitl14_reg4 backbone."
+            )
+        if (
+            self.is_multilabel_few_shot
+            and self.text_align_cfg.ENABLE
+            and self.feat_extractor_type != "dinotxt_vitl14_reg4"
+        ):
+            raise NotImplementedError(
+                "TEXT_ALIGN currently requires the dinotxt_vitl14_reg4 backbone."
+            )
+        self.use_label_text_features = (
+            self.use_text_conditioned_support
+            or self.use_pot_support_route
+            or self.use_text_alignment
         )
         self.num_patches = (224 // self.patch_size) ** 2
         if cfg.POINT_INFO.ENABLE:
@@ -189,7 +225,7 @@ class Pointformer(nn.Module):
 
         self.spatial_pos_embed_drop = nn.Dropout(p=cfg.MF.POS_DROPOUT)
         self.layer_to_use = None
-        if self.use_text_conditioned_support:
+        if self.use_label_text_features:
             if self.feat_extractor_type == "clip_vit_b16":
                 self.text_feature_dim = 512
             elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
@@ -202,15 +238,18 @@ class Pointformer(nn.Module):
                 self.text_to_model_proj = nn.Identity()
             else:
                 self.text_to_model_proj = nn.Linear(self.text_feature_dim, self.embed_dim)
-            self.text_gate_mlp = nn.Sequential(
-                norm_layer(self.embed_dim),
-                nn.Linear(self.embed_dim, self.embed_dim),
-                nn.GELU(),
-                nn.Linear(self.embed_dim, self.embed_dim),
+            if self.use_text_conditioned_support:
+                self.text_gate_mlp = nn.Sequential(
+                    norm_layer(self.embed_dim),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                    nn.GELU(),
+                    nn.Linear(self.embed_dim, self.embed_dim),
+                )
+                self.text_inject_alpha = nn.Parameter(torch.tensor(0.1))
+                self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
+            self.use_soft_label_route = (
+                self.use_text_conditioned_support and cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE
             )
-            self.text_inject_alpha = nn.Parameter(torch.tensor(0.1))
-            self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
-            self.use_soft_label_route = cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE
             if self.use_soft_label_route:
                 self.label_q_mod_mlp = nn.Sequential(
                     norm_layer(self.embed_dim),
@@ -219,6 +258,8 @@ class Pointformer(nn.Module):
                 self.label_slot_q = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
                 self.label_slot_kv = nn.Linear(self.embed_dim, self.embed_dim * 2, bias=self.qkv_bias)
                 self.label_slot_proj = nn.Linear(self.embed_dim, self.embed_dim)
+            if self.use_pot_support_route or self.use_text_alignment:
+                self.atomic_label_names = self._load_atomic_label_names()
         else:
             self.use_soft_label_route = False
 
@@ -276,9 +317,10 @@ class Pointformer(nn.Module):
                 )
         elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
             self.dinotxt_visual_model = self._load_dinotxt_visual_model()
-            if self.use_text_conditioned_support:
+            if self.use_label_text_features:
                 self.dinotxt_text_model = self._load_dinotxt_text_model()
                 self.dinotxt_tokenizer = self._load_dinotxt_tokenizer()
+            if self.use_text_conditioned_support:
                 prompt_bank_path = self._resolve_prompt_bank_path(
                     self.text_cluster_cfg.PROMPT_BANK_PATH
                 )
@@ -452,6 +494,87 @@ class Pointformer(nn.Module):
                 patch_prompt_features = F.normalize(patch_prompt_features, dim=-1)
                 text_embeddings.append(patch_prompt_features)
         return self._pad_prompt_embeddings(text_embeddings)
+
+    def _resolve_sav_label_map_path(self):
+        """Resolve the SAV atomic label map used for DinoTxt label text."""
+        candidate_paths = []
+        if self.cfg.DATA.PATH_TO_DATA_DIR:
+            data_root = self.cfg.DATA.PATH_TO_DATA_DIR
+            if os.path.isabs(data_root):
+                candidate_paths.append(
+                    os.path.join(data_root, "education_first_label.pbtxt")
+                )
+            else:
+                candidate_paths.append(
+                    os.path.join(
+                        os.getcwd(),
+                        data_root,
+                        "education_first_label.pbtxt",
+                    )
+                )
+        candidate_paths.append(
+            os.path.join(os.getcwd(), "data", "sav", "education_first_label.pbtxt")
+        )
+        for candidate_path in candidate_paths:
+            if os.path.exists(candidate_path):
+                return candidate_path
+        raise FileNotFoundError(
+            "Could not locate SAV atomic label map education_first_label.pbtxt."
+        )
+
+    def _load_atomic_label_names(self):
+        """Load the 0-based SAV atomic action names for POT routing."""
+        dataset_names = {
+            str(getattr(self.cfg.TRAIN, "DATASET", "")).lower(),
+            str(getattr(self.cfg.TEST, "DATASET", "")).lower(),
+        }
+        if "sav" not in dataset_names:
+            raise NotImplementedError(
+                "POT support routing currently expects SAV atomic label names."
+            )
+
+        label_names = [str(class_id) for class_id in range(self.num_classes)]
+        label_map_path = self._resolve_sav_label_map_path()
+        current_name = None
+        current_id = None
+        with open(label_map_path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if line.startswith("name:"):
+                    current_name = line.split(":", 1)[1].strip().strip('"')
+                elif line.startswith("id:"):
+                    current_id = int(line.split(":", 1)[1].strip()) - 1
+
+                if current_name is not None and current_id is not None:
+                    if 0 <= current_id < len(label_names):
+                        label_names[current_id] = current_name
+                    current_name = None
+                    current_id = None
+        return label_names
+
+    def _get_pot_label_text_features(self, global_class_indices, dtype):
+        """Encode episode label names with DinoTxt text encoder for POT routing."""
+        if self.feat_extractor_type != "dinotxt_vitl14_reg4":
+            raise NotImplementedError(
+                "POT label text features are only implemented for dinotxt_vitl14_reg4."
+            )
+
+        label_names = [
+            self.atomic_label_names[int(class_id)].replace("_", " ")
+            for class_id in global_class_indices.detach().cpu().tolist()
+        ]
+        text_device = next(self.dinotxt_text_model.parameters()).device
+        self.dinotxt_text_model.eval()
+        with torch.no_grad():
+            tokenized = self.dinotxt_tokenizer.tokenize(label_names).to(
+                text_device,
+                non_blocking=True,
+            )
+            text_features = self.dinotxt_text_model(tokenized).float()
+            text_features = text_features[:, text_features.shape[-1] // 2 :]
+        text_features = self.text_to_model_proj(text_features)
+        text_features = F.normalize(text_features, dim=-1)
+        return text_features.to(device=global_class_indices.device, dtype=dtype)
 
     def _torchhub_dirs(self):
         """Return candidate torch hub dirs for cached DINOv2 assets."""
@@ -713,13 +836,9 @@ class Pointformer(nn.Module):
         branch_mask_tensor = torch.cat(branch_masks, dim=0)
         branch_class_indices = torch.cat(branch_class_indices, dim=0)
         branch_global_class_indices = torch.cat(branch_global_class_indices, dim=0)
-        text_tokens, text_mask, text_global = self._get_branch_text_features(
+        text_tokens, text_mask, _ = self._get_branch_text_features(
             branch_global_class_indices,
             branch_feature_tensor.dtype,
-        )
-        branch_feature_tensor = self._inject_text_condition(
-            branch_feature_tensor,
-            text_global,
         )
         _, branch_patch_tokens = self.text_conditioned_pt_forward(
             branch_feature_tensor,
@@ -838,8 +957,6 @@ class Pointformer(nn.Module):
             cls_token_mask = torch.ones(bs, 1, device=x.device, dtype=torch.bool)
             point_mask = torch.cat((cls_token_mask, point_mask), dim=1)
 
-        text_mod = self.label_q_mod_mlp(label_text.to(dtype=x.dtype, device=x.device))
-        gamma, beta = text_mod.chunk(2, dim=-1)
         gate = gate.to(device=x.device, dtype=x.dtype)
         thw = [
             temporal_dim,
@@ -852,8 +969,8 @@ class Pointformer(nn.Module):
                 x,
                 thw,
                 point_mask,
-                (gamma, beta),
-                gate,
+                None,
+                None,
                 relation_eps,
             )
 
@@ -949,6 +1066,337 @@ class Pointformer(nn.Module):
         denom = weights.sum(dim=1).clamp_min(1e-6)
         traj_repr = (feat * weights).sum(dim=1) / denom
         return torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _masked_space_time_mean(self, feat, point_mask):
+        """Average support tokens over valid space-time positions only."""
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        if point_mask is None:
+            point_mask = torch.ones(
+                feat.shape[:3],
+                device=feat.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=feat.device).bool()
+
+        weights = point_mask[..., None].to(feat.dtype)
+        denom = weights.sum(dim=(1, 2)).clamp_min(1e-6)
+        pooled = (feat * weights).sum(dim=(1, 2)) / denom
+        return torch.nan_to_num(pooled, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _normalized_distribution_entropy(self, probs):
+        """Return entropy normalized to [0, 1] for the last dimension."""
+        probs = torch.nan_to_num(probs.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        probs = probs.clamp_min(1e-12)
+        entropy = -(probs * probs.log()).sum(dim=-1)
+        normalizer = max(float(np.log(max(probs.shape[-1], 2))), 1e-6)
+        return entropy / entropy.new_tensor(normalizer)
+
+    def _solve_joint_relaxed_transport(self, cost, row_mass, col_cap):
+        """Solve a joint relaxed POT problem over positive labels and trajectories."""
+        route_cfg = self.pot_route_cfg
+        entropic_eps = max(float(route_cfg.ENTROPIC_EPS), 1e-6)
+        max_iters = max(int(route_cfg.MAX_ITERS), 1)
+        stop_tol = max(float(route_cfg.STOP_TOL), 0.0)
+
+        cost = torch.nan_to_num(cost.float(), nan=1.0, posinf=1.0, neginf=0.0)
+        row_mass = torch.nan_to_num(
+            row_mass.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        col_cap = torch.nan_to_num(
+            col_cap.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        total_mass = row_mass.sum()
+        if cost.numel() == 0 or float(total_mass.item()) <= 0.0:
+            return cost.new_zeros(cost.shape)
+
+        cap_sum = col_cap.sum()
+        if float(cap_sum.item()) <= 0.0:
+            return cost.new_zeros(cost.shape)
+        if float(cap_sum.item()) < float(total_mass.item()):
+            col_cap = col_cap * (total_mass / cap_sum.clamp_min(1e-12))
+
+        transport = torch.exp(-cost / entropic_eps).clamp_min(1e-12)
+        transport = transport * (
+            total_mass / transport.sum().clamp_min(1e-12)
+        )
+
+        for _ in range(max_iters):
+            prev_transport = transport
+
+            row_sum = prev_transport.sum(dim=1)
+            row_scale = torch.minimum(
+                row_mass / row_sum.clamp_min(1e-12),
+                torch.ones_like(row_sum),
+            )
+            transport = row_scale[:, None] * prev_transport
+
+            col_sum = transport.sum(dim=0)
+            col_scale = torch.minimum(
+                col_cap / col_sum.clamp_min(1e-12),
+                torch.ones_like(col_sum),
+            )
+            transport = transport * col_scale[None, :]
+
+            current_mass = transport.sum()
+            if float(current_mass.item()) > 0.0:
+                transport = transport * (
+                    total_mass / current_mass.clamp_min(1e-12)
+                )
+            delta = torch.max(torch.abs(transport - prev_transport))
+            if float(delta.item()) <= stop_tol:
+                break
+
+        return torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compute_joint_positive_transport(self, traj_repr, support_global, positive_text):
+        """Jointly solve relaxed POT across all positive labels for one support sample."""
+        route_cfg = self.pot_route_cfg
+        traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
+        support_global = torch.nan_to_num(
+            support_global,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        positive_text = torch.nan_to_num(
+            positive_text,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        traj_repr = F.normalize(traj_repr.float(), dim=-1)
+        support_global = F.normalize(support_global.float(), dim=-1)
+        positive_text = F.normalize(positive_text.float(), dim=-1)
+
+        sim_matrix = torch.matmul(positive_text, traj_repr.transpose(0, 1))
+        sim_matrix = torch.nan_to_num(
+            sim_matrix,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        cost = 1.0 - sim_matrix
+
+        mu_logits = max(float(route_cfg.MU_LOGIT_SCALE), 1e-6) * torch.matmul(
+            positive_text,
+            support_global,
+        )
+        mu = torch.softmax(mu_logits, dim=0)
+
+        affinity_tau = max(float(route_cfg.AFFINITY_TAU), 1e-6)
+        affinity = torch.softmax(sim_matrix / affinity_tau, dim=-1)
+        entropy = self._normalized_distribution_entropy(affinity)
+        rho_min = min(max(float(route_cfg.RHO_MIN), 0.0), 1.0)
+        rho_max = min(max(float(route_cfg.RHO_MAX), rho_min), 1.0)
+        rho = rho_min + (rho_max - rho_min) * entropy
+        row_mass = mu * rho
+
+        nu_shared = affinity.mean(dim=0)
+        nu_shared = nu_shared / nu_shared.sum().clamp_min(1e-6)
+        kappa = max(float(route_cfg.KAPPA), 1.0)
+        col_cap = kappa * nu_shared
+
+        transport = self._solve_joint_relaxed_transport(
+            cost,
+            row_mass,
+            col_cap,
+        )
+        return {
+            "transport": transport,
+            "affinity": affinity,
+        }
+
+    def _build_support_text_alignment(self, patch_tokens, metadata):
+        """Align support global visual features with episode label text features."""
+        support_mask = metadata['support_mask'].bool()
+        episode_positive_labels = metadata['episode_positive_labels'].float()
+        base_pt_mask = (
+            metadata['pred_query_mask']
+            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
+            else metadata['pred_visibility']
+        )
+        episode_class_ids = metadata['episode_class_ids'].long()
+        episode_class_ids = (
+            episode_class_ids[0]
+            if episode_class_ids.ndim == 2
+            else episode_class_ids
+        )
+        if support_mask.sum().item() == 0:
+            return None
+
+        support_patch_tokens = patch_tokens[support_mask]
+        support_point_mask = base_pt_mask[support_mask]
+        support_targets = episode_positive_labels[support_mask].to(
+            device=patch_tokens.device,
+            dtype=patch_tokens.dtype,
+        )
+        valid_support = support_targets.sum(dim=-1) > 0
+        if not valid_support.any():
+            return None
+
+        support_patch_tokens = support_patch_tokens[valid_support]
+        support_point_mask = support_point_mask[valid_support]
+        support_targets = support_targets[valid_support]
+
+        support_global = self._masked_space_time_mean(
+            support_patch_tokens,
+            support_point_mask,
+        )
+        episode_label_text = self._get_pot_label_text_features(
+            episode_class_ids,
+            patch_tokens.dtype,
+        )
+        support_global = F.normalize(support_global.float(), dim=-1)
+        episode_label_text = F.normalize(episode_label_text.float(), dim=-1)
+        logits = float(self.text_align_cfg.LOGIT_SCALE) * torch.matmul(
+            support_global,
+            episode_label_text.transpose(0, 1),
+        )
+
+        target = support_targets / support_targets.sum(
+            dim=-1,
+            keepdim=True,
+        ).clamp_min(1.0)
+        pred = torch.softmax(logits, dim=-1)
+        align_loss = ((pred - target.float()) ** 2).sum(dim=-1).mean()
+        return {
+            'text_align_loss': torch.nan_to_num(
+                align_loss.to(dtype=patch_tokens.dtype),
+                nan=0.0,
+                posinf=1e4,
+                neginf=0.0,
+            ),
+        }
+
+    def _aggregate_weighted_support_tokens(self, feat, point_mask, traj_weights):
+        """Aggregate trajectories per frame with one shared POT trajectory weighting."""
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        point_mask = point_mask.to(device=feat.device).bool()
+        traj_weights = torch.nan_to_num(
+            traj_weights.to(device=feat.device, dtype=feat.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        frame_weights = point_mask.to(feat.dtype) * traj_weights.unsqueeze(0)
+        denom = frame_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        proto = (feat * frame_weights.unsqueeze(-1)).sum(dim=1) / denom
+        return torch.nan_to_num(proto, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_pot_support_prototypes(self, patch_tokens, metadata):
+        """Build support prototypes with joint positive-label relaxed POT."""
+        support_mask = metadata['support_mask'].bool()
+        episode_positive_labels = metadata['episode_positive_labels'].bool()
+        base_pt_mask = (
+            metadata['pred_query_mask']
+            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
+            else metadata['pred_visibility']
+        ).bool()
+        episode_class_ids = metadata['episode_class_ids'].long()
+        episode_class_ids = (
+            episode_class_ids[0]
+            if episode_class_ids.ndim == 2
+            else episode_class_ids
+        )
+        episode_label_text = self._get_pot_label_text_features(
+            episode_class_ids,
+            patch_tokens.dtype,
+        )
+
+        branch_tokens = []
+        branch_weights = []
+        branch_class_indices = []
+        branch_sample_indices = []
+        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
+        for sample_idx in support_indices.tolist():
+            sample_positive_labels = torch.nonzero(
+                episode_positive_labels[sample_idx],
+                as_tuple=False,
+            ).flatten()
+            if sample_positive_labels.numel() == 0:
+                continue
+
+            sample_patch_tokens = patch_tokens[sample_idx]
+            sample_point_mask = base_pt_mask[sample_idx]
+            traj_repr = self._masked_temporal_mean_per_traj(
+                sample_patch_tokens.unsqueeze(0),
+                sample_point_mask.unsqueeze(0),
+            ).squeeze(0)
+            support_global = self._masked_space_time_mean(
+                sample_patch_tokens.unsqueeze(0),
+                sample_point_mask.unsqueeze(0),
+            ).squeeze(0)
+            positive_text = episode_label_text.index_select(
+                0,
+                sample_positive_labels,
+            )
+            joint_stats = self._compute_joint_positive_transport(
+                traj_repr,
+                support_global,
+                positive_text,
+            )
+            transport = joint_stats["transport"]
+            affinity = joint_stats["affinity"]
+
+            for branch_idx, positive_label in enumerate(sample_positive_labels):
+                traj_weights = transport[branch_idx]
+                weight_sum = traj_weights.sum()
+                if float(weight_sum.item()) <= 0.0:
+                    traj_weights = affinity[branch_idx]
+                    weight_sum = traj_weights.sum()
+                traj_weights = traj_weights / weight_sum.clamp_min(1e-6)
+                traj_weights = torch.nan_to_num(
+                    traj_weights,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                sample_proto = self._aggregate_weighted_support_tokens(
+                    sample_patch_tokens,
+                    sample_point_mask,
+                    traj_weights,
+                )
+                branch_tokens.append(sample_proto.unsqueeze(1))
+                branch_weights.append(traj_weights)
+                branch_class_indices.append(positive_label.view(1))
+                branch_sample_indices.append(sample_idx)
+
+        if not branch_tokens:
+            return None
+
+        support_tokens = torch.stack(branch_tokens, dim=0)
+        support_tokens = torch.nan_to_num(
+            support_tokens,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        support_branch_point_weights = torch.stack(branch_weights, dim=0)
+        class_indices = torch.cat(branch_class_indices, dim=0)
+        return {
+            'support_conditioned_patch_tokens': support_tokens,
+            'support_branch_point_weights': support_branch_point_weights.to(
+                device=support_tokens.device,
+                dtype=support_tokens.dtype,
+            ),
+            'support_branch_class_indices': class_indices.to(
+                device=support_tokens.device,
+                dtype=torch.long,
+            ),
+            'support_branch_sample_indices': torch.tensor(
+                branch_sample_indices,
+                device=support_tokens.device,
+                dtype=torch.long,
+            ),
+        }
 
     def _build_soft_label_routed_support_prototypes(self, fused_feat, metadata):
         """Build per-label Otsu relation-gated support prototypes."""
@@ -1310,7 +1758,7 @@ class Pointformer(nn.Module):
         """Forward pass of the model"""
         x = input_to_use['video']
         metadata = input_to_use['metadata']
-        few_shot_aux = None
+        few_shot_aux = {}
 
         if 'skip_feat_extractor' in input_to_use:
             skip_feat_extractor = input_to_use['skip_feat_extractor']
@@ -1377,21 +1825,36 @@ class Pointformer(nn.Module):
             sampled_feat = sampled_feat + cross_motion_feat
 
         cls_x, patch_x = self.pt_forward(sampled_feat, metadata)
-        if (
-            self.use_text_conditioned_support
-            and 'support_mask' in metadata
-            and 'episode_positive_labels' in metadata
-        ):
-            if self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE:
-                few_shot_aux = self._build_soft_label_routed_support_prototypes(
-                    sampled_feat,
+        if 'support_mask' in metadata and 'episode_positive_labels' in metadata:
+            if self.use_text_alignment:
+                text_align_aux = self._build_support_text_alignment(
+                    patch_x,
                     metadata,
                 )
-            else:
-                few_shot_aux = self._build_support_conditioned_branches(
-                    sampled_feat,
+                if text_align_aux is not None:
+                    few_shot_aux.update(text_align_aux)
+            if self.use_pot_support_route:
+                route_aux = self._build_pot_support_prototypes(
+                    patch_x,
                     metadata,
                 )
+                if route_aux is not None:
+                    few_shot_aux.update(route_aux)
+            elif self.use_text_conditioned_support:
+                if self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE:
+                    route_aux = self._build_soft_label_routed_support_prototypes(
+                        sampled_feat,
+                        metadata,
+                    )
+                else:
+                    route_aux = self._build_support_conditioned_branches(
+                        sampled_feat,
+                        metadata,
+                    )
+                if route_aux is not None:
+                    few_shot_aux.update(route_aux)
+        if not few_shot_aux:
+            few_shot_aux = None
         # x = self.forward_features(x, metadata) # [BS, d]
         x = self.head_drop(cls_x)
 

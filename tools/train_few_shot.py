@@ -14,6 +14,8 @@ from few_shot_multilabel import (
     compute_base_novel_hm,
     empty_ap_storage,
     episode_labels_from_global,
+    few_shot_aux_has_support_tokens,
+    get_text_align_loss,
     get_episode_class_ids,
     is_multilabel_episode,
     mean_or_nan,
@@ -267,6 +269,7 @@ def train_epoch(
     epoch_top_1_acc_few_shot = []
     epoch_cls_loss = []
     epoch_q2s_loss = []
+    epoch_align_loss = []
 
     if cfg.MIXUP.ENABLE:
         mixup_fn = MixUp(
@@ -324,6 +327,7 @@ def train_epoch(
                 preds, _ = preds
             preds = preds / cfg.SOLVER.TEMPRATURE
             preds = torch.nan_to_num(preds, nan=0.0, posinf=30.0, neginf=-30.0)
+            align_loss = get_text_align_loss(few_shot_aux, patch_tokens)
 
             # Explicitly declare reduction to mean.
             loss_fun = losses.get_loss_func(cfg)(
@@ -340,7 +344,7 @@ def train_epoch(
             if multilabel_episode:
                 base_support_query_dict = support_query_split_multilabel(
                     patch_tokens, labels, meta)
-                if few_shot_aux is not None:
+                if few_shot_aux_has_support_tokens(few_shot_aux):
                     patch_support_query_dict = support_query_split_multilabel_conditioned(
                         base_support_query_dict,
                         few_shot_aux,
@@ -367,8 +371,10 @@ def train_epoch(
             else:
                 q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
             loss_dict['q2s_loss'] = q2s_loss
+            loss_dict['align_loss'] = align_loss
         loss = (cfg.FEW_SHOT.CLASS_LOSS_LAMBDA * classfication_loss +
-                cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss)
+                cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss +
+                cfg.FEW_SHOT.TEXT_ALIGN.LOSS_WEIGHT * align_loss)
 
         if not torch.isfinite(loss):
             finite_report = {
@@ -379,6 +385,7 @@ def train_epoch(
                 "patch_q2s_logits": bool(torch.isfinite(patch_q2s_logits).all()),
                 "classification_loss": bool(torch.isfinite(classfication_loss)),
                 "q2s_loss": bool(torch.isfinite(q2s_loss)),
+                "align_loss": bool(torch.isfinite(align_loss)),
             }
             logger.warning(
                 "Skip non-finite train batch at epoch %d iter %d: %s",
@@ -414,25 +421,29 @@ def train_epoch(
         top1_err, top5_err = None, None
         classification_loss = loss_dict['classfication_loss']
         q2s_loss = loss_dict['q2s_loss']
+        align_loss = loss_dict['align_loss']
 
         if multilabel_episode:
             few_shot_top1_acc = multilabel_top1_accuracy(patch_q2s_logits, q2s_labels)
             if cfg.NUM_GPUS > 1:
-                loss, classification_loss, q2s_loss, few_shot_top1_acc = du.all_reduce(
-                    [loss, classification_loss, q2s_loss, few_shot_top1_acc]
+                loss, classification_loss, q2s_loss, align_loss, few_shot_top1_acc = du.all_reduce(
+                    [loss, classification_loss, q2s_loss, align_loss, few_shot_top1_acc]
                 )
             loss = loss.item()
             classification_loss = classification_loss.item()
             q2s_loss = q2s_loss.item()
+            align_loss = align_loss.item()
             few_shot_top1_acc = few_shot_top1_acc.item()
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
+            epoch_align_loss.append(align_loss)
             epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
             global_iter = data_size * cur_epoch + cur_iter
             wandb_iter_dict = {
                 'iter_cls_loss': classification_loss,
                 'iter_q2s_loss': q2s_loss,
+                'iter_align_loss': align_loss,
                 'iteration': global_iter,
                 'iter_top1_acc_few_shot': few_shot_top1_acc,
             }
@@ -453,11 +464,9 @@ def train_epoch(
 
             # Gather all the predictions across all the devices.
             if cfg.NUM_GPUS > 1:
-                classification_loss, top1_err, top5_err, few_shot_top1_acc = du.all_reduce(
-                    [classification_loss, top1_err, top5_err, few_shot_top1_acc]
+                classification_loss, top1_err, top5_err, few_shot_top1_acc, q2s_loss, align_loss, loss = du.all_reduce(
+                    [classification_loss, top1_err, top5_err, few_shot_top1_acc, q2s_loss, align_loss, loss]
                 )
-                q2s_loss = du.all_reduce([q2s_loss])[0]
-                loss = du.all_reduce([loss])[0]
 
             # Copy the stats from GPU to CPU (sync point).
             classification_loss, top1_err, top5_err = (
@@ -466,12 +475,14 @@ def train_epoch(
                 top5_err.item(),
             )
             q2s_loss = q2s_loss.item()
+            align_loss = align_loss.item()
 
             few_shot_top1_acc = few_shot_top1_acc.item()
             loss = loss.item()
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
+            epoch_align_loss.append(align_loss)
 
             epoch_top_1_err.append(top1_err)
             epoch_top_5_err.append(top5_err)
@@ -479,6 +490,7 @@ def train_epoch(
             global_iter = data_size * cur_epoch + cur_iter
             wandb_iter_dict = {'iter_cls_loss':classification_loss,
                                 'iter_q2s_loss':q2s_loss,
+                                'iter_align_loss':align_loss,
                                 'iter_top1_err':top1_err,
                                 'iter_top5_err':top5_err,
                             'iteration':global_iter,
@@ -496,7 +508,7 @@ def train_epoch(
             * max(
                 cfg.NUM_GPUS, 1
             ),  # If running  on CPU (cfg.NUM_GPUS == 1), use 1 to represent 1 CPU.
-            extra_metrics={"q2s_loss": q2s_loss},
+            extra_metrics={"q2s_loss": q2s_loss, "align_loss": align_loss},
         )
         train_meter.iter_toc()  # measure allreduce for this meter
         if should_log_iter_stats(progress_bar):
@@ -504,7 +516,11 @@ def train_epoch(
         if progress_bar is not None:
             progress_bar.update(1)
             progress_bar.set_postfix(
-                {shot_acc_name: f"{few_shot_top1_acc:.2f}", "q2s_loss": f"{q2s_loss:.3f}"},
+                {
+                    shot_acc_name: f"{few_shot_top1_acc:.2f}",
+                    "q2s_loss": f"{q2s_loss:.3f}",
+                    "align_loss": f"{align_loss:.3f}",
+                },
                 refresh=False,
             )
         train_meter.iter_tic()
@@ -518,6 +534,7 @@ def train_epoch(
     wandb_iter_dict = {
         'train_cls_loss': mean_or_nan(epoch_cls_loss),
         'train_q2s_loss': mean_or_nan(epoch_q2s_loss),
+        'train_align_loss': mean_or_nan(epoch_align_loss),
         'train_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch,
     }
@@ -554,6 +571,7 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
     val_meter.iter_tic()
     epoch_top_1_acc_few_shot = []
     epoch_q2s_loss = []
+    epoch_align_loss = []
     ap_storage = empty_ap_storage(cfg.MODEL.NUM_CLASSES) if cfg.DATA.MULTI_LABEL else None
     shot_acc_name = shot_metric_name(cfg)
     progress_bar = create_progress_bar(
@@ -590,12 +608,13 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
                 few_shot_aux = None
             if isinstance(preds, tuple):
                 preds, _ = preds
+            align_loss = get_text_align_loss(few_shot_aux, patch_tokens)
 
             multilabel_episode = is_multilabel_episode(cfg, labels, meta)
             if multilabel_episode:
                 base_support_query_dict = support_query_split_multilabel(
                     patch_tokens, labels, meta)
-                if few_shot_aux is not None:
+                if few_shot_aux_has_support_tokens(few_shot_aux):
                     patch_support_query_dict = support_query_split_multilabel_conditioned(
                         base_support_query_dict,
                         few_shot_aux,
@@ -637,12 +656,16 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
 
 
         if cfg.NUM_GPUS > 1:
-            few_shot_top1_acc, q2s_loss = du.all_reduce([few_shot_top1_acc, q2s_loss])
+            few_shot_top1_acc, q2s_loss, align_loss = du.all_reduce(
+                [few_shot_top1_acc, q2s_loss, align_loss]
+            )
 
         # Copy the errors from GPU to CPU (sync point).
         few_shot_top1_acc = few_shot_top1_acc.item()
         q2s_loss = q2s_loss.item()
+        align_loss = align_loss.item()
         epoch_q2s_loss.append(q2s_loss)
+        epoch_align_loss.append(align_loss)
         epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
 
         val_meter.iter_toc()
@@ -654,6 +677,7 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
             * max(
                 cfg.NUM_GPUS, 1
             ),  # If running  on CPU (cfg.NUM_GPUS == 1), use 1 to represent 1 CPU.
+            extra_metrices={"align_loss": align_loss},
         )
         # write to tensorboard format if available.
 
@@ -664,7 +688,11 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
         if progress_bar is not None:
             progress_bar.update(1)
             progress_bar.set_postfix(
-                {shot_acc_name: f"{few_shot_top1_acc:.2f}", "q2s_loss": f"{q2s_loss:.3f}"},
+                {
+                    shot_acc_name: f"{few_shot_top1_acc:.2f}",
+                    "q2s_loss": f"{q2s_loss:.3f}",
+                    "align_loss": f"{align_loss:.3f}",
+                },
                 refresh=False,
             )
         val_meter.iter_tic()
@@ -676,6 +704,7 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
 
     log_dict = {
         'val_q2s_loss': mean_or_nan(epoch_q2s_loss),
+        'val_align_loss': mean_or_nan(epoch_align_loss),
         'val_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch}
     epoch_mean_acc = mean_or_nan(epoch_top_1_acc_few_shot)

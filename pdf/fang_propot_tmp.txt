@@ -1,0 +1,821 @@
+                                                                         Pattern Recognition 164 (2025) 111482
+
+
+                                                                       Contents lists available at ScienceDirect
+
+
+                                                                           Pattern Recognition
+                                                                journal homepage: www.elsevier.com/locate/pr
+
+
+
+
+On inferring prototypes for multi-label few-shot learning via partial
+aggregation
+Pengfei Fang a,b ,1 , Zhihong Chen a,b ,1 , Hui Xue a,b ,∗
+a   School of Computer Science and Engineering, Southeast University, Nanjing, 210096, China
+b
+    Key Laboratory of New Generation Artificial Intelligence Technology and Its Interdisciplinary Applications (Southeast University), Ministry of Education, China
+
+
+
+ARTICLE                  INFO                                 ABSTRACT
+
+Keywords:                                                     Multi-label few-shot learning (ML-FSL) aims to endow the learning system to recognize multiple objects
+Multi-label few-shot learning                                 within an image, trained with insufficient samples. Existing methods have significantly improved ML-FSL
+Partial aggregation scheme                                    and focused on mining the correlation of labels, resulting in a discriminative prototype per class. However,
+Partial optimal transport
+                                                              those methods often engage irrelevant information, i.e., the tangled region with other classes, in the phase
+                                                              of constructing prototypes, limiting their performance gain. Following the intuition that only part regions
+                                                              of an image correspond to a target label, this paper addresses this issue by creating prototypes via a partial
+                                                              aggregation scheme. This is realized by first generating aggregation weights via partial optimal transport (POT)
+                                                              between image and label features and producing features per class using relevant regions within an image.
+                                                              Having the refined class features in a support set, one can obtain a better prototype for each class. We evaluate
+                                                              our model on multiple benchmarks and obtain state-of-the-art performance. A thorough study also reveals the
+                                                              superiority of POT as a way of mining important information for generating prototypes.
+
+
+
+1. Introduction                                                                                     generate prototypes for classification to tackle multi-label few-shot
+                                                                                                    learning (ML-FSL) problems. Chen et al. [8] propose leveraging label
+    This paper investigates the multi-label few-shot learning (ML-FSL)                              co-occurrence by constructing a knowledge graph to generate class pro-
+problem by developing the partial aggregation scheme to generate a                                  totypes, incorporating neighboring labels in the graph. Simon et al. [9]
+better class prototype, which is realized by partial optimal transport                              extend the episodic training paradigm, also known as meta-learning,
+(POT) as a way of matching the distributions from the textual and visual                            initially proposed for few-shot learning (FSL), to ML-FSL. Their ap-
+modalities.                                                                                         proach generates class prototypes by averaging samples containing the
+    Few-shot learning (FSL) refers to a learning scenario where the ma-                             target class. However, when a sample has multiple labels, the averaging
+chine is required to adapt to new tasks fast, trained with only a limited                           operation results in equal contributions from each corresponding proto-
+amount of data. In this regard, a diversity of methods, including the                               type, which can diminish the distinguishability of class representations.
+meta-learning [1,2], transfer learning [3,4], generative learning [5,6],                            Yan et al. [10] incorporate word embeddings of class text as prior
+etc., have been proposed, and bring significant improvement to the                                  knowledge and employ a cross-attention mechanism to fuse text and
+generalization capacity of FSL. However, those pioneer works only                                   image features, improving prototype generation. While this method
+focus on the recognition task of a single class, while neglecting the fact                          differentiates the contributions of different regions of the sample to
+that the images in real-world scenarios often include multiple objects                              the corresponding categories, it does not account for noisy regions
+(see Fig. 1(a)) and recognizing all possible objects is also necessary.
+                                                                                                    within the image. This oversight can severely degrade the quality of
+This is referred to as multi-label few-shot learning problems (ML-
+                                                                                                    the generated prototypes, particularly when noisy regions interfere. In
+FSL) [7], and the main challenge of ML-FSL is to disentangle the mixed
+                                                                                                    such cases, prototypes become less discriminative, reducing the model’s
+class2 information present with the scarce data for discriminative class
+                                                                                                    ability to distinguish between similar classes. This issue is exacerbated
+representations.
+                                                                                                    in multi-label classification. Therefore, it is essential to mitigate the in-
+    Only a few attempts have been made to address ML-FSL. Exist-
+                                                                                                    fluence of such noise to improve the accuracy of prototype generation.
+ing methods predominantly adopt episodic training paradigms and
+
+
+     ∗ Corresponding author.
+       E-mail addresses: fangpengfei@seu.edu.cn (P. Fang), 220232235@seu.edu.cn (Z. Chen), hxue@seu.edu.cn (H. Xue).
+     1
+       Equal contributions.
+     2
+       In the remainder of this paper, we will use the terms ‘‘label’’, ‘‘class’’ and ‘‘category’’ interchangeably.
+
+https://doi.org/10.1016/j.patcog.2025.111482
+Received 20 October 2024; Received in revised form 3 February 2025; Accepted 18 February 2025
+Available online 28 February 2025
+0031-3203/© 2025 Elsevier Ltd. All rights are reserved, including those for text and data mining, AI training, and similar technologies.
+P. Fang et al.                                                                                                                                     Pattern Recognition 164 (2025) 111482
+
+
+
+
+Fig. 1. An example to show local image features and their relationship with categories in a ML-FSL task. (a) shows an original image from the real world containing 3 concerned
+categories, i.e., dog, cat, bed. (b) roughly shows the image regions of this image w.r.t. its corresponding class(es). The areas related to dog, cat, and bed are distinguished by purple,
+green, and bright yellow, respectively. (c) is the normalized similarity matrix calculated by the cosine similarity between local features of the origin image and the feature of the
+category name ‘bed’ through CLIP, and (d) is the corresponding POT transportation plan where cosine distances between modalities are set as the cost matrix. The proportion of
+scores corresponding to concerned and noisy regions are highlighted in yellow and red, respectively. (For interpretation of the references to color in this figure legend, the reader
+is referred to the web version of this article.)
+
+
+Our work addresses this challenge by focusing on the most informative                           prior findings. This strategy helps the model focus on the most pertinent
+and relevant parts of the image, ensuring that the prototypes are more                          local image features and mitigates the influence of irrelevant ones.
+representative and robust in distinguishing between classes.                                        Building on this, we develop the ProPOT method for ML-FSL, which
+    As shown in Fig. 1(a) , the real-world image often contains multiple                        generates improved prototypes using POT to partially aggregate local
+labeled objects, partially distributed in different image regions, i.e., cat,                   image features and delineate class features based on their relevance.
+dog and bed, as well as the unlabeled regions, i.e., window to the upper                        Initially, we generate distributions for both text and local image fea-
+right corner in Fig. 1(b). That said, existing methods of producing the                         tures based on the similarity of each image–text pair, where the prob-
+class prototypes will be affected by the noise within the image. This                           ability mass assigned to a specific feature reflects its informational
+is verified by a toy example. Specifically, since the image shown in                            value relative to the other modality. Subsequently, we address corre-
+Fig. 1(a) is labeled with cat, dog and bed, when creating a prototype                           sponding POT challenges to match features across modalities, selecting
+for a class, i.e., the bed class, the region of left down corner, belonging                     the most pertinent local image features through textual engagement.
+to the dog class, and the upper right corner, belonging to the noise,                           The resulting optimal transport plans serve as refined attention maps,
+both attain information for the bed class, e.g ., non-zero similarity value                     enabling the formation of distinct class features through a weighted
+between the word embedding of class bed and the local feature of                                sum of relevant image features. Our contributions in this paper can be
+visual feature map in Fig. 1(c). This observation motivates us to develop                       summarized as follows:
+an adaptive algorithm that partially selects and aggregates the most                                (1) We propose a novel modality alignment loss between textual
+relevant regions within images to generate robust and representative                            and visual modalities for multi-label tasks applying prompt learning
+prototypes. Considering the values as the scores for regions related                            methods, making it suitable for the nature of ML-FSL setting;
+to the target category, i.e., bed, as shown in Fig. 1(c) and Fig. 1(d)                              (2) We introduce POT to select related image features to gen-
+(60.74% vs. 88.56%). This demonstrates that the POT coupling di-                                erate representations of classes without extra supervision, obtaining
+rects nearly 30% more attention to the relevant regions, significantly                          prototypes with reduced redundancy of information beneficial to clas-
+reducing interference from irrelevant parts, i.e., images of dog, cat,                          sification;
+etc.. Specifically, we adopt episodic learning methods akin to ProtoNet                             (3) We process ML-FSL tasks through several public multi-label
+[11], which generate class prototypes and make predictions by com-                              datasets and evaluate our model’s performance. As compared to exist-
+paring the distance between image features and prototypes. Given the                            ing ML-FSL methods, our method achieves a state-of-the-art result.
+episodic learning paradigm’s nature, where labels and instances vary
+with each training step, we treat each episode as a unique sampling                             2. Related work
+from the visual and label domains. We leverage the semantic infor-
+mation of the labels, namely, the text of category names, as prior                              2.1. Few-shot classification
+knowledge to assist with the selection and partial aggregation scheme
+via vision language models (VLMs), benefiting from the unified space                                Few-shot learning has been widely studied in the field of computer
+for text and image features that VLMs provide. The goal is to align                             vision. The main idea of few-shot learning is to learn a model that can
+the latent distribution of the two modalities through observed episodes.                        generalize well to unseen classes using only a few examples. Metric-
+To this end, optimal transport (OT) is a prominent method in machine                            learning-based methods [11,20,21] mainly follow the episodic training
+learning [12] for effectively measuring the distance between distribu-                          method, leveraging the distances between query and support features
+tions and is extensively applied in areas such as generative models [13,                        to make classifications. On the other hand, fine-tuning existing base-
+14], domain adaptation [15,16], etc. OT transports probability mass                             lines with elaborated transfer learning methods [22–24] also achieves
+from the source to the target distribution at minimal cost. However,                            competitive performance without modification on training procedures.
+it necessitates the complete transfer of the source’s probability mass in                       Moreover, many recent works [25–27] on FSL pay extensive atten-
+OT and contradicts prior observations, i.e., the noise region should not                        tion to local features of images for better prototype representation.
+considered in the transportation stage.                                                         However, as a challenging and realistic problem, multi-label few-shot
+    This is addressed by the partial optimal transport (POT) strategy,                          learning has not been comprehensively studied.
+which is developed as an extension of the classical OT problem and
+is gaining traction in computational mathematics and machine learn-                             2.2. Multi-label few-shot classification
+ing [17,18]. POT replaces the mass conservation constraint by allowing
+only a fixed portion of the mass to be transported. Caffarelli et al. [19]                          In multi-label few-shot classification, the task is to predict multi-
+have demonstrated that mass from active regions of the source distribu-                         ple labels per image, presenting a greater challenge than single-label
+tion is fully transported to the target, while the remainder stays intact.                      classification. Alfassy et al. [7] first addressed this problem, proposing
+This leads to a sparse solution to the POT problem, consistent with                             a model with data augmentation strategies to enhance performance.
+the required selective transportation attribute. As depicted in Fig. 1(d),                      Chen et al. [8] introduced a graph-based approach to capture label
+the optimized POT plan focuses intensively on the target region while                           dependencies by analyzing label co-occurrence. Simon et al. [9] ex-
+minimizing the transport of noise in image features, aligning with our                          tended prototypical networks and other few-shot learning methods to
+
+                                                                                            2
+P. Fang et al.                                                                                                            Pattern Recognition 164 (2025) 111482
+
+
+multi-label classification, incorporating a prediction module for esti-          3.2. Partial optimal transport
+mating the number of labels. However, averaging prototypes across all
+related images may not fully capture the complexities of multi-label             3.2.1. Definition
+tasks. To address this, Yan et al. [10] employ weak supervision from                 In partial optimal transport (POT), the objective is to determine the
+textual descriptions and a cross-modal attention mechanism to generate           optimal transport plan between two probability distributions, where
+prototypes focused on relevant local image features.                             only a fixed proportion of the mass is required to be transported. Unlike
+                                                                                 traditional optimal transport which fully aligns both distributions, POT
+2.3. Vision language models
+                                                                                 permits partial matching by allowing a portion of the mass to remain
+                                                                                 untransported, addressing situations where full alignment is unneces-
+    Vision-language models (VLMs), such as CLIP [28], significantly
+                                                                                 sary. This flexibility is particularly useful in cases such as resource
+advance the alignment of visual and textual representations. Trained
+                                                                                 allocation problems or when comparing distributions with outliers.
+on large-scale image–text pairs, CLIP leverages contrastive learning to
+link images with their corresponding textual descriptions, using a visual            The modified OT problem to fit this case can be formulated as
+encoder and a text encoder to embed both modalities into a shared                below:
+semantic space. Based on CLIP’s flexibility for various downstream                                ∑𝑛 ∑𝑚
+                                                                                   min ⟨𝑪, 𝛾⟩ =          𝑪 𝑖𝑗 𝛾𝑖𝑗 ,
+tasks, numerous works have extended its applications. CoOp [29] and              𝛾∈𝛱(𝜇 ,𝜈)
+                                                                                                         𝑖=1 𝑗=1
+CoCoOp [30] focus on few-shot learning, introducing prompt-tuning
+                                                                                             ∑
+                                                                                             𝑚
+methods to generate optimized and dynamic prompts. Sun et al. [31]                   𝑠.𝑡.          𝛾𝑖𝑗 ≤ 𝜇𝑖 ,
+address multi-label classification with insufficient annotations by de-                      𝑗=1
+veloping dual prompts.                                                                       ∑𝑛
+                                                                                                                                                           (4)
+                                                                                                   𝛾𝑖𝑗 ≤ 𝜈𝑗 ,
+3. Preliminary                                                                               𝑖=1
+                                                                                             ∑
+                                                                                             𝑛 ∑
+                                                                                               𝑚
+
+3.1. Optimal transport                                                                                 𝛾𝑖𝑗 = 1 − 𝑠,
+                                                                                             𝑖=1 𝑗=1
+
+3.1.1. Definition                                                                           𝛾𝑖𝑗 ≥ 0, 𝑠 ≥ 0,
+    Optimal transport (OT) is a mathematical framework that aims to              where 𝑠 is the remaining mass that does not need to be transported. This
+find the most efficient way to transport mass distribution from the              formulation of POT is particularly useful in scenarios where only part
+source to the target. The problem can be formulated as follows: given            of the data is relevant for the task, such as multi-label classification
+two probability distributions 𝜇 and 𝜈 on R𝑑 , find a transport plan 𝛾 that       or few-shot learning, where different regions or features may corre-
+minimizes the cost of transporting 𝜇 to 𝜈. The cost of transporting a unit
+                                                                                 spond to different classes, and full alignment between distributions is
+of mass from 𝜇 to 𝜈 is given by a cost function 𝐶(𝜇 , 𝜈). The optimal
+                                                                                 unnecessary or even undesirable.
+transport problem can be formulated as a linear program:
+  min                 𝐶(𝑥, 𝑦)𝑑 𝛾(𝑥, 𝑦),                               (1)        3.2.2. Entropic partial optimal transport regularization
+𝛾∈𝛱(𝜇,𝜈) ∫R𝑑 ×R𝑑
+                                                                                    The partial optimal transport problem can be solved with the same
+where 𝛱(𝜇 , 𝜈) is the set of all joint distributions with marginals 𝜇 and
+                                                                                 entropic regularization method as the OT problem. The reformulated
+𝜈. To be simplified, we mainly consider the discrete case where 𝜇 and
+                                                                                 POT problem with entropic regularization is:
+𝜈 are discrete distributions with 𝑛 and 𝑚 points, respectively. In this
+case, the cost function 𝐶 is a matrix 𝑪 ∈ R𝑛×𝑚 , where 𝑪 𝑖𝑗 is the cost of         min ⟨𝑪, 𝛾⟩ − 𝜖 𝐻(𝛾),
+                                                                                 𝛾∈𝛱(𝜇 ,𝜈)
+transporting mass from 𝜇𝑖 to 𝜈𝑗 , usually defined by a distance measure.                     ∑
+                                                                                             𝑚
+The transport plan 𝛾 is a joint probability distribution 𝛾 ∈ R𝑛×𝑚 , where            𝑠.𝑡.          𝛾𝑖𝑗 ≤ 𝜇𝑖 ,
+𝛾𝑖𝑗 is the amount of mass transported from source to the target. The                         𝑗=1
+optimal transport problem between two discrete distributions can be                          ∑𝑛
+                                                                                                 𝛾𝑖𝑗 ≤ 𝜈𝑗 ,                                                (5)
+formulated as below:
+                                                                                             𝑖=1
+                 ∑
+                 𝑛 ∑ 𝑚
+  min ⟨𝑪, 𝛾⟩ =         𝑪 𝑖𝑗 𝛾𝑖𝑗 ,                                                            ∑𝑛 ∑ 𝑚
+𝛾∈𝛱(𝜇,𝜈)                                                                                               𝛾𝑖𝑗 = 1 − 𝑠,
+                       𝑖=1 𝑗=1
+                                                                                             𝑖=1 𝑗=1
+           ∑
+           𝑚
+    𝑠.𝑡.         𝛾𝑖𝑗 = 𝜇𝑖 ,                                                                 𝛾𝑖𝑗 ≥ 0, 𝑠 ≥ 0.
+           𝑗=1                                                        (2)
+                                                                                 For convenience, we denote this problem by its inputs and the result
+           ∑𝑛
+                 𝛾𝑖𝑗 = 𝜈𝑗 ,                                                      as:
+           𝑖=1                                                                   𝛾 = POT(𝑪, 𝜇 , 𝜈 , 𝑠).                                                    (6)
+           𝛾𝑖𝑗 ≥ 0.
+
+3.1.2. Entropic optimal transport regularization                                 3.2.3. Solution to POT
+   While the OT problem can be solved with specific linear program-                  To address the POT problem defined in Eq. (4), we follow Benamou
+ming algorithms, the computational cost is 𝑂(𝑛3 𝑚3 ), which becomes              et al. [33] to apply an iterative algorithm with entropic regularization.
+computationally prohibitive for large-scale datasets. To address this is-        Details of the algorithm are shown below:
+sue, Cuturi et al. proposed the entropic optimal transport regularization            1. Initialization
+(EOT) method [32]. The EOT problem is formulated as below:                           Given the cost matrix 𝑪 and regularization parameter 𝜖, the initial
+  min ⟨𝑪, 𝛾⟩ − 𝜖 𝐻(𝛾),                                                           transport matrix is defined as:
+𝛾∈𝛱(𝜇,𝜈)
+                                                                      (3)                  (      )
+                                                                                               𝑪
+                         ∑𝑛 ∑𝑚                                                   𝑲 = exp −          ,                                                  (7)
+where 𝐻(𝛾) = − 𝑖=1 𝑗=1 𝛾𝑖𝑗 log(𝛾𝑖𝑗 ) is the entropy of 𝛾. The entropic                          𝜖
+regularization parameter 𝜖 controls the trade-off between the trans-             which is then scaled to satisfy the total transported mass 1 − 𝑠:
+portation cost and the entropy. The EOT problem can be solved with                        1−𝑠
+                                                                                 𝑲 ←𝑲⋅ ∑ .                                                                 (8)
+the Sinkhorn algorithm [32], which iteratively updates the transport                         𝑲
+plan.
+
+                                                                             3
+P. Fang et al.                                                                                                                         Pattern Recognition 164 (2025) 111482
+
+
+    2. Iterative Steps                                                                     feature 𝒕𝑐 , 𝑐 ∈ [1, 2, … , 𝑁] and the corresponding global image feature
+                                                                                                      ∑ 𝑁𝐿 𝑆
+    During each iteration, the transport matrix is alternately scaled                      𝒙𝑆𝑖 = 𝑁1          𝒙 , 𝑖 ∈ [1, 2, … , 𝑁𝑆 ], where 𝒙𝑆𝑖𝑗 is the 𝑗th local feature
+                                                                                                          𝑗=1 𝑖𝑗
+                                                                                                   𝐿
+along its rows and columns to progressively meet the marginal con-                         of image 𝑰 𝑆𝑖 . With the well-matched features of the two modalities,
+straints 𝜇 and 𝜈.                                                                          we use POT to transport the information carried by image regions
+    Let 𝑲 1 represent the row-normalized matrix:                                           to the closely associated labels. We partially aggregate local features
+            (      (            ))
+                        𝜇                                                                  𝒙𝑆𝑖𝑗 into class features 𝒑𝑐𝑖 for each relevant class 𝑐 according to the
+𝑲 1 = diag min ∑              ,𝟏   ⋅ 𝑲,                           (9)
+                       𝑗 𝑲 𝑖𝑗                                                              resulting transportation plans between visual and textual distributions,
+                 𝜇                                                                         as illustrated by the POT Module in Fig. 2. Class features 𝒑𝑐𝑖 are
+where    ∑              normalizes the sum of each row to ensure that row sums
+             𝑗   𝑲 𝑖𝑗                                                                      averaged across all images labeled 𝑐 to form the final class prototype 𝒑𝑐 .
+do not exceed the vector 𝜇.                                                                We optimize classification loss by minimizing the distance between the
+    The columns of 𝑲 1 are then normalized as follows:                                     prototype and the global feature 𝒙𝑄
+                (   (            ))                                                                                            𝑖 of each query image containing the
+                         𝜈                                                                 corresponding class. During inference, class prototypes are generated
+𝑲 2 = 𝑲 1 ⋅ diag min ∑         ,𝟏   ,                                         (10)
+                        𝑖 𝑲 𝑖𝑗                                                             in a similar manner, and query samples are classified based on their
+                                                                                           similarity to each prototype.
+where ∑ 𝜈𝑲 normalizes the sum of each column to ensure that column
+         𝑖 𝑖𝑗
+sums do not exceed the vector 𝜈.
+   Finally, the matrix 𝑲 2 is scaled to ensure the total transported mass                  4.3. Modality alignment with prompt-based fine-tuning
+equals 1 − 𝑚:
+           1−𝑠                                                                                  To improve alignment between visual and textual modalities, we
+𝑲 ← 𝑲2 ⋅ ∑       .                                                   (11)
+              𝑲2                                                                           propose a prompt-based fine-tuning method using class names. The
+   3. Convergence                                                                          textual descriptions are extracted by the pre-trained CLIP [28] model.
+   After each iteration, the algorithm computes the difference between                     Following CoOp [29], we set the input prompts for class 𝑐 as 𝑷 =
+the current and previous transport matrix. The error is defined as:                        [𝑃 ]𝑐1 [𝑃 ]𝑐2 … [𝑃 ]𝑐𝑁 [CLASS], where [CLASS] ∈ R𝑑𝑤 represents the word
+                                                                                                                 𝑐 𝑡𝑥
+                                                                                           embedding of class 𝑐, [𝑃 ]𝑐𝑖 ∈ R𝑑𝑤 is the 𝑖th trainable prompt embedding,
+error = ‖𝛾prev − 𝛾‖,                                                          (12)
+                                                                                           and 𝑁𝑐 𝑡𝑥 is the number of prompts. The class-specific text features 𝒕𝑐 ,
+and the algorithm stops when the error falls below a pre-defined                           generated by the CLIP text encoder, are aligned with the image features.
+threshold.                                                                                 We apply the contrastive loss to maximize the similarity between text
+   This procedure iteratively normalizes the rows and columns of the                       features 𝒕𝑐 and global image features 𝒙𝑆𝑖 of the same class, and minimize
+transport matrix, ensuring that the solution complies with the marginal                    the similarity between text and image features from different classes.
+constraints while maintaining a smooth distribution through entropic                       The text encoder remains fixed during training, while the prompts are
+regularization.                                                                            updated through backpropagation. To fit in the ML-FSL problem, the
+                                                                                           cross-entropy loss is replaced by binary cross-entropy loss to calculate
+4. Method                                                                                  the loss between the predicted labels and the ground truth labels. The
+                                                                                           loss function is defined as:
+4.1. Problem formulation                                                                                    𝑁𝑆 𝑁 ⎛                       ( ) ⎞2
+                                                                                                          1 ∑ ∑ ⎜ 𝑦𝑖𝑐
+                                                                                                                            𝑆
+                                                                                                                                     exp 𝑠𝑖𝑐
+                                                                                           𝑎𝑙𝑖𝑔𝑛 =                              − ∑𝑁       ( ) ⎟⎟ ,
+     In this section, we introduce the notations and problem formulation                                 𝑁𝑆 𝑖=1 𝑐=1 ⎜ ‖ ‖ 𝒚 𝑆‖
+                                                                                                                             ‖          exp  𝑠𝑖𝑘 ⎠              (13)
+                                                                                                                      ⎝ ‖ 𝑖 ‖1      𝑘=1
+of ML-FSL. Given a support set  with assigned labels from the label                                         ( 𝑆 )             [           ]
+set  and a query set , the goal is to predict the labels of samples                          𝑠𝑖𝑐 = 𝜆 cos 𝒙𝑖 , 𝒕𝑐 , 𝑖 ∈ 1, 2, … , 𝑁𝑆 , 𝑐 ∈ [1, 2, … , 𝑁] ,
+in  given the . We denote an episode as  = {, }, where  =                            where 𝜆 is the scaling factor, 𝑁 is the number of classes in the episode,
+                𝑁                      𝑄 𝑁𝑄
+{(𝑰 𝑆𝑖 , 𝒚 𝑆𝑖 )}𝑖=1𝑆 and  = {(𝑰 𝑄
+                                 𝑖 , 𝒚 𝑖 )}𝑖=1 . The symbol 𝒚 𝑖 is the one-hot label       and 𝑦𝑆𝑖𝑐 is the 𝑐th element of the one-hot label of support image 𝑰 𝑆𝑖 .
+of image 𝑰 𝑖 in the support or query sets, and 𝒚 𝑖 ∈ R|| where  is the                   The aligned features are then used to generate class prototypes for
+selected label set for each episode. In the traditional 𝑁-way 𝐾-shot                       classification.
+setting for FSL, the support set  consists of 𝑁 classes, each with 𝐾
+labeled images where 𝐾 is small, e.g ., 1 or 5. In the ML-FSL setting,
+each image is labeled with multiple labels, making the number of labels                    4.4. Partial optimal transport for prototype generation
+uncertain in each episode. To this end, we fix the number of samples
+in the support and query sets as 𝑁𝑆 and 𝑁𝑄 , guaranteeing each class                           To generate class prototypes from the support set, we propose a
+contains at least one sample, and still use 𝑁 to denote the number of                      partial aggregation scheme that selects the most relevant local image
+classes within an episode. To apply the episodic learning paradigm, the                    features. For each support image 𝑰 𝑆𝑖 , we determine the relevance of its
+label set is divided into two disjoint sets 𝑏𝑎𝑠𝑒 and 𝑛𝑜𝑣𝑒𝑙 . The images                  local features to each class by solving several POT problems according
+that only contain labels in 𝑏𝑎𝑠𝑒 form the training dataset 𝑡𝑟𝑎𝑖𝑛 , while                 to its labels. The resulting transportation plans serve as weight matri-
+those with labels in 𝑛𝑜𝑣𝑒𝑙 form the test dataset 𝑡𝑒𝑠𝑡 . We train and test                ces, allowing use to compute the weighted average of the local features
+the model using images sampled from 𝑡𝑟𝑎𝑖𝑛 and 𝑡𝑒𝑠𝑡 , respectively.                       to generate corresponding class features.
+                                                                                               Specifically, we require the probability distributions 𝜇 and 𝜈 for
+4.2. Overview                                                                              the textual and visual modalities, the cost matrix 𝑪 representing the
+                                                                                           transportation cost between modalities, and the remaining mass 𝑠
+    This section introduces the overview of the proposed ProPOT for                        denoting the portion of probability mass that should remain untrans-
+ML-FSL, as shown in Fig. 2. In each episode, we extract text features 𝒕𝑐                   ported within a single POT problem. For one of the corresponding class
+from class names using the pre-trained CLIP text encoder with prompt                                                          ( )
+                                                                                           𝑐, we define the distribution 𝜇𝑖 = 𝜇𝑖𝑐 ∈ R𝑁 of textual modality as
+tuning, and image features 𝑿 𝑆𝑖 from support images 𝑰 𝑆𝑖 using the CLIP                              𝑒−𝑠𝑖𝑐
+image encoder. We have modified the image encoder to extract local                         𝜇𝑖𝑐 = ∑𝑁            ,                                               (14)
+                                                                                                          −𝑠𝑖𝑘
+feature maps; the output for image 𝑰 𝑆𝑖 is 𝑿 𝑆𝑖 ∈ R𝑁𝐿 ×𝑑𝑣 , comprising                              𝑘=1 𝑒
+
+𝑁𝐿 local features and 𝑑𝑣 feature dimensions. We align text and image                       where 𝑠𝑖𝑐 is defined the same way as Eq. (13). Here 𝜇𝑖 reveals the
+features by maximizing the similarity between each correlated text                         overall distribution of information 𝑰 𝑆𝑖 carries. The distribution of local
+
+                                                                                       4
+P. Fang et al.                                                                                                                             Pattern Recognition 164 (2025) 111482
+
+
+
+
+                                                        Fig. 2. Overview of ProPOT method using a 3-way 1-shot task as an example.
+
+                            (   )
+image features 𝜈𝑖𝑐 = 𝜈𝑖𝑗𝑐 ∈ R𝑁𝐿 is defined as                                                   the classification loss, which is defined as:
+                 𝑗
+            𝑒−𝑠𝑖𝑐                                                                                = 𝛼𝑎𝑙𝑖𝑔𝑛 + 𝛽𝑐 𝑙𝑠 .                                                    (21)
+𝜈𝑖𝑗𝑐 = ∑          𝑘
+                       ,                                                             (15)
+         𝑁𝐿
+          𝑘=1
+               𝑒−𝑠𝑖𝑐
+                                                                                                5. Experiments
+where    𝑠𝑐𝑖𝑗 represents   the cosine similarity between the 𝑗th local feature
+𝒙𝑆𝑖𝑗 and the text feature 𝒕𝑐 of the related class 𝑐, defined as 𝑠𝑗𝑖𝑐 =                          5.1. Datasets
+𝜆 cos(𝒙𝑆𝑖𝑗 , 𝒕𝑐 ). Similarly, 𝜈𝑖𝑐 indicates the information of class 𝑐 that each
+local feature 𝒙𝑖𝑗 carries. A specific image 𝑰 𝑆𝑖 can carry multiple labels                          We evaluate the performance of our method on multi-label few-shot
+in the multi-label setting. Therefore, we obtain get visual distributions                       tasks using three datasets. An episodic training strategy is employed,
+in the quantity of ‖𝒚 𝑆𝑖 ‖1 corresponding to different classes and there                        where in each episode, a few classes and samples are drawn from the
+are such a number of POT problems to be solved for 𝑰 𝑆𝑖 . It ensures that                       base classes to form the support and query sets. The training images
+we engage more related local features in the prototype generation.                              contain only labels from the base classes. During testing, the model is
+     Then, the cost matrix 𝑪 𝑖 is defined by the regularized cosine dis-                        evaluated on novel classes that are unseen during training. Test samples
+tance between the local image features and the text features. Specially,
+                                         ((       ) )                                           belong exclusively to novel classes and do not carry any labels from the
+we compute it as 𝑪 𝑖 = sof t max 1 − 𝑺 𝑖 ∕𝜏 , where 𝑆𝑖 is the cosine                            base classes. The details of the datasets are as follows:
+similarity matrix,
+                        [            ]⊤        [          ]                                         MS-COCO [34]: The MS-COCO (Microsoft Common Objects in Con-
+                                                        𝑁
+𝑺 𝑖 = 𝑻 × 𝑿 𝑆𝑖 , 𝑻 = 𝒕1 , … , 𝒕𝑁𝐶 , 𝑿 𝑆𝑖 = 𝒙1𝑖 , … , 𝒙𝑖 𝐿 .                 (16)                text) dataset is a widely used benchmark in computer vision, particu-
+                                                                                                larly for tasks such as object detection, segmentation, and captioning.
+   As for one POT optimization we aim to obtain the plan transporting
+                                                                                                In this study, the MS-COCO dataset is utilized to perform a multi-label
+local image features to one of its related classes, setting the remaining
+                                                                                                classification task. This dataset provides a rich collection of images,
+mass 𝑠 as the number of the rest classes, 𝑠 = 1 − 𝑆1 .
+                                                                 ‖𝒚 𝑖 ‖1                        each annotated with multiple labels, which correspond to various
+   We calculate transportation plans 𝛾𝑖𝑐 for image 𝑰 𝑆𝑖 which show the                          objects present within the image. MS-COCO contains about 120,000
+potential of the local features to be the prototype of different classes                        labeled images, divided into training, validation, and test sets. To
+by solving the following POT problems:                                                          evaluate the performance of our model, we use the 2014 version of
+𝛾𝑖𝑐 = POT(𝑪 𝑖 , 𝜇𝑖 , 𝜈𝑖𝑐 , 𝑠), 𝑐 ∈ {𝑘 ∣ 𝑦𝑆𝑖𝑘 = 1, 𝑘 = 1, 2, … , 𝑁}.                  (17)       the dataset, which contains 80 object categories. To perform 10-way
+                                                                                                few-shot classification tasks, We follow Simon et al. [9] to split the
+    The resulting transportation plan serves as a weight matrix to aggre-                       dataset, i.e., 50,10,20 categories are used as base, validation, and novel
+gate the corresponding class feature 𝒑𝑐𝑖 , which contains the information                       classes, respectively. To perform 16-way few-shot classification tasks,
+of concerned regions of 𝑰 𝑆𝑖 w.r.t. class 𝑐. The class feature is calculated                    we follow Alfassy et al. [7] and Yan et al. [10] to split the dataset, using
+as below:                                                                                       52, 12, and 16 categories as the base, validation, and novel classes,
+𝒑𝑐𝑖 = (𝛾𝑖𝑐 )𝑐 ,∶ × 𝑿 𝑆𝑖 ,                                                            (18)       respectively. The detailed split is shown in Table 1.
+                                                                                                    NUS-WIDE [35]: The NUS-WIDE (National University of Singapore
+where     (𝛾𝑖𝑐 )𝑐 ,∶
+               denotes the 𝑐th row of           𝛾𝑖𝑐 .
+                                        Finally the prototypes 𝒑𝑐 for
+                                                                                                - Web Image Database) dataset consists of a large collection of images
+each class 𝑐 are obtained by averaging the class features of support
+                                                                                                harvested from the web, annotated with multiple labels representing
+images that contain the specific label,
+             ∑                                                                                  various objects and concepts present within each image. NUS-WIDE
+       1
+𝒑𝑐 =                (𝛾 𝑐 )𝑐 ,∶ × 𝑿 𝑆𝑖                                                           contains over 260,000 images, each tagged with multiple labels derived
+     |𝑐𝑆 | 𝑆 𝑆 𝑖
+           𝑿 𝑖 ∈𝑐                                                                              from user-provided tags and further refined through a semi-automated
+                                                                 (19)
+       1 ∑ 𝑐                                                                                    process. These labels span 81 categories, including objects, scenes,
+   =            𝒑 ,
+     |𝑐𝑆 | 𝑖 𝑖                                                                                 and activities, making the dataset suitable for evaluating models in
+                                                                                                multi-label classification scenarios. Considering there is no current ML-
+where 𝑐𝑆 refers to the set of support samples containing class 𝑐.
+                                                                                                FSL research tackling this dataset, We randomly divided the dataset
+The distances between the global feature 𝑿 𝑞𝑖 of query image 𝑰 𝑄 𝑖 and                          into 41, 20, and 20 categories for base, validation, and novel classes,
+prototypes are then used to predict the labels. The classification loss
+                                                                                                respectively.
+function for query samples is defined as:
+                                     (    ) ⎞2                                                      Pascal-VOC [36]: The Pascal-VOC (Visual Object Classes) dataset
+            𝑁𝑄 𝑁 ⎛        𝑄
+          1 ∑ ∑ ⎜ 𝑦𝑖𝑐            exp −𝑧𝑖𝑐                                                       consists of over 5000 images annotated with object bounding boxes and
+𝑐 𝑙 𝑠 =                     − ∑𝑁      (    )⎟ ,                   (20)
+         𝑁𝑄 𝑖=1 𝑐=1 ⎜ ‖ 𝒚𝑄
+                           ‖        exp −𝑧𝑖𝑘 ⎟⎠                                                 class labels. In this study, we use the Pascal-VOC 2012 dataset, which
+                    ⎝‖‖ ‖1
+                         𝑖 ‖    𝑘=1
+                                                                                                contains 20 object categories. We follow the split of the dataset used
+where 𝑧𝑖𝑐 = 𝜆‖𝒑𝑐 − 𝒙𝑄      𝑖 ‖2 denotes the squared Euclidean distance
+                              2                                                                 in the CMW papers where 14 categories are used as base classes and
+between the prototype of class 𝑐 and the global features of query sample                        6 categories are used as novel classes for testing. The detailed split is
+𝑰𝑄
+ 𝑖 . The final loss function is the combination of the alignment loss and                       shown in Table 2.
+
+                                                                                            5
+P. Fang et al.                                                                                                                                   Pattern Recognition 164 (2025) 111482
+
+                           Table 1
+                           The dataset split for MS-COCO.
+                                                                                    MS-COCO
+                                                    Training classes                              Validation classes                 Test classes
+                            Backpack          Cell phone       Knife           Sink               Airplane              Apple               Banana
+                            Baseball bat      Chair            Laptop          Spoon              Carrot                Bed                 Bird
+                            Baseball glove    Clock            Motorcycle      Suitcase           Frisbee               Boat                Broccoli
+                            Bear              Couch            Mouse           Person             Tennis racket         Donuts              Elephant
+                            Bench             Cow              Oven            Tie                Kite                  Fire hydrant        Horse
+                            Bicycle           Cup              Person          Toaster            Orange                Microwave           Parking meter
+                            Book              Dining table     Pizza           Traffic light      Skis                  Sandwich            Scissors
+                            Bottle            Dog              Potted plant    Truck              Stop sign             Sheep               Skateboard
+                            Bowl              Fork             Refrigerator    TV                 Surfboard             Teddy bear          Toilet
+                            Bus               Giraffe          Remote          Umbrella           Toothbrush            Train               Wine glass
+                            Cake              Hairdryer        Snowboard       Vase
+                            Car               Handbag          Sports ball     Zebra
+                            Cat               Keyboard
+
+
+        Table 2                                                                                      Table 3
+        The dataset split for Pascal-VOC.                                                            Comparison with state-of-the-art methods on MS-COCO dataset using
+                                       Pascal-VOC                                                    LaSO benchmark on 1-shot and 5-shot scenarios.
+                         Training classes                       Test classes                          Method                    Backbone                1-shot        5-shot
+         Aero-plane         Car                 Person          Dog                                   LaSO                      GoogleNet-v3            45.3          58.1
+         Bicycle            Chair               Train           Sofa
+                                                                                                      ML-ProtoNet               ConvNet-4               50.2          60.4
+         Bird               Cow                                 Cat
+         Boat               Dining table                        Potted plant                                                    GoogleNet-v3            49.4          61.0
+                                                                                                      KGGR
+         Bottle             Horse                               TV monitor                                                      ResNet-101              52.3          63.5
+         Bus                Motorbike                           Sheep                                                           GoogleNet-v3            53.4          65.1
+                                                                                                      CMW
+                                                                                                                                ResNet-101              55.7          68.2
+                                                                                                                                ConvNet-4               53.2          62.5
+                                                                                                      ProPOT                    GoogleNet-v3            56.7          65.8
+5.2. Implementation details                                                                                                     ResNet-101              60.3          69.2
+
+    In our implementation, we adopt different settings for ML-ProtoNet
+and CMW to conduct our experiments. The key differences between                                Table 4
+                                                                                               Comparison with meta-learning methods on MS-COCO dataset following ML-ProtoNet
+these two approaches lie in the number of categories and the number of
+                                                                                               setting on 1-shot and 5-shot scenarios.
+samples per class in each episode. ML-ProtoNet follows the traditional
+                                                                                                Method                 MS-COCO                 NUS-WIDE            Pascal
+episodic learning paradigm for few-shot learning (FSL), maintaining a
+                                                                                                                       1-shot      5-shot      1-shot     5-shot   1-shot      5-shot
+consistent number of categories across all episodes. In contrast, CMW
+adjusts the number of classes in each episode to match the total number                         ML-ProtoNet            56.7        66.7        62.1       65.3     54.3        61.5
+of classes in the entire dataset split. Specifically, for ML-ProtoNet, all                      ML-ProtoNet+NLC        58.5        68.0        62.7       66.9     57.2        63.3
+                                                                                                LPN+NLC                60.4        69.1        62.5       67.1     57.9        63.1
+few-shot tasks across datasets are 10-way, while in CMW, the number of
+classes varies across datasets, with 16-way, 20-way, and 6-way tasks for                        ProPOT                 61.9        72.3        63.5       68.4     62.4        65.1
+
+MS-COCO, NUS-WIDE, and Pascal-VOC, respectively, during the testing
+phase. Additionally, ML-ProtoNet ensures that at least one sample is
+present for each class in the query set. In contrast, CMW samples 4
+                                                                                               5.3. Results
+instances per class, maintaining a fixed query set size of 4 × 𝑛 for an
+n-way task.
+    We use different scales of vision model as feature extractors ac-                              We compare our model with ML-ProtoNet, CMW, and LaSO on
+cording to the few-shot tasks. For 10-way 1-shot and 10-way 5-shot                             the MS-COCO, NUS-WIDE and Pascal-VOC datasets. However, these
+tasks, we use the ConvNet-4 [20] architecture to be compared with                              methods apply different sampling strategies for generating episodes.
+ML-ProtoNet [9]. The learning rate is initially set to 0.001. For 16-                          Therefore, we follow each method separately to ensure fair compar-
+way 1-shot and 16-way 5-shot settings, we use the ResNet-50 [37]                               isons. Firstly we evaluate our model on the LaSO benchmark, which
+architecture which is compared with CMW [10]. To evaluate our model                            applies a traditional test strategy, using all related samples in the MS-
+on the LaSO [7] benchmark where episodic testing is not implemented,                           COCO dataset to evaluate the model. The results are shown in Table 3,
+we use the GoogleNet-v3 [38] and ResNet-101 [37] as our backbone,                              with the best results highlighted in bold. Our method outperforms the
+which allows for comparison with all previous methods. The learning
+                                                                                               state-of-the-art techniques. ProPOT with GoogleNet-v3 as the image
+rates for these two settings are initially set to 1e-5. The feature extractor
+                                                                                               encoder gains 3.3% and 0.7% of mAP improvement compared with
+for the text modality in our model is the default CLIP text encoder,
+                                                                                               CMW on 1-shot and 5-shot settings, together with 4.6% and 1.0% if
+whose weights are frozen during all stages and only the parameterized
+prompts are used for training. We use the Adam optimizer [39] and                              using ResNet-101.
+a decreasing learning rate scheduler for all experiments. The model                                We also test our model using ConvNet-4 as the image encoder in 10-
+is trained for 100,000 episodes for each task and is evaluated on the                          way 1-shot and 10-way 5-shot tasks following the dataset split of [9]
+validation set every 1000 episodes. The best model is selected based                           and the results are shown in Table 4. To compare with CMW, we test
+on the validation set performance except for experiments on PASCAL-                            our model using the split provided by [10] with ResNet-50 as the image
+VOC. Considering the limited number of classes in PASCAL-VOC, we                               encoder under the setting of 16-way 1-shot and 16-way-5-shot tasks
+use the model trained after the last episode for evaluation to leverage                        and the results are shown in Table 5. Both of the latter two settings
+all base classes for training. We set the weight of entropic regularization                    are based on episodic training and testing. Our model outperforms all
+to 0.001, the number of local features to 49, and the weight 𝛼, 𝛽 for                          other state-of-the-art methods across all settings.
+alignment loss and classification loss to 0.01 and 1 respectively for all
+experiments.
+
+                                                                                        6
+P. Fang et al.                                                                                                                           Pattern Recognition 164 (2025) 111482
+
+Table 5                                                                                  5.4.4. Analysis on distance metrics
+Comparison following CMW setting on 1-shot and 5-shot scenarios.
+                                                                                             We evaluate the model using various combinations of distance
+ Method          Backbone         MS-COCO                     Pascal
+                                                                                         metrics for intra-modal and inter-modal calculations. Intra-modal dis-
+                                  1-shot          5-shot      1-shot      5-shot         tance refers to the distance between text and image features, while
+                 ResNet-50        57.5            61.2        60.0        60.8           inter-modal distance refers to the distance between image features
+ CMW
+                 ResNet-101       58.3            64.3        61.8        62.1
+                                                                                         and the corresponding prototypes. The results, presented in Table 9,
+                 ConvNet-4        54.1            62.8        62.4        67.8           indicate that cosine distance is particularly effective for intra-modal
+ ProPOT          ResNet-50        61.6            66.5        64.7        68.8
+                                                                                         alignment, consistent with CLIP’s design philosophy. In contrast, using
+                 ResNet-101       62.3            68.7        69.4        72.3
+                                                                                         Euclidean distance for this task significantly degrades performance. The
+                                                                                         optimal performance is achieved when cosine distance is employed
+Table 6                                                                                  for intra-modal calculations and Euclidean distance for inter-modal
+Precision, recall and F1 scores on MS-COCO dataset under 1-shot scenarios compared
+                                                                                         comparisons.
+with meta-learning methods.
+ Method               Backbone             Precision       Recall       F1-score
+                                                                                         5.4.5. Analysis on partial optimal transport
+ ML-ProtoNet          ConvNet-4            37.2            70.7         48.8
+ ProPOT               ConvNet-4            39.4            75.6         51.7                 We perform a detailed ablation study on the core module of our
+ CMW                  ResNet-50            34.5            40.1         37.1
+                                                                                         model, the POT mechanism, to assess the impact of key hyper-
+ ProPOT               ResNet-50            31.5            90.6         39.8             parameters on performance. The outcomes are presented in Tables 10,
+                                                                                         11, 12 13. In each test, the specific hyper-parameter is evaluated while
+                                                                                         keeping the others at their default settings. The results demonstrate that
+                                                                                         the entropic regularization weight 𝜖 plays a critical role, particularly
+5.4. Ablation study                                                                      when using larger backbones. 𝜖 regulates the sparsity of the trans-
+                                                                                         portation plan, where lower values lead to sparser solutions—fewer
+    In this section, we conduct an ablation study to evaluate the effec-                 local image features are selected for prototype generation. As seen in
+tiveness of each module in our model. The study is carried out using                     Table 10, a smaller 𝜖 generally yields better performance, highlighting
+the split provided by Simon et al. [9] under the 10-way 1-shot setting.                  POT’s ability to prioritize relevant features while discarding irrelevant
+                                                                                         ones. However, as 𝜖 decreases, training becomes more challenging,
+                                                                                         resulting in lower model stability and poorer performance due to
+5.4.1. Analyis on evaluation metrics                                                     numerical instabilities that may affect overall accuracy.
+    For better method comparison, we provide a more detailed metric                          The remaining mass 𝑠 is also a crucial hyper-parameter in POT. 𝑠
+table to present the precision, recall, and F1 scores, as shown in                       controls the amount of mass that can be transported from the source to
+Table 6. For ProPOT and ML-ProtoNet, the threshold to determine                          the target. A specific POT problem involves matching the information
+positive and negative categories is set to 0.1, as the classification logit              of a single class, as carried by the image, with the corresponding text
+follows a softmax function. In contrast, the threshold for CMW is set                    features. From this perspective, 𝑠 quantifies the proportion of regions
+to 0.5, consistent with the original paper. Our method achieves higher                   irrelevant to the target class. The results of different remaining masses
+F1 scores compared to the other methods, indicating better overall                       are demonstrated in Table 13. The results show that among the settings
+performance. However, the precision score is slightly lower than that                    of fixed remaining mass, 𝑠 = 0.67 obtains the best result, which means
+of CMW, likely due to the difference in threshold settings.                              only one-third of the mass can be transported from the source to the
+                                                                                         target. The performance drops when 𝑠 is set to 0.5 and 0.33, and the
+                                                                                         performance is the worst when 𝑠 is set to 0.00, which means all the
+5.4.2. Analysis on statistical significance                                              mass can be transported from the source to the target, namely the
+    We report the confidence interval as a measure of model per-                         setting of OT problem. The dynamic setting of 𝑠 achieves the best
+formance. Specifically, we calculate the 95% confidence interval for                     performance, indicating that tuning the mass amount according to the
+our proposed method across three benchmarks, as shown in Table 7.                        number of labels makes sense.
+The results demonstrate that our method clearly outperforms existing                         Additionally, calculating the remaining masses for each support
+state-of-the-art approaches, highlighting its superiority. Note that [9]                 image can be time-consuming. A more efficient approach is to fix 𝑠
+evaluates methods only on the MS-COCO dataset; therefore, we use                         for different datasets, which results in only a slight loss of accuracy.
+the results from [9] for MS-COCO, while the results for NUS-WIDE and                     In Table 12, we further investigate the effect of different values of 𝑠 for
+Pascal-VOC are re-implemented. We also calculate p-values for ProPOT                     the datasets used in our manuscript, under 10-way 1-shot tasks with
+on NUS-WIDE and Pascal-VOC datasets compared to ML-ProtoNet,                             ResNet-50 as the visual encoder. The best result for each dataset is
+yielding 0.027 and 0.001. Considering a common level 0.05 for the                        highlighted in bold. For MS-COCO and NUS-WIDE, which have more
+𝑝-value, our method realizes a significant improvement over previous                     than 3 labels per image, a smaller remaining mass performs better. In
+                                                                                         contrast, Pascal-VOC, with an average of 1.4 labels per image, benefits
+methods as the p-values are all smaller than the given level.
+                                                                                         from a larger remaining mass, as smaller masses lead to information
+                                                                                         loss and worse performance.
+5.4.3. Analysis on model design                                                              In addition, the distributions of text features and image features
+    We perform an ablation study to assess the contribution of each                      also affect the performance, but the impact is not as significant as
+module in our model, with results summarized in Table 8. ‘‘Modality                      the other two hyper-parameters. It may arise from the strong selective
+Alignment’’ refers to the implementation of the alignment loss 𝑎𝑙𝑖𝑔𝑛 .                  function of POT, which focuses on the most related features according
+‘‘Prompt Learning’’ indicates the presence of trainable prompts, without                 to the cost matrix, even if the possibility masses of all features are the
+which text features remain fixed during training. ‘‘POT’’ represents the                 same. Table 11 shows the results, where Uni., GT, Logits mean uniform
+partial aggregation scheme, compared against a baseline that averages                    distribution, ground-truth distribution and output logits defined in
+                                                                                         Section 4 respectively. Considering that the distribution sums up to
+all related image features to generate prototypes. Each component con-
+                                                                                         1, we modify the one-hot label 𝒚 𝑆𝑖 to the ground-truth distribution
+tributes to overall performance, with modality alignment significantly                             𝒚𝑆
+                                                                                           ′        𝑖 +𝜖
+enhancing results, and POT providing further gains.                                      𝒚 𝑆𝑖 =               , where 𝜖 is 1𝑒 − 5 to avoid numerical instability.
+                                                                                                  ‖𝒚 𝑆
+                                                                                                     𝑖 +𝜖‖1
+
+
+                                                                                     7
+P. Fang et al.                                                                                                                                   Pattern Recognition 164 (2025) 111482
+
+                              Table 7
+                              Comparison with meta-learning methods following ML-ProtoNet setting on 1-shot and 5-shot scenarios.
+                               Method                    MS-COCO                       NUS-WIDE                              Pascal-VOC
+                                                         1-shot          5-shot        1-shot           5-shot               1-shot           5-shot
+                               ML-ProtoNet               56.7            66.7          62.1 ± 1.02      65.3 ± 1.24          54.3 ± 0.78      61.5 ± 0.99
+                               ML-ProtoNet+NLC           58.5            68.0          62.7 ± 0.97      66.9 ± 0.98          57.2 ± 1.03      63.3 ± 1.12
+                               LPN+NLC                   60.4            69.1          62.5 ± 1.35      67.1 ± 1.51          57.9 ± 1.26      63.1 ± 1.19
+                               ProPOT                    61.9 ± 0.93     72.3 ± 1.11   63.5 ± 0.82      68.4 ± 1.03          62.4 ± 1.10      65.1 ± 0.99
+
+
+        Table 8                                                                                               Table 13
+        Ablation study on each module in our method with ConvNet-4 as the                                     Ablation study on distributions 𝜇 of text features and 𝜈
+        image encoder.                                                                                        of image features, where Uni., GT and Logit denote the
+           Modality Alignment               Prompt Learning        POT       mAP                              uniform distribution, normalized ground-truth label
+                                                                                                              and the predicted logit, respectively.
+           ✗                                ✗                      ✗         56.7
+                                                                                                                 Backbone             𝜇           𝜈            mAP
+           ✓                                ✗                      ✗         59.2
+           ✓                                ✓                      ✗         59.5                                                     Uni.        Uni.         61.6
+           ✓                                ✓                      ✓         61.9                                                     GT          Uni.         58.6
+                                                                                                                 ConvNet-4
+                                                                                                                                      Logit       Uni.         61.9
+                                                                                                                                      Logit       Logit        61.9
+        Table 9
+                                                                                                                                      Uni.        Uni.         74.7
+        Ablation study on distance used in the method, where Euc. denotes the
+                                                                                                                 ResNet-50            GT          Uni.         74.2
+        Euclidean distance and Cos. denotes the cosine distance.
+                                                                                                                                      Logit       Uni.         74.5
+           Intra-modal            Inter-modal             Backbone           mAP                                                      Logit       Logit        74.9
+           Euc.                   Euc.                                       57.1
+           Euc.                   Cos.                                       61.9
+                                                          ConvNet-4
+           Cos.                   Euc.                                       42.3
+           Cos.                   Cos.                                       59.5               5.5. Visualization
+           Euc.                   Euc.                                       67.7
+           Euc.                   Cos.                                       74.9                   In this section, we visualize the transportation plans of POT w.r.t.
+                                                          ResNet-50
+           Cos.                   Euc.                                       61.3               local image features and labels, and contrast them with direct similarity
+           Cos.                   Cos.                                       70.2
+                                                                                                matrices between visual and textual modalities to highlight the efficacy
+                                                                                                of ProPOT’s partial aggregation scheme.
+                         Table 10                                                                   In Fig. 3, all features are extracted using ProPOT with ResNet-
+                         Ablation study on the weight of entropic                               101 after the training stage. It can be observed that POT plans pre-
+                         regularization.
+                                                                                                dominantly focus on the informative regions of images to generate
+                          Backbone          Entropic weight 𝜖     mAP
+                                                                                                prototypes and effectively disregard irrelevant areas. For instance, com-
+                                            2                     61.4                          paring Fig. 3(a1) and (a2), POT selectively focuses on the location of
+                                            1                     61.0
+                          ConvNet-4         0.1                   61.5
+                                                                                                the class apple, while (a1) spreads unnecessary attention across’ the left
+                                            0.01                  61.9                          part of the image which contains unrelated objects. This phenomenon
+                                            0.009                 61.7                          is also evident in the other visualizations. It is important to note that
+                                            2                     74.4                          the quality of POT transportation plans is highly associated with the
+                                            1                     74.3                          similarity matrices, which serve as the cost matrices for POT problems.
+                          ResNet-50         0.1                   74.7                          For example, in Fig. 3(c2) and (c4), POT plans also allocate weights
+                                            0.01                  74.9
+                                                                                                to unrelated regions due to the confusion made by corresponding
+                                            0.009                 74.3
+                                                                                                similarity matrices.
+
+                         Table 11                                                               6. Conclusion
+                         Ablation study on the remaining mass of POT.
+                          Backbone          Remaining mass 𝑠      mAP                               In this paper, we have introduced a novel approach to multi-label
+                                            0.67                  61.7                          few-shot learning, addressing a challenging area that often limits the
+                                            0.50                  61.7
+                                                                                                performance of existing models. By leveraging weak supervision from
+                          ConvNet-4         0.33                  61.4
+                                            0.00                  61.5
+                                                                                                the pre-trained VLM, our method generates distinct and informative
+                                            Dynamic               61.9                          representations of multiple classes through a proposed regional ag-
+                                            0.67                  74.4                          gregation scheme that utilizes Partial Optimal Transport (POT). This
+                                            0.50                  74.7                          innovative strategy is specifically tailored for few-shot tasks involving
+                          ResNet-50         0.33                  74.1                          unseen classes, enhancing the model’s ability to generalize in scenar-
+                                            0.00                  73.1                          ios with limited labeled data. Our empirical evaluations demonstrate
+                                            Dynamic               74.9
+                                                                                                that our approach achieves state-of-the-art performance across sev-
+                                                                                                eral benchmark datasets, outperforming the latest methodologies and
+   Table 12                                                                                     significantly surpassing the previously best-performing method. These
+   Ablation study on different remaining mass 𝑠 across three datasets.                          results underscore the effectiveness of integrating optimal transport
+    Remaining mass 𝑠                 MS-COCO             NUS-WIDE         Pascal-VOC            mechanisms within the context of few-shot learning. Further investi-
+    0.00                             73.1                76.2             75.1                  gation is needed to address potential scalability issues when applying
+    0.33                             74.1                76.4             75.8                  our method to more complex datasets, as the complexity of optimal
+    0.50                             74.7                77.1             74.7
+                                                                                                transport (OT) algorithms increases rapidly with problem scale. Ad-
+    0.67                             74.4                76.9             73.6
+                                                                                                ditionally, the quality of feature representations plays a critical role
+                                                                                                in the success of the optimal transport process. While our approach
+                                                                                                demonstrates strong empirical performance, there is still room for
+
+                                                                                          8
+P. Fang et al.                                                                                                                               Pattern Recognition 164 (2025) 111482
+
+
+
+
+Fig. 3. Visualization of the aggregation scheme for local features to generate prototypes. The normalized similarity matrices are calculated by the cosine similarity between text
+and local image features, followed by a softmax normalization with a fixed temperature. POT plans are obtained by solving the POT problems defined in Section 4.
+
+
+improvement in data preprocessing [40,41] and feature extraction.                           BE2022811). Furthermore, the work was also supported by the Big Data
+Enhancing the ability to capture more discriminative and informative                        Computing Center of Southeast University.
+features, particularly in noisy or less structured environments, remains
+an area of ongoing research. Future work could focus on integrating                         Data availability
+more advanced feature extraction methods or exploring alternative
+forms of regularization to improve the robustness and quality of the                            Data will be made available on request.
+learned representations. A more comprehensive exploration of strate-
+gies to mitigate these challenges will be essential for the broader
+applicability of our framework.                                                             References
+
+CRediT authorship contribution statement                                                     [1] Z. Zhao, Q. Liu, W. Cao, D. Lian, Z. He, Self-guided information for few-shot
+                                                                                                 classification, Pattern Recognit. 131 (2022) 108880.
+   Pengfei Fang: Writing – review & editing, Supervision, Methodol-                          [2] H. Xu, J. Wang, H. Li, D. Ouyang, J. Shao, Unsupervised meta-learning for
+                                                                                                 few-shot learning, Pattern Recognit. 116 (2021) 107951.
+ogy, Investigation, Conceptualization. Zhihong Chen: Writing – orig-
+                                                                                             [3] Z. Yu, L. Chen, Z. Cheng, J. Luo, Transmatch: A transfer-learning scheme for
+inal draft, Software, Methodology, Investigation. Hui Xue: Resources,                            semi-supervised few-shot learning, in: Proceedings of the IEEE/CVF Conference
+Project administration, Conceptualization.                                                       on Computer Vision and Pattern Recognition, CVPR, 2020, pp. 12856–12864.
+                                                                                             [4] M. Yazdanpanah, A.A. Rahman, M. Chaudhary, C. Desrosiers, M. Havaei, E.
+Declaration of competing interest                                                                Belilovsky, S.E. Kahou, Revisiting learnable affines for batch norm in few-shot
+                                                                                                 transfer learning, in: Proceedings of the IEEE/CVF Conference on Computer
+                                                                                                 Vision and Pattern Recognition, CVPR, 2022, pp. 9109–9118.
+    The authors declare that they have no known competing finan-                             [5] S. Bartunov, D. Vetrov, Few-shot generative modelling with generative matching
+cial interests or personal relationships that could have appeared to                             networks, in: International Conference on Artificial Intelligence and Statistics,
+influence the work reported in this paper.                                                       AISTATS, PMLR, 2018, pp. 670–678.
+                                                                                             [6] S. Sheynin, S. Benaim, L. Wolf, A hierarchical transformation-discriminating gen-
+                                                                                                 erative model for few-shot anomaly detection, in: Proceedings of the IEEE/CVF
+Acknowledgements
+                                                                                                 International Conference on Computer Vision, ICCV, 2021, pp. 8495–8504.
+                                                                                             [7] A. Alfassy, L. Karlinsky, A. Aides, J. Shtok, S. Harary, R. Feris, R. Giryes, A.M.
+   This work was supported by the National Natural Science Foun-                                 Bronstein, Laso: Label-set operations networks for multi-label few-shot learning,
+dation of China (No. 62306070 and 62476056) and the Social De-                                   in: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+velopment Science and Technology Project of Jiangsu Province (No.                                Recognition, CVPR, 2019, pp. 6548–6557.
+
+
+                                                                                        9
+P. Fang et al.                                                                                                                                    Pattern Recognition 164 (2025) 111482
+
+
+ [8] T. Chen, L. Lin, R. Chen, X. Hui, H. Wu, Knowledge-guided multi-label few-shot               [28] A. Radford, J.W. Kim, C. Hallacy, A. Ramesh, G. Goh, S. Agarwal, G. Sastry,
+     learning for general image recognition, IEEE Trans. Pattern Anal. Mach. Intell.                   A. Askell, P. Mishkin, J. Clark, et al., Learning transferable visual models from
+     (TPAMI) 44 (3) (2020) 1371–1384.                                                                  natural language supervision, in: Proceedings of the International Conference on
+ [9] C. Simon, P. Koniusz, M. Harandi, Meta-learning for multi-label few-shot classi-                  Machine Learning, ICML, PMLR, 2021, pp. 8748–8763.
+     fication, in: Proceedings of the IEEE/CVF Winter Conference on Applications of               [29] K. Zhou, J. Yang, C.C. Loy, Z. Liu, Learning to prompt for vision-language
+     Computer Vision, WACV, 2022, pp. 3951–3960.                                                       models, Int. J. Comput. Vis. (IJCV) 130 (9) (2022) 2337–2348.
+[10] K. Yan, C. Zhang, J. Hou, P. Wang, Z. Bouraoui, S. Jameel, S. Schockaert,                    [30] K. Zhou, J. Yang, C.C. Loy, Z. Liu, Conditional prompt learning for vision-
+     Inferring prototypes for multi-label few-shot image classification with word                      language models, in: Proceedings of the IEEE/CVF Conference on Computer
+     vector guided attention, in: Proceedings of the AAAI Conference on Artificial                     Vision and Pattern Recognition, CVPR, 2022, pp. 16816–16825.
+     Intelligence, Vol. 36, No. 3, AAAI, 2022, pp. 2991–2999.                                     [31] X. Sun, P. Hu, K. Saenko, Dualcoop: Fast adaptation to multi-label recognition
+[11] J. Snell, K. Swersky, R. Zemel, Prototypical networks for few-shot learning, in:                  with limited annotations, in: Proceedings of the Advances in Neural Information
+     Proceedings of the Advances in Neural Information Processing Systems, NIPS,                       Processing Systems, NIPS, 2022, pp. 30569–30582.
+     2017.                                                                                        [32] M. Cuturi, Sinkhorn distances: Lightspeed computation of optimal transport, in:
+[12] A. Khamis, R. Tsuchida, M. Tarek, V. Rolland, L. Petersson, Scalable optimal                      Proceedings of the Advances in Neural Information Processing Systems, NIPS,
+     transport methods in machine learning: A contemporary survey, IEEE Trans.                         2013.
+     Pattern Anal. Mach. Intell. (TPAMI) (2024).                                                  [33] J.-D. Benamou, G. Carlier, M. Cuturi, L. Nenna, G. Peyré, Iterative bregman
+[13] M. Arjovsky, S. Chintala, L. Bottou, Wasserstein generative adversarial networks,                 projections for regularized transportation problems, SIAM J. Sci. Comput. 37 (2)
+     in: Proceedings of the International Conference on Machine Learning, ICML,                        (2015) A1111–A1138.
+     PMLR, 2017, pp. 214–223.                                                                     [34] T.-Y. Lin, M. Maire, S. Belongie, J. Hays, P. Perona, D. Ramanan, P. Dollár,
+[14] C. Bunne, D. Alvarez-Melis, A. Krause, S. Jegelka, Learning generative models                     C.L. Zitnick, Microsoft coco: Common objects in context, in: Proceedings of the
+     across incomparable spaces, in: Proceedings of the International Conference on                    European Conference on Computer Vision, ECCV, Springer, 2014, pp. 740–755.
+     Machine Learning, ICML, PMLR, 2019, pp. 851–861.                                             [35] T.-S. Chua, J. Tang, R. Hong, H. Li, Z. Luo, Y. Zheng, Nus-wide: A real-world
+[15] N. Courty, R. Flamary, A. Habrard, A. Rakotomamonjy, Joint distribution optimal                   web image database from national university of singapore, in: Proceedings of
+     transportation for domain adaptation, in: Proceedings of the Advances in Neural                   the ACM International Conference on Image and Video Retrieval, CIVR, 2009,
+     Information Processing Systems, NIPS, 2017.                                                       pp. 1–9.
+[16] C. Zhang, Y. Cai, G. Lin, C. Shen, Deepemd: Few-shot image classification with               [36] M. Everingham, S.A. Eslami, L. Van Gool, C.K. Williams, J. Winn, A. Zisserman,
+     differentiable earth mover’s distance and structured classifiers, in: Proceedings of              The pascal visual object classes challenge: A retrospective, Int. J. Comput. Vis.
+     the IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR,                         (IJCV) 111 (2015) 98–136.
+     2020, pp. 12203–12213.                                                                       [37] K. He, X. Zhang, S. Ren, J. Sun, Deep residual learning for image recognition,
+[17] K. Nguyen, D. Nguyen, T. Pham, N. Ho, et al., Improving mini-batch opti-                          in: Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern
+     mal transport via partial transportation, in: Proceeding of the International                     Recognition, CVPR, 2016, pp. 770–778.
+     Conference on Machine Learning, ICML, PMLR, 2022, pp. 16656–16690.                           [38] C. Szegedy, V. Vanhoucke, S. Ioffe, J. Shlens, Z. Wojna, Rethinking the inception
+[18] B. Riaz, Y. Karahan, A.J. Brockmeier, Partial optimal transport for support subset                architecture for computer vision, in: Proceedings of the IEEE/CVF Conference on
+     selection, IEEE Trans. Mach. Learn. Res. (TMLR) (2023).                                           Computer Vision and Pattern Recognition, CVPR, 2016, pp. 2818–2826.
+[19] L.A. Caffarelli, R.J. McCann, Free boundaries in optimal transport and                       [39] D.P. Kingma, J. Ba, Adam: A method for stochastic optimization, in: Proceedings
+     monge-ampere obstacle problems, Ann. Math. (2010) 673–730.                                        of the International Conference on Learning Representations, ICLR, 2015.
+[20] O. Vinyals, C. Blundell, T. Lillicrap, D. Wierstra, et al., Matching networks for one        [40] A.A.M. Dawood, A.S. Abdulaziz, A.J. Mohammed, Rlc-based image compression
+     shot learning, in: Proceedings of the Advances in Neural Information Processing                   using wavelet decomposition with zero-setting of unnecessary sub-bands, J. Eng.
+     Systems, NIPS, 2016.                                                                              Sci. Technol. 17 (1) (2022) 0391–0403.
+[21] F. Sung, Y. Yang, L. Zhang, T. Xiang, P.H. Torr, T.M. Hospedales, Learning                   [41] B. Zhang, J. Sun, F. Sun, F. Wang, B. Zhu, Image deblurring method based
+     to compare: Relation network for few-shot learning, in: Proceedings of the                        on self-attention and residual wavelet transform, Expert Syst. Appl. 244 (2024)
+     IEEE/CVF Conference on Computer Vision and Pattern Recognition, CVPR, 2018,                       123005.
+     pp. 1199–1208.
+[22] W.-Y. Chen, Y.-C. Liu, Z. Kira, Y.-C.F. Wang, J.-B. Huang, A closer look at few-
+                                                                                                  Pengfei Fang is an Associate Professor at the School of Computer Science and
+     shot classification, in: Proceedings of the International Conference on Learning
+                                                                                                  Engineering, Southeast University (SEU), China. Before joining SEU, he was a post-
+     Representations, ICLR, 2019.
+                                                                                                  doctoral fellow at Monash University in 2022. He received the Ph.D. degree from the
+[23] M. Goldblum, S. Reich, L. Fowl, R. Ni, V. Cherepanova, T. Goldstein, Unraveling
+                                                                                                  Australian National University and DATA61-CSIRO in 2022, and the M.E. degree from
+     meta-learning: Understanding feature representations for few-shot tasks, in:
+                                                                                                  the Australian National University in 2017. His research interests include computer
+     Proceedings of the International Conference on Machine Learning, ICML, PMLR,
+                                                                                                  vision and machine learning.
+     2020, pp. 3607–3616.
+[24] G.S. Dhillon, P. Chaudhari, A. Ravichandran, S. Soatto, A baseline for few-shot
+     image classification, in: Proceedings of the International Conference on Learning            Zhihong Chen is a master student at the School of Computer Science and Engineering,
+     Representations, ICLR, 2020.                                                                 Southeast University (SEU), China. His research interests include computer vision and
+[25] W. Chen, Z. Zhang, W. Wang, L. Wang, Z. Wang, T. Tan, Few-shot learning with                 machine learning.
+     unsupervised part discovery and part-aligned similarity, Pattern Recognit. 133
+     (2023) 108986.
+[26] M. Liang, S. Huang, S. Pan, M. Gong, W. Liu, Learning multi-level weight-centric             Hui Xue is currently a professor of School of Computer Science and Engineering at
+     features for few-shot learning, Pattern Recognit. 128 (2022) 108662.                         Southeast University, China. She received the B.Sc. degree in Mathematics from Nanjing
+[27] H. Huang, Z. Wu, W. Li, J. Huo, Y. Gao, Local descriptor-based multi-prototype               Norm University in 2002. In 2005, she received the M.Sc. degree in Mathematics from
+     network for few-shot learning, Pattern Recognit. 116 (2021) 107935.                          Nanjing University of Aeronautics & Astronautics (NUAA). And she also received the
+                                                                                                  Ph.D. degree in Computer Application Technology at NUAA in 2008. Her research
+                                                                                                  interests include pattern recognition and machine learning.
+
+
+
+
+                                                                                             10
+
