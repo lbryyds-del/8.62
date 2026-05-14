@@ -12,22 +12,6 @@ FEW_SHOT:
   PATCH_TOKENS_AGG: spatial
   DIST_NORM: none
   TRAIN_OG_EPISODES: False
-  TEXT_CLUSTER:
-    ENABLE:   False
-    TOP_M: 3
-    TAU: 0.07
-    PROMPT_BANK_PATH: data/sav/clip_label_prompt_bank.json
-  SOFT_LABEL_ROUTE:
-    ENABLE: False
-    ROUTE_TAU: 0.05
-    SHARPEN_GAMMA: 1.5
-    TEXT_INJECT_ALPHA: 0.1
-    TAG_INJECT_ALPHA: 0.1
-    AFFINITY_ALPHA: 0.1
-    SLOT_TAU: 0.07
-    GATE_TEMPERATURE: 0.05
-    OTSU_BINS: 64
-    RELATION_EPS: 1e-6
   POT_ROUTE:
     ENABLE: True
     MU_LOGIT_SCALE: 10.0

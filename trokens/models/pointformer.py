@@ -1,7 +1,6 @@
 """Pointformer model."""
 import os
 import sys
-import json
 from functools import partial
 from collections import OrderedDict
 from pathlib import Path
@@ -79,18 +78,12 @@ class Pointformer(nn.Module):
         self.attn_drop_rate = cfg.MF.ATTN_DROPOUT
         self.head_act = cfg.MF.HEAD_ACT
         self.cfg = cfg
-        self.text_cluster_cfg = cfg.FEW_SHOT.TEXT_CLUSTER
         self.pot_route_cfg = cfg.FEW_SHOT.POT_ROUTE
         self.text_align_cfg = cfg.FEW_SHOT.TEXT_ALIGN
         self.is_multilabel_few_shot = (
             cfg.TASK == 'few_shot'
             and cfg.DATA.MULTI_LABEL
             and not cfg.MODEL.APPEARANCE_MODULE_DISABLE
-        )
-        self.use_text_conditioned_support = (
-            self.is_multilabel_few_shot
-            and self.feat_extractor_type in ("clip_vit_b16", "dinotxt_vitl14_reg4")
-            and self.text_cluster_cfg.ENABLE
         )
         self.use_pot_support_route = (
             self.is_multilabel_few_shot
@@ -119,9 +112,7 @@ class Pointformer(nn.Module):
                 "TEXT_ALIGN currently requires the dinotxt_vitl14_reg4 backbone."
             )
         self.use_label_text_features = (
-            self.use_text_conditioned_support
-            or self.use_pot_support_route
-            or self.use_text_alignment
+            self.use_pot_support_route or self.use_text_alignment
         )
         self.num_patches = (224 // self.patch_size) ** 2
         if cfg.POINT_INFO.ENABLE:
@@ -238,30 +229,8 @@ class Pointformer(nn.Module):
                 self.text_to_model_proj = nn.Identity()
             else:
                 self.text_to_model_proj = nn.Linear(self.text_feature_dim, self.embed_dim)
-            if self.use_text_conditioned_support:
-                self.text_gate_mlp = nn.Sequential(
-                    norm_layer(self.embed_dim),
-                    nn.Linear(self.embed_dim, self.embed_dim),
-                    nn.GELU(),
-                    nn.Linear(self.embed_dim, self.embed_dim),
-                )
-                self.text_inject_alpha = nn.Parameter(torch.tensor(0.1))
-                self.text_inject_beta = nn.Parameter(torch.tensor(0.0))
-            self.use_soft_label_route = (
-                self.use_text_conditioned_support and cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE
-            )
-            if self.use_soft_label_route:
-                self.label_q_mod_mlp = nn.Sequential(
-                    norm_layer(self.embed_dim),
-                    nn.Linear(self.embed_dim, self.embed_dim * 2),
-                )
-                self.label_slot_q = nn.Linear(self.embed_dim, self.embed_dim, bias=self.qkv_bias)
-                self.label_slot_kv = nn.Linear(self.embed_dim, self.embed_dim * 2, bias=self.qkv_bias)
-                self.label_slot_proj = nn.Linear(self.embed_dim, self.embed_dim)
             if self.use_pot_support_route or self.use_text_alignment:
                 self.atomic_label_names = self._load_atomic_label_names()
-        else:
-            self.use_soft_label_route = False
 
         # Initialize weights
         self.init_weights()
@@ -293,50 +262,15 @@ class Pointformer(nn.Module):
 
             clip_model, _ = clip.load("ViT-B/16", device="cuda", jit=False)
             self.clip_model = clip_model
-            self.clip_tokenize = clip.tokenize
             self.clip_visual = clip_model.visual
             self.clip_model.cuda()
             for param in self.clip_model.parameters():
                 param.requires_grad = False
-            if self.use_text_conditioned_support:
-                prompt_bank_path = self._resolve_prompt_bank_path(
-                    self.text_cluster_cfg.PROMPT_BANK_PATH
-                )
-                prompt_embeddings, prompt_mask = self._load_prompt_bank_embeddings(
-                    prompt_bank_path
-                )
-                self.register_buffer(
-                    "text_prompt_embeddings",
-                    prompt_embeddings,
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "text_prompt_mask",
-                    prompt_mask,
-                    persistent=False,
-                )
         elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
             self.dinotxt_visual_model = self._load_dinotxt_visual_model()
             if self.use_label_text_features:
                 self.dinotxt_text_model = self._load_dinotxt_text_model()
                 self.dinotxt_tokenizer = self._load_dinotxt_tokenizer()
-            if self.use_text_conditioned_support:
-                prompt_bank_path = self._resolve_prompt_bank_path(
-                    self.text_cluster_cfg.PROMPT_BANK_PATH
-                )
-                prompt_embeddings, prompt_mask = self._load_prompt_bank_embeddings(
-                    prompt_bank_path
-                )
-                self.register_buffer(
-                    "text_prompt_embeddings",
-                    prompt_embeddings,
-                    persistent=False,
-                )
-                self.register_buffer(
-                    "text_prompt_mask",
-                    prompt_mask,
-                    persistent=False,
-                )
         else:
             raise NotImplementedError('Feature extractor not implemented')
 
@@ -415,85 +349,6 @@ class Pointformer(nn.Module):
         """Get point grid size"""
         all_divisors = divisors(self.cfg.POINT_INFO.NUM_POINTS_TO_SAMPLE)
         return all_divisors[len(all_divisors) // 2]
-
-    def _resolve_prompt_bank_path(self, prompt_bank_path):
-        """Resolve the prompt bank path for SAV text-cluster selection."""
-        if prompt_bank_path:
-            if os.path.isabs(prompt_bank_path):
-                return prompt_bank_path
-            return os.path.join(os.getcwd(), prompt_bank_path)
-        default_path = os.path.join(os.getcwd(), "data", "sav", "clip_label_prompt_bank.json")
-        if os.path.exists(default_path):
-            return default_path
-        raise FileNotFoundError(
-            "Prompt bank path is not set and default SAV prompt bank was not found."
-        )
-
-    def _load_prompt_bank(self, prompt_bank_path):
-        """Load the class prompt bank for text-conditioned cluster selection."""
-        with open(prompt_bank_path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-
-    def _load_prompt_bank_embeddings(self, prompt_bank_path):
-        """Load and encode prompt text as per-class prompt sequences."""
-        if self.feat_extractor_type == "clip_vit_b16":
-            return self._load_clip_prompt_bank_embeddings(prompt_bank_path)
-        if self.feat_extractor_type == "dinotxt_vitl14_reg4":
-            return self._load_dinotxt_prompt_bank_embeddings(prompt_bank_path)
-        raise NotImplementedError(
-            f"Text cluster is not supported for {self.feat_extractor_type}."
-        )
-
-    def _pad_prompt_embeddings(self, per_class_embeddings):
-        """Pad variable-length prompt lists into one tensor plus a bool mask."""
-        max_prompts = max(embeddings.shape[0] for embeddings in per_class_embeddings)
-        feat_dim = per_class_embeddings[0].shape[-1]
-        padded = per_class_embeddings[0].new_zeros(
-            (len(per_class_embeddings), max_prompts, feat_dim)
-        )
-        mask = torch.zeros(
-            (len(per_class_embeddings), max_prompts),
-            device=padded.device,
-            dtype=torch.bool,
-        )
-        for class_id, embeddings in enumerate(per_class_embeddings):
-            num_prompts = embeddings.shape[0]
-            padded[class_id, :num_prompts] = embeddings
-            mask[class_id, :num_prompts] = True
-        return padded, mask
-
-    def _load_clip_prompt_bank_embeddings(self, prompt_bank_path):
-        """Load and encode the prompt bank into CLIP text space."""
-        prompt_bank = self._load_prompt_bank(prompt_bank_path)
-        text_embeddings = []
-        self.clip_model.eval()
-        with torch.no_grad():
-            for class_id in range(self.num_classes):
-                prompts = prompt_bank.get(str(class_id))
-                if not prompts:
-                    raise KeyError(f"Missing prompt list for class id {class_id}")
-                tokenized = self.clip_tokenize(prompts).cuda(non_blocking=True)
-                prompt_features = self.clip_model.encode_text(tokenized).float()
-                prompt_features = F.normalize(prompt_features, dim=-1)
-                text_embeddings.append(prompt_features)
-        return self._pad_prompt_embeddings(text_embeddings)
-
-    def _load_dinotxt_prompt_bank_embeddings(self, prompt_bank_path):
-        """Load and encode the prompt bank into DinoTxt patch text space."""
-        prompt_bank = self._load_prompt_bank(prompt_bank_path)
-        text_embeddings = []
-        self.dinotxt_text_model.eval()
-        with torch.no_grad():
-            for class_id in range(self.num_classes):
-                prompts = prompt_bank.get(str(class_id))
-                if not prompts:
-                    raise KeyError(f"Missing prompt list for class id {class_id}")
-                tokenized = self.dinotxt_tokenizer.tokenize(prompts).cuda(non_blocking=True)
-                prompt_features = self.dinotxt_text_model(tokenized).float()
-                patch_prompt_features = prompt_features[:, prompt_features.shape[-1] // 2 :]
-                patch_prompt_features = F.normalize(patch_prompt_features, dim=-1)
-                text_embeddings.append(patch_prompt_features)
-        return self._pad_prompt_embeddings(text_embeddings)
 
     def _resolve_sav_label_map_path(self):
         """Resolve the SAV atomic label map used for DinoTxt label text."""
@@ -774,281 +629,6 @@ class Pointformer(nn.Module):
         sampled_feat = rearrange(sampled_feat, 'b d p q -> b p q d')
         sampled_feat = sampled_feat.squeeze(-2)
         return rearrange(sampled_feat, '(b t) p d -> b t p d', t=num_frames)
-
-    def _build_support_conditioned_branches(
-        self,
-        fused_feat,
-        metadata,
-    ):
-        """Build support-only label-conditioned branches for q2s few-shot matching."""
-        support_mask = metadata['support_mask'].bool()
-        episode_positive_labels = metadata['episode_positive_labels'].bool()
-        base_pt_mask = (
-            metadata['pred_query_mask']
-            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
-            else metadata['pred_visibility']
-        ).bool()
-        episode_class_ids = metadata['episode_class_ids'].long()
-
-        branch_features = []
-        branch_masks = []
-        branch_class_indices = []
-        branch_global_class_indices = []
-        branch_sample_indices = []
-        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
-        for sample_idx in support_indices.tolist():
-            sample_positive_labels = torch.nonzero(
-                episode_positive_labels[sample_idx], as_tuple=False
-            ).flatten()
-            if sample_positive_labels.numel() == 0:
-                continue
-
-            sample_episode_class_ids = (
-                episode_class_ids[sample_idx]
-                if episode_class_ids.ndim == 2
-                else episode_class_ids
-            )
-            global_class_indices = sample_episode_class_ids.index_select(0, sample_positive_labels)
-            num_sample_branches = sample_positive_labels.shape[0]
-            branch_features.append(
-                fused_feat[sample_idx:sample_idx + 1].repeat(
-                    num_sample_branches,
-                    1,
-                    1,
-                    1,
-                )
-            )
-            branch_masks.append(
-                base_pt_mask[sample_idx:sample_idx + 1].repeat(
-                    num_sample_branches,
-                    1,
-                    1,
-                )
-            )
-            branch_class_indices.append(sample_positive_labels)
-            branch_global_class_indices.append(global_class_indices)
-            branch_sample_indices.extend([sample_idx] * num_sample_branches)
-
-        if not branch_features:
-            return None
-
-        branch_feature_tensor = torch.cat(branch_features, dim=0)
-        branch_mask_tensor = torch.cat(branch_masks, dim=0)
-        branch_class_indices = torch.cat(branch_class_indices, dim=0)
-        branch_global_class_indices = torch.cat(branch_global_class_indices, dim=0)
-        text_tokens, text_mask, _ = self._get_branch_text_features(
-            branch_global_class_indices,
-            branch_feature_tensor.dtype,
-        )
-        _, branch_patch_tokens = self.text_conditioned_pt_forward(
-            branch_feature_tensor,
-            {
-                'pred_visibility': branch_mask_tensor,
-                'pred_query_mask': branch_mask_tensor,
-            },
-            text_tokens,
-            text_mask,
-        )
-        return {
-            'support_conditioned_patch_tokens': branch_patch_tokens,
-            'support_branch_point_weights': branch_patch_tokens.new_ones(
-                (branch_patch_tokens.shape[0], branch_patch_tokens.shape[2])
-            ),
-            'support_branch_class_indices': branch_class_indices.to(
-                device=branch_patch_tokens.device,
-                dtype=torch.long,
-            ),
-            'support_branch_sample_indices': torch.tensor(
-                branch_sample_indices,
-                device=branch_patch_tokens.device,
-                dtype=torch.long,
-            ),
-        }
-
-    def _otsu_threshold(self, scores):
-        """Compute a detached Otsu threshold for one trajectory-label score vector."""
-        scores_detached = torch.nan_to_num(
-            scores.detach().float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-        if scores_detached.numel() == 0:
-            return scores.new_tensor(0.0)
-        if torch.isclose(scores_detached.max(), scores_detached.min()):
-            return scores_detached.mean().to(device=scores.device, dtype=scores.dtype)
-
-        route_cfg = self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE
-        num_bins = max(int(getattr(route_cfg, "OTSU_BINS", 64)), 2)
-        hist = torch.histc(scores_detached, bins=num_bins, min=-1.0, max=1.0)
-        hist_sum = hist.sum()
-        if hist_sum <= 0:
-            return scores_detached.mean().to(device=scores.device, dtype=scores.dtype)
-
-        bin_width = 2.0 / num_bins
-        bin_centers = torch.linspace(
-            -1.0 + 0.5 * bin_width,
-            1.0 - 0.5 * bin_width,
-            num_bins,
-            device=scores_detached.device,
-            dtype=scores_detached.dtype,
-        )
-        prob = hist / hist_sum.clamp_min(1.0)
-        omega = prob.cumsum(dim=0)
-        mu = (prob * bin_centers).cumsum(dim=0)
-        mu_total = mu[-1]
-        denom = omega * (1.0 - omega)
-        valid = denom > 1e-12
-        if not bool(valid.any().item()):
-            return scores_detached.mean().to(device=scores.device, dtype=scores.dtype)
-
-        sigma_b = (mu_total * omega - mu).pow(2) / denom.clamp_min(1e-12)
-        sigma_b = sigma_b.masked_fill(~valid, -1.0)
-        threshold = bin_centers[sigma_b.argmax()]
-        return threshold.to(device=scores.device, dtype=scores.dtype)
-
-    def _compute_otsu_gate(self, traj_repr, label_text):
-        """Compute one label's trajectory relevance scores, Otsu threshold, and gate."""
-        traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
-        label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
-        if label_text.ndim == 1:
-            label_text = label_text.unsqueeze(0)
-        traj_repr = F.normalize(traj_repr, dim=-1)
-        label_text = F.normalize(label_text, dim=-1)
-        traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
-        label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
-
-        scores = torch.matmul(traj_repr, label_text.squeeze(0))
-        scores = torch.nan_to_num(scores, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
-        threshold = self._otsu_threshold(scores).detach()
-        route_cfg = self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE
-        temperature = max(float(getattr(route_cfg, "GATE_TEMPERATURE", 0.05)), 1e-6)
-        gate = torch.sigmoid((scores - threshold) / temperature)
-        gate = torch.nan_to_num(gate, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-        return scores, threshold, gate
-
-    def _text_relation_spatial_forward(self, x, label_text, gate, point_mask):
-        """Run standard temporal attention and text-gated relation spatial attention."""
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        if label_text.ndim == 1:
-            label_text = label_text.unsqueeze(0)
-        if gate.ndim == 1:
-            gate = gate.unsqueeze(0)
-
-        bs, temporal_dim, num_points, _ = x.shape
-        if point_mask is None:
-            point_mask = torch.ones(
-                bs,
-                temporal_dim,
-                num_points,
-                device=x.device,
-                dtype=torch.bool,
-            )
-        else:
-            point_mask = point_mask.bool()
-
-        x = rearrange(x, 'b t n d -> b n t d')
-        point_mask = rearrange(point_mask, 'b t n -> b n t')
-        x = rearrange(x, 'b n t d -> b (n t) d')
-        point_mask = rearrange(point_mask, 'b n t -> b (n t)')
-        if self.cfg.MODEL.USE_CLS_TOKEN:
-            cls_tokens = self.cls_token.expand(bs, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
-            cls_token_mask = torch.ones(bs, 1, device=x.device, dtype=torch.bool)
-            point_mask = torch.cat((cls_token_mask, point_mask), dim=1)
-
-        gate = gate.to(device=x.device, dtype=x.dtype)
-        thw = [
-            temporal_dim,
-            self.point_grid_size,
-            int(num_points / self.point_grid_size),
-        ]
-        relation_eps = float(getattr(self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE, "RELATION_EPS", 1e-6))
-        for _, blk in enumerate(self.blocks):
-            x, _ = blk.forward_text_relation_conditioned(
-                x,
-                thw,
-                point_mask,
-                None,
-                None,
-                relation_eps,
-            )
-
-        x = self.norm(x)
-        if self.cfg.MODEL.USE_CLS_TOKEN:
-            patch_x = x[:, 1:]
-        else:
-            patch_x = x
-        patch_x = rearrange(patch_x, 'b (n t) d -> b t n d', t=temporal_dim)
-        return torch.nan_to_num(patch_x, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _label_slot_prototypes(self, h_st, label_text):
-        """Use label text slots to aggregate all trajectory-time tokens."""
-        h_st = torch.nan_to_num(h_st, nan=0.0, posinf=0.0, neginf=0.0)
-        label_text = torch.nan_to_num(label_text, nan=0.0, posinf=0.0, neginf=0.0)
-        bs, num_frames, num_points, feat_dim = h_st.shape
-        num_labels = label_text.shape[1]
-        tokens = rearrange(h_st, 'b t m c -> b (t m) c')
-        orig_dtype = tokens.dtype
-        query = self.label_slot_q(label_text)
-        kv = self.label_slot_kv(tokens)
-        q = rearrange(query, 'b z (h d) -> b h z d', h=self.num_heads)
-        kv = rearrange(kv, 'b n (two h d) -> two b h n d', two=2, h=self.num_heads)
-        k, v = kv[0], kv[1]
-        q = q.float()
-        k = k.float()
-        v = v.float()
-        scale = (feat_dim // self.num_heads) ** -0.5
-        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
-        attn = attn - attn.max(dim=-1, keepdim=True).values
-        attn = F.softmax(attn / self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.SLOT_TAU, dim=-1)
-        out = torch.matmul(attn, v)
-        out = rearrange(out, 'b h z d -> b z (h d)')
-        out = self.label_slot_proj(out.to(orig_dtype))
-        return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _gate_weighted_visual_prototypes(self, h_st, gate, point_mask):
-        """Aggregate visual trajectory tokens with the precomputed trajectory gate."""
-        h_st = torch.nan_to_num(h_st, nan=0.0, posinf=0.0, neginf=0.0)
-        if gate.ndim == 1:
-            gate = gate.unsqueeze(0)
-        gate = torch.nan_to_num(
-            gate.to(device=h_st.device, dtype=h_st.dtype),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        ).clamp(0.0, 1.0)
-
-        if point_mask is None:
-            point_mask = torch.ones(
-                h_st.shape[:3],
-                device=h_st.device,
-                dtype=torch.bool,
-            )
-        else:
-            point_mask = point_mask.to(device=h_st.device).bool()
-
-        weights = gate[:, None, :, None] * point_mask[..., None].to(h_st.dtype)
-        denom = weights.sum(dim=(1, 2)).clamp_min(1e-6)
-        proto = (h_st * weights).sum(dim=(1, 2)) / denom
-        return torch.nan_to_num(proto.unsqueeze(1), nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _masked_mean_visual_prototypes(self, h_st, point_mask):
-        """Aggregate visual trajectory tokens with uniform weights over valid points."""
-        h_st = torch.nan_to_num(h_st, nan=0.0, posinf=0.0, neginf=0.0)
-        if point_mask is None:
-            point_mask = torch.ones(
-                h_st.shape[:3],
-                device=h_st.device,
-                dtype=torch.bool,
-            )
-        else:
-            point_mask = point_mask.to(device=h_st.device).bool()
-
-        weights = point_mask[..., None].to(h_st.dtype)
-        denom = weights.sum(dim=(1, 2)).clamp_min(1e-6)
-        proto = (h_st * weights).sum(dim=(1, 2)) / denom
-        return torch.nan_to_num(proto.unsqueeze(1), nan=0.0, posinf=0.0, neginf=0.0)
 
     def _masked_temporal_mean_per_traj(self, feat, point_mask):
         """Average each trajectory over valid temporal positions only."""
@@ -1398,114 +978,6 @@ class Pointformer(nn.Module):
             ),
         }
 
-    def _build_soft_label_routed_support_prototypes(self, fused_feat, metadata):
-        """Build per-label Otsu relation-gated support prototypes."""
-        support_mask = metadata['support_mask'].bool()
-        episode_positive_labels = metadata['episode_positive_labels'].bool()
-        base_pt_mask = (
-            metadata['pred_query_mask']
-            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
-            else metadata['pred_visibility']
-        ).bool()
-        episode_class_ids = metadata['episode_class_ids'].long()
-
-        slot_tokens = []
-        slot_class_indices = []
-        slot_sample_indices = []
-        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
-        for sample_idx in support_indices.tolist():
-            positive_labels = torch.nonzero(
-                episode_positive_labels[sample_idx],
-                as_tuple=False,
-            ).flatten()
-            if positive_labels.numel() == 0:
-                continue
-
-            sample_episode_class_ids = (
-                episode_class_ids[sample_idx]
-                if episode_class_ids.ndim == 2
-                else episode_class_ids
-            )
-            global_class_indices = sample_episode_class_ids.index_select(0, positive_labels)
-            _, _, label_text = self._get_branch_text_features(
-                global_class_indices,
-                fused_feat.dtype,
-            )
-
-            support_feat = fused_feat[sample_idx:sample_idx + 1]
-            support_mask_i = base_pt_mask[sample_idx:sample_idx + 1]
-            traj_repr = self._masked_temporal_mean_per_traj(
-                support_feat,
-                support_mask_i,
-            ).squeeze(0)
-
-            for label_offset, positive_label in enumerate(positive_labels):
-                label_text_i = label_text[label_offset]
-                _, _, gate = self._compute_otsu_gate(traj_repr, label_text_i)
-                h_st = self._text_relation_spatial_forward(
-                    support_feat,
-                    label_text_i.unsqueeze(0),
-                    gate.unsqueeze(0),
-                    support_mask_i,
-                )
-                sample_slot = self._masked_mean_visual_prototypes(
-                    h_st,
-                    support_mask_i,
-                ).squeeze(0)
-                sample_slot = torch.nan_to_num(
-                    sample_slot,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
-                slot_tokens.append(sample_slot[:, None, None, :])
-                slot_class_indices.append(positive_label.view(1))
-                slot_sample_indices.append(sample_idx)
-
-        if not slot_tokens:
-            return None
-
-        support_tokens = torch.cat(slot_tokens, dim=0)
-        support_tokens = torch.nan_to_num(support_tokens, nan=0.0, posinf=0.0, neginf=0.0)
-        class_indices = torch.cat(slot_class_indices, dim=0)
-        return {
-            'support_conditioned_patch_tokens': support_tokens,
-            'support_branch_point_weights': support_tokens.new_ones(
-                (support_tokens.shape[0], support_tokens.shape[2])
-            ),
-            'support_branch_class_indices': class_indices.to(
-                device=support_tokens.device,
-                dtype=torch.long,
-            ),
-            'support_branch_sample_indices': torch.tensor(
-                slot_sample_indices,
-                device=support_tokens.device,
-                dtype=torch.long,
-            ),
-        }
-
-    def _get_branch_text_features(self, global_class_indices, dtype):
-        """Return projected prompt sequence, mask, and pooled text for branches."""
-        text_tokens = self.text_prompt_embeddings.index_select(0, global_class_indices)
-        text_mask = self.text_prompt_mask.index_select(0, global_class_indices)
-        text_tokens = self.text_to_model_proj(text_tokens)
-        text_tokens = F.normalize(text_tokens, dim=-1).to(dtype=dtype)
-        text_weights = text_mask.to(dtype=text_tokens.dtype).unsqueeze(-1)
-        text_global = (text_tokens * text_weights).sum(dim=1)
-        text_global = text_global / text_weights.sum(dim=1).clamp_min(1.0)
-        return text_tokens, text_mask, text_global
-
-    def _inject_text_condition(self, branch_features, text_global):
-        """Inject pooled label text through channel-wise gating."""
-        text_gate = torch.sigmoid(self.text_gate_mlp(text_global)).unsqueeze(1).unsqueeze(1)
-        text_bias = text_global.unsqueeze(1).unsqueeze(1)
-        return (
-            branch_features
-            * (1.0 + self.text_inject_alpha.to(branch_features.dtype) * text_gate)
-            + self.text_inject_beta.to(branch_features.dtype) * text_bias
-        )
-
-
     def get_dino_features(self, x):
         """ Get DINO features
         Args:
@@ -1681,59 +1153,6 @@ class Pointformer(nn.Module):
             print("WARNING: nan in features out")
         return cls_x, patch_x
 
-    def text_conditioned_pt_forward(self, x, metadata, text_tokens, text_mask):
-        """Support branch forward with text injection inside each trajectory block."""
-        if self.cfg.POINT_INFO.USE_PT_QUERY_MASK:
-            pt_mask = metadata['pred_query_mask']
-        else:
-            pt_mask = metadata['pred_visibility']
-
-        bs, temporal_dim, num_points, _ = x.shape
-        x = rearrange(x, 'b t n d -> b n t d')
-        pt_mask = rearrange(pt_mask, 'b t n -> b n t')
-        x = rearrange(x, 'b n t d -> b (n t) d')
-        pt_mask = rearrange(pt_mask, 'b n t -> b (n t)')
-        if self.cfg.MODEL.USE_CLS_TOKEN:
-            cls_tokens = self.cls_token.expand(bs, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
-            cls_token_mask = torch.ones(bs, 1).bool().to(x.device)
-            pt_mask = torch.cat((cls_token_mask, pt_mask), dim=1)
-
-        x = self.pos_drop(x)
-        thw = [
-            self.temporal_resolution,
-            self.point_grid_size,
-            int(num_points / self.point_grid_size),
-        ]
-        for _, blk in enumerate(self.blocks):
-            x, _ = blk.forward_text_conditioned(
-                x,
-                thw,
-                pt_mask,
-                text_tokens,
-                text_mask,
-            )
-
-        if self.cfg.MODEL.ADAPOOLING.ENABLE:
-            raise NotImplementedError(
-                "Text-conditioned support branch does not support adaptive pooling."
-            )
-
-        x = self.norm(x)
-        if self.cfg.MODEL.USE_CLS_TOKEN:
-            cls_x, patch_x = x[:, 0], x[:, 1:]
-            if self.cfg.MODEL.USE_PATCH_AS_CLS:
-                cls_x = patch_x.mean(dim=1)
-        else:
-            cls_x = x.mean(dim=1)
-            patch_x = x
-
-        cls_x = self.pre_logits(cls_x)
-        patch_x = rearrange(patch_x, 'b (n t) d -> b t n d', t=temporal_dim)
-        if not torch.isfinite(x).all():
-            print("WARNING: nan in text-conditioned features out")
-        return cls_x, patch_x
-
     def add_st_pos_embeddings(self, x):
         """ Add spatial and temporal positional embeddings to the input features.
 
@@ -1838,19 +1257,6 @@ class Pointformer(nn.Module):
                     patch_x,
                     metadata,
                 )
-                if route_aux is not None:
-                    few_shot_aux.update(route_aux)
-            elif self.use_text_conditioned_support:
-                if self.cfg.FEW_SHOT.SOFT_LABEL_ROUTE.ENABLE:
-                    route_aux = self._build_soft_label_routed_support_prototypes(
-                        sampled_feat,
-                        metadata,
-                    )
-                else:
-                    route_aux = self._build_support_conditioned_branches(
-                        sampled_feat,
-                        metadata,
-                    )
                 if route_aux is not None:
                     few_shot_aux.update(route_aux)
         if not few_shot_aux:
