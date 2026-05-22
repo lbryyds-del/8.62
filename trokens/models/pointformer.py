@@ -1,6 +1,8 @@
 """Pointformer model."""
+import json
 import os
 import sys
+import time
 from functools import partial
 from collections import OrderedDict
 from pathlib import Path
@@ -80,6 +82,9 @@ class Pointformer(nn.Module):
         self.cfg = cfg
         self.pot_route_cfg = cfg.FEW_SHOT.POT_ROUTE
         self.text_align_cfg = cfg.FEW_SHOT.TEXT_ALIGN
+        self._pot_debug_call_count = 0
+        self._pot_debug_record_count = 0
+        self._pot_debug_io_failed = False
         self.is_multilabel_few_shot = (
             cfg.TASK == 'few_shot'
             and cfg.DATA.MULTI_LABEL
@@ -407,28 +412,92 @@ class Pointformer(nn.Module):
                     current_id = None
         return label_names
 
+    def _get_sav_label_prompts(self, label_name):
+        """Return prompt variants for SAV labels that need finer visual grounding."""
+        base_prompt = label_name.replace("_", " ")
+        prompt_bank = {
+            "read": [
+                "read",
+                "a student reads a book or paper",
+                "eyes looking down at reading material",
+                "holding or looking at a book on a desk",
+                "reading pages without writing",
+            ],
+            "flip_books": [
+                "flip books",
+                "a student turns pages of a book",
+                "hand flipping book pages on a desk",
+                "fingers moving along page edges",
+                "a book page changes position over time",
+            ],
+            "take_notes": [
+                "take notes",
+                "a student writes notes on paper",
+                "hand holding a pen and writing",
+                "small repetitive hand motion on notebook",
+                "writing on a desk with paper",
+            ],
+            "turn_around": [
+                "turn around",
+                "a person turns the head or body around",
+                "torso orientation changes over time",
+                "head rotates from front to side or back",
+                "shoulder direction changes across frames",
+            ],
+            "talk_with_others": [
+                "talk with others",
+                "a student talks with another person",
+                "face turned toward a nearby person while speaking",
+                "mouth movement during conversation",
+                "two people interacting or conversing",
+            ],
+            "answer_questions": [
+                "answer questions",
+                "a student answers a question in class",
+                "a student speaks while looking toward the teacher",
+                "a student responds in the classroom",
+                "head and mouth movement while answering",
+            ],
+        }
+        return prompt_bank.get(label_name, [base_prompt])
+
     def _get_pot_label_text_features(self, global_class_indices, dtype):
-        """Encode episode label names with DinoTxt text encoder for POT routing."""
+        """Encode episode label prompts with DinoTxt text encoder for POT routing."""
         if self.feat_extractor_type != "dinotxt_vitl14_reg4":
             raise NotImplementedError(
                 "POT label text features are only implemented for dinotxt_vitl14_reg4."
             )
 
-        label_names = [
-            self.atomic_label_names[int(class_id)].replace("_", " ")
+        prompt_groups = [
+            self._get_sav_label_prompts(self.atomic_label_names[int(class_id)])
             for class_id in global_class_indices.detach().cpu().tolist()
         ]
+        flat_prompts = [prompt for group in prompt_groups for prompt in group]
+        group_sizes = [len(group) for group in prompt_groups]
         text_device = next(self.dinotxt_text_model.parameters()).device
         self.dinotxt_text_model.eval()
         with torch.no_grad():
-            tokenized = self.dinotxt_tokenizer.tokenize(label_names).to(
+            tokenized = self.dinotxt_tokenizer.tokenize(flat_prompts).to(
                 text_device,
                 non_blocking=True,
             )
-            text_features = self.dinotxt_text_model(tokenized).float()
-            text_features = text_features[:, text_features.shape[-1] // 2 :]
-        text_features = self.text_to_model_proj(text_features)
-        text_features = F.normalize(text_features, dim=-1)
+            flat_text_features = self.dinotxt_text_model(tokenized).float()
+            flat_text_features = flat_text_features[
+                :,
+                flat_text_features.shape[-1] // 2 :,
+            ]
+        flat_text_features = self.text_to_model_proj(flat_text_features)
+        flat_text_features = F.normalize(flat_text_features, dim=-1)
+
+        label_text_features = []
+        start_idx = 0
+        for group_size in group_sizes:
+            group_features = flat_text_features[start_idx : start_idx + group_size]
+            label_feature = group_features.mean(dim=0)
+            label_text_features.append(F.normalize(label_feature, dim=0))
+            start_idx += group_size
+
+        text_features = torch.stack(label_text_features, dim=0)
         return text_features.to(device=global_class_indices.device, dtype=dtype)
 
     def _torchhub_dirs(self):
@@ -630,23 +699,6 @@ class Pointformer(nn.Module):
         sampled_feat = sampled_feat.squeeze(-2)
         return rearrange(sampled_feat, '(b t) p d -> b t p d', t=num_frames)
 
-    def _masked_temporal_mean_per_traj(self, feat, point_mask):
-        """Average each trajectory over valid temporal positions only."""
-        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
-        if point_mask is None:
-            point_mask = torch.ones(
-                feat.shape[:3],
-                device=feat.device,
-                dtype=torch.bool,
-            )
-        else:
-            point_mask = point_mask.to(device=feat.device).bool()
-
-        weights = point_mask[..., None].to(feat.dtype)
-        denom = weights.sum(dim=1).clamp_min(1e-6)
-        traj_repr = (feat * weights).sum(dim=1) / denom
-        return torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
-
     def _masked_space_time_mean(self, feat, point_mask):
         """Average support tokens over valid space-time positions only."""
         feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
@@ -664,22 +716,20 @@ class Pointformer(nn.Module):
         pooled = (feat * weights).sum(dim=(1, 2)) / denom
         return torch.nan_to_num(pooled, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _normalized_distribution_entropy(self, probs):
-        """Return entropy normalized to [0, 1] for the last dimension."""
-        probs = torch.nan_to_num(probs.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        probs = probs.clamp_min(1e-12)
-        entropy = -(probs * probs.log()).sum(dim=-1)
-        normalizer = max(float(np.log(max(probs.shape[-1], 2))), 1e-6)
-        return entropy / entropy.new_tensor(normalizer)
-
-    def _solve_joint_relaxed_transport(self, cost, row_mass, col_cap):
+    def _solve_joint_relaxed_transport(
+        self,
+        cost,
+        row_mass,
+        col_cap,
+        force_total_mass=True,
+    ):
         """Solve a joint relaxed POT problem over positive labels and trajectories."""
         route_cfg = self.pot_route_cfg
         entropic_eps = max(float(route_cfg.ENTROPIC_EPS), 1e-6)
         max_iters = max(int(route_cfg.MAX_ITERS), 1)
         stop_tol = max(float(route_cfg.STOP_TOL), 0.0)
 
-        cost = torch.nan_to_num(cost.float(), nan=1.0, posinf=1.0, neginf=0.0)
+        cost = torch.nan_to_num(cost.float(), nan=1e4, posinf=1e4, neginf=0.0)
         row_mass = torch.nan_to_num(
             row_mass.float(),
             nan=0.0,
@@ -699,10 +749,29 @@ class Pointformer(nn.Module):
         cap_sum = col_cap.sum()
         if float(cap_sum.item()) <= 0.0:
             return cost.new_zeros(cost.shape)
-        if float(cap_sum.item()) < float(total_mass.item()):
+        if force_total_mass and float(cap_sum.item()) < float(total_mass.item()):
             col_cap = col_cap * (total_mass / cap_sum.clamp_min(1e-12))
 
-        transport = torch.exp(-cost / entropic_eps).clamp_min(1e-12)
+        valid_entries = (
+            (cost < 1e3)
+            & (row_mass[:, None] > 0.0)
+            & (col_cap[None, :] > 0.0)
+        )
+        row_min = cost.masked_fill(~valid_entries, float("inf")).amin(dim=1)
+        has_valid_row = torch.isfinite(row_min)
+        if not has_valid_row.any():
+            return cost.new_zeros(cost.shape)
+
+        row_min = torch.where(has_valid_row, row_min, torch.zeros_like(row_min))
+        shifted_cost = cost - row_min[:, None]
+        log_kernel = (-shifted_cost / entropic_eps).clamp(min=-80.0, max=0.0)
+        transport = torch.where(
+            valid_entries,
+            torch.exp(log_kernel),
+            torch.zeros_like(cost),
+        )
+        if float(transport.sum().item()) <= 0.0:
+            return cost.new_zeros(cost.shape)
         transport = transport * (
             total_mass / transport.sum().clamp_min(1e-12)
         )
@@ -724,75 +793,17 @@ class Pointformer(nn.Module):
             )
             transport = transport * col_scale[None, :]
 
-            current_mass = transport.sum()
-            if float(current_mass.item()) > 0.0:
-                transport = transport * (
-                    total_mass / current_mass.clamp_min(1e-12)
-                )
+            if force_total_mass:
+                current_mass = transport.sum()
+                if float(current_mass.item()) > 0.0:
+                    transport = transport * (
+                        total_mass / current_mass.clamp_min(1e-12)
+                    )
             delta = torch.max(torch.abs(transport - prev_transport))
             if float(delta.item()) <= stop_tol:
                 break
 
         return torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _compute_joint_positive_transport(self, traj_repr, support_global, positive_text):
-        """Jointly solve relaxed POT across all positive labels for one support sample."""
-        route_cfg = self.pot_route_cfg
-        traj_repr = torch.nan_to_num(traj_repr, nan=0.0, posinf=0.0, neginf=0.0)
-        support_global = torch.nan_to_num(
-            support_global,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        positive_text = torch.nan_to_num(
-            positive_text,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        traj_repr = F.normalize(traj_repr.float(), dim=-1)
-        support_global = F.normalize(support_global.float(), dim=-1)
-        positive_text = F.normalize(positive_text.float(), dim=-1)
-
-        sim_matrix = torch.matmul(positive_text, traj_repr.transpose(0, 1))
-        sim_matrix = torch.nan_to_num(
-            sim_matrix,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-        cost = 1.0 - sim_matrix
-
-        mu_logits = max(float(route_cfg.MU_LOGIT_SCALE), 1e-6) * torch.matmul(
-            positive_text,
-            support_global,
-        )
-        mu = torch.softmax(mu_logits, dim=0)
-
-        affinity_tau = max(float(route_cfg.AFFINITY_TAU), 1e-6)
-        affinity = torch.softmax(sim_matrix / affinity_tau, dim=-1)
-        entropy = self._normalized_distribution_entropy(affinity)
-        rho_min = min(max(float(route_cfg.RHO_MIN), 0.0), 1.0)
-        rho_max = min(max(float(route_cfg.RHO_MAX), rho_min), 1.0)
-        rho = rho_min + (rho_max - rho_min) * entropy
-        row_mass = mu * rho
-
-        nu_shared = affinity.mean(dim=0)
-        nu_shared = nu_shared / nu_shared.sum().clamp_min(1e-6)
-        kappa = max(float(route_cfg.KAPPA), 1.0)
-        col_cap = kappa * nu_shared
-
-        transport = self._solve_joint_relaxed_transport(
-            cost,
-            row_mass,
-            col_cap,
-        )
-        return {
-            "transport": transport,
-            "affinity": affinity,
-        }
 
     def _build_support_text_alignment(self, patch_tokens, metadata):
         """Align support global visual features with episode label text features."""
@@ -856,23 +867,879 @@ class Pointformer(nn.Module):
             ),
         }
 
-    def _aggregate_weighted_support_tokens(self, feat, point_mask, traj_weights):
-        """Aggregate trajectories per frame with one shared POT trajectory weighting."""
-        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
-        point_mask = point_mask.to(device=feat.device).bool()
-        traj_weights = torch.nan_to_num(
-            traj_weights.to(device=feat.device, dtype=feat.dtype),
+    def _pot_debug_rank(self):
+        """Return the distributed rank used for POT debug logging."""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank()
+        return int(os.environ.get("RANK", "0"))
+
+    def _should_log_pot_debug(self):
+        """Return whether this forward should write sampled POT debug records."""
+        route_cfg = self.pot_route_cfg
+        if not bool(getattr(route_cfg, "DEBUG_ENABLE", False)):
+            return False
+        if bool(getattr(route_cfg, "DEBUG_RANK0_ONLY", True)):
+            if self._pot_debug_rank() != 0:
+                return False
+
+        call_count = getattr(self, "_pot_debug_call_count", 0) + 1
+        self._pot_debug_call_count = call_count
+        log_period = max(int(getattr(route_cfg, "DEBUG_LOG_PERIOD", 10)), 1)
+        if (call_count - 1) % log_period != 0:
+            return False
+
+        max_records = max(int(getattr(route_cfg, "DEBUG_MAX_RECORDS", 1000)), 0)
+        return getattr(self, "_pot_debug_record_count", 0) < max_records
+
+    def _pot_debug_scalar(self, value, default=0.0):
+        """Convert a scalar tensor-like value to a JSON-friendly float."""
+        if value is None:
+            return float(default)
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return float(default)
+            value = torch.nan_to_num(
+                value.detach().float(),
+                nan=default,
+                posinf=default,
+                neginf=default,
+            ).mean()
+            return round(float(value.cpu().item()), 6)
+        return round(float(value), 6)
+
+    def _pot_debug_list(self, value, max_items=None):
+        """Convert a tensor-like vector to JSON-friendly floats."""
+        if not torch.is_tensor(value):
+            values = list(value)
+        else:
+            values = torch.nan_to_num(
+                value.detach().flatten().float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).cpu().tolist()
+        if max_items is not None:
+            values = values[:max_items]
+        return [round(float(item), 6) for item in values]
+
+    def _pot_debug_masked_values(self, value, mask):
+        """Return finite values selected by a boolean mask."""
+        mask = mask.to(device=value.device).bool()
+        if value.numel() == 0 or not mask.any():
+            return value.new_zeros(0)
+        return torch.nan_to_num(
+            value.detach().float()[mask],
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    def _pot_debug_masked_summary(self, value, mask):
+        """Summarize masked tensor values."""
+        values = self._pot_debug_masked_values(value, mask)
+        if values.numel() == 0:
+            return {
+                "mean": 0.0,
+                "std": 0.0,
+                "min": 0.0,
+                "max": 0.0,
+            }
+        return {
+            "mean": self._pot_debug_scalar(values.mean()),
+            "std": self._pot_debug_scalar(values.std(unbiased=False)),
+            "min": self._pot_debug_scalar(values.min()),
+            "max": self._pot_debug_scalar(values.max()),
+        }
+
+    def _pot_debug_weight_summary(self, weights, valid_mask, topk):
+        """Summarize how concentrated a transport row is over valid tokens."""
+        weights = torch.nan_to_num(
+            weights.detach().float(),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         ).clamp_min(0.0)
-        frame_weights = point_mask.to(feat.dtype) * traj_weights.unsqueeze(0)
-        denom = frame_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
-        proto = (feat * frame_weights.unsqueeze(-1)).sum(dim=1) / denom
+        valid_mask = valid_mask.to(device=weights.device).bool()
+        valid_weights = weights[valid_mask]
+        num_valid = int(valid_mask.sum().item())
+        invalid_weight_sum = weights[~valid_mask].sum() if (~valid_mask).any() else weights.new_zeros(())
+        weight_sum = valid_weights.sum()
+        summary = {
+            "weight_sum": self._pot_debug_scalar(weight_sum),
+            "invalid_weight_sum": self._pot_debug_scalar(invalid_weight_sum),
+            "entropy": 0.0,
+            "effective_token_count": 0.0,
+            "top8_mass_ratio": 0.0,
+            "topk_mass_ratio": 0.0,
+        }
+        if num_valid == 0 or float(weight_sum.item()) <= 0.0:
+            return summary
+
+        normalized = valid_weights / weight_sum.clamp_min(1e-12)
+        entropy = -(
+            normalized.clamp_min(1e-12) * normalized.clamp_min(1e-12).log()
+        ).sum()
+        entropy = entropy / entropy.new_tensor(max(float(np.log(max(num_valid, 2))), 1e-6))
+        effective_count = 1.0 / normalized.pow(2).sum().clamp_min(1e-12)
+        top8 = min(8, num_valid)
+        topk = min(max(int(topk), 1), num_valid)
+        summary.update({
+            "entropy": self._pot_debug_scalar(entropy),
+            "effective_token_count": self._pot_debug_scalar(effective_count),
+            "top8_mass_ratio": self._pot_debug_scalar(torch.topk(normalized, k=top8).values.sum()),
+            "topk_mass_ratio": self._pot_debug_scalar(torch.topk(normalized, k=topk).values.sum()),
+        })
+        return summary
+
+    def _pot_debug_top_value_mean(self, values, weights, valid_mask, topk):
+        """Mean value over top-weighted valid tokens."""
+        weights = torch.nan_to_num(
+            weights.detach().float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        values = torch.nan_to_num(
+            values.detach().float().to(device=weights.device),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid_mask = valid_mask.to(device=weights.device).bool()
+        if not valid_mask.any():
+            return 0.0
+        masked_weights = weights.masked_fill(~valid_mask, -1.0)
+        topk = min(max(int(topk), 1), int(valid_mask.sum().item()))
+        indices = torch.topk(masked_weights, k=topk).indices
+        return self._pot_debug_scalar(values[indices].mean())
+
+    def _pot_debug_top_tokens(
+        self,
+        weights,
+        valid_mask,
+        point_mask,
+        sharedness,
+        sim_row,
+        topk,
+    ):
+        """Return top-weighted token coordinates for a transport row."""
+        if not bool(getattr(self.pot_route_cfg, "DEBUG_SAVE_TOP_TOKENS", True)):
+            return []
+        weights = torch.nan_to_num(
+            weights.detach().float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid_mask = valid_mask.to(device=weights.device).bool()
+        if not valid_mask.any():
+            return []
+
+        masked_weights = weights.masked_fill(~valid_mask, -1.0)
+        topk = min(max(int(topk), 1), int(valid_mask.sum().item()))
+        values, indices = torch.topk(masked_weights, k=topk)
+        num_points = point_mask.shape[1]
+        tokens = []
+        for weight, token_idx in zip(values.detach().cpu().tolist(), indices.detach().cpu().tolist()):
+            if weight < 0.0:
+                continue
+            frame_idx = int(token_idx // num_points)
+            point_idx = int(token_idx % num_points)
+            tokens.append({
+                "token_idx": int(token_idx),
+                "frame": frame_idx,
+                "point": point_idx,
+                "weight": round(float(weight), 6),
+                "sharedness": self._pot_debug_scalar(sharedness[token_idx]),
+                "text_sim": self._pot_debug_scalar(sim_row[token_idx]),
+            })
+        return tokens
+
+    def _pot_debug_label_summary(self, D_label):
+        """Summarize label-side FGW structure."""
+        num_labels = D_label.shape[0] - 1
+        if num_labels <= 1:
+            return {
+                "private_offdiag_mean": 0.0,
+                "shared_tau_mean": self._pot_debug_scalar(D_label[-1, :-1].mean()) if num_labels > 0 else 0.0,
+            }
+        private = D_label[:num_labels, :num_labels]
+        offdiag_mask = ~torch.eye(
+            num_labels,
+            device=D_label.device,
+            dtype=torch.bool,
+        )
+        return {
+            "private_offdiag_mean": self._pot_debug_scalar(private[offdiag_mask].mean()),
+            "shared_tau_mean": self._pot_debug_scalar(D_label[-1, :-1].mean()),
+        }
+
+    def _write_pot_debug_record(self, record):
+        """Append one POT debug record to the standalone JSONL file."""
+        max_records = max(int(getattr(self.pot_route_cfg, "DEBUG_MAX_RECORDS", 1000)), 0)
+        if getattr(self, "_pot_debug_record_count", 0) >= max_records:
+            return
+        if getattr(self, "_pot_debug_io_failed", False):
+            return
+
+        debug_file = str(getattr(self.pot_route_cfg, "DEBUG_FILE", "pot_fgw_debug.jsonl"))
+        if os.path.isabs(debug_file):
+            debug_path = Path(debug_file)
+        else:
+            debug_path = Path(str(self.cfg.OUTPUT_DIR)) / debug_file
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+
+        record = dict(record)
+        record["rank"] = self._pot_debug_rank()
+        record["mode"] = "train" if self.training else "eval"
+        record["debug_call"] = getattr(self, "_pot_debug_call_count", 0)
+        record["wall_time"] = round(time.time(), 3)
+
+        if (
+            getattr(self, "_pot_debug_record_count", 0) == 0
+            and bool(getattr(self.pot_route_cfg, "DEBUG_RESET_FILE", True))
+        ):
+            try:
+                debug_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            with debug_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
+            self._pot_debug_record_count = getattr(self, "_pot_debug_record_count", 0) + 1
+        except OSError as err:
+            self._pot_debug_io_failed = True
+            print(f"WARNING: failed to write POT debug log {debug_path}: {err}")
+
+    def _flatten_st_tokens(self, feat, point_mask):
+        """Flatten spatio-temporal point tokens and masks."""
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        if point_mask is None:
+            point_mask = torch.ones(
+                feat.shape[:2],
+                device=feat.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=feat.device).bool()
+        flat_feat = rearrange(feat, 't n c -> (t n) c')
+        flat_mask = rearrange(point_mask, 't n -> (t n)')
+        return flat_feat, flat_mask
+
+    def _compute_sharedness(self, sim_matrix, valid_mask):
+        """Estimate how much each token is shared across positive labels."""
+        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
+        num_labels = sim_matrix.shape[0]
+        if num_labels <= 1:
+            return sim_matrix.new_zeros(sim_matrix.shape[-1])
+
+        route_cfg = self.pot_route_cfg
+        tau_label = max(float(getattr(route_cfg, "SHARED_TAU_LABEL", 0.07)), 1e-6)
+        theta_shared = float(getattr(route_cfg, "SHARED_THETA", 0.2))
+        tau_strength = max(
+            float(getattr(route_cfg, "SHARED_TAU_STRENGTH", 0.1)),
+            1e-6,
+        )
+
+        sim_matrix = torch.nan_to_num(
+            sim_matrix.float(),
+            nan=-1e4,
+            posinf=1.0,
+            neginf=-1e4,
+        )
+        label_prob = torch.softmax(sim_matrix / tau_label, dim=0).clamp_min(1e-12)
+        entropy = -(label_prob * label_prob.log()).sum(dim=0)
+        normalizer = max(float(np.log(max(num_labels, 2))), 1e-6)
+        entropy = entropy / entropy.new_tensor(normalizer)
+        max_sim = sim_matrix.max(dim=0).values
+        semantic_strength = torch.sigmoid((max_sim - theta_shared) / tau_strength)
+        sharedness = entropy * semantic_strength
+        sharedness = torch.where(valid_mask, sharedness, torch.zeros_like(sharedness))
+        return torch.nan_to_num(
+            sharedness.clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+    def _compute_intra_evidence(self, pred_tracks, valid_mask):
+        """Compute intra-motion evidence from velocity and acceleration."""
+        pred_tracks = torch.nan_to_num(
+            pred_tracks.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid_mask = valid_mask.to(device=pred_tracks.device).bool()
+        if valid_mask.ndim == 1:
+            valid_mask_2d = valid_mask.view(pred_tracks.shape[:2])
+        else:
+            valid_mask_2d = valid_mask
+
+        velocity = pred_tracks.new_zeros(pred_tracks.shape[:2])
+        if pred_tracks.shape[0] > 1:
+            velocity[1:] = torch.norm(pred_tracks[1:] - pred_tracks[:-1], dim=-1)
+
+        acceleration = pred_tracks.new_zeros(pred_tracks.shape[:2])
+        if pred_tracks.shape[0] > 1:
+            acceleration[1:] = torch.abs(velocity[1:] - velocity[:-1])
+
+        evidence = velocity + 0.5 * acceleration
+        evidence_flat = rearrange(evidence, 't n -> (t n)')
+        valid_flat = rearrange(valid_mask_2d, 't n -> (t n)')
+        normalized = torch.zeros_like(evidence_flat)
+        if valid_flat.any():
+            valid_evidence = evidence_flat[valid_flat]
+            if float((valid_evidence.max() - valid_evidence.min()).item()) > 1e-6:
+                median = valid_evidence.median()
+                mad = (valid_evidence - median).abs().median().clamp_min(1e-6)
+                normalized = torch.sigmoid((evidence_flat - median) / mad)
+                normalized = torch.where(
+                    valid_flat,
+                    normalized,
+                    torch.zeros_like(normalized),
+                )
+        return torch.nan_to_num(
+            normalized.clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+    def _compute_inter_relation(self, pred_tracks, valid_mask, topk=16):
+        """Build a same-frame sparse-like dense relation matrix from point tracks."""
+        pred_tracks = torch.nan_to_num(
+            pred_tracks.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid_mask = valid_mask.to(device=pred_tracks.device).bool()
+        temporal_dim, num_points = pred_tracks.shape[:2]
+        num_tokens = temporal_dim * num_points
+        relation_matrix = pred_tracks.new_zeros(num_tokens, num_tokens)
+        if num_points <= 1:
+            return relation_matrix
+
+        route_cfg = self.pot_route_cfg
+        sigma = max(float(getattr(route_cfg, "INTER_SIGMA", 0.5)), 1e-6)
+        topk = max(int(topk), 1)
+        topk = min(topk, num_points - 1)
+
+        prev_dist = None
+        for frame_idx in range(temporal_dim):
+            frame_tracks = pred_tracks[frame_idx]
+            dist = torch.cdist(frame_tracks, frame_tracks, p=2)
+            if prev_dist is None:
+                delta_dist = torch.zeros_like(dist)
+            else:
+                delta_dist = torch.abs(dist - prev_dist)
+
+            frame_valid = valid_mask[frame_idx]
+            pair_valid = frame_valid[:, None] & frame_valid[None, :]
+            if frame_idx > 0:
+                prev_valid = valid_mask[frame_idx - 1]
+                pair_valid = pair_valid & prev_valid[:, None] & prev_valid[None, :]
+            pair_valid.fill_diagonal_(False)
+
+            delta_norm = torch.zeros_like(delta_dist)
+            if pair_valid.any():
+                max_delta = delta_dist[pair_valid].max().clamp_min(1e-6)
+                delta_norm = delta_dist / max_delta
+
+            relation = torch.exp(-(dist ** 2) / (sigma ** 2)) * delta_norm
+            relation = torch.where(pair_valid, relation, torch.zeros_like(relation))
+            if topk < num_points:
+                values, indices = torch.topk(relation, k=topk, dim=-1)
+                sparse_relation = torch.zeros_like(relation)
+                sparse_relation.scatter_(dim=-1, index=indices, src=values)
+                relation = sparse_relation
+
+            start_idx = frame_idx * num_points
+            end_idx = start_idx + num_points
+            relation_matrix[start_idx:end_idx, start_idx:end_idx] = relation
+            prev_dist = dist
+
+        return torch.nan_to_num(
+            relation_matrix.clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+    def _build_shared_private_cost(
+        self,
+        sim_matrix,
+        sharedness,
+        valid_mask,
+    ):
+        """Construct unary private-label and shared-row transport costs."""
+        route_cfg = self.pot_route_cfg
+        lambda_shared = float(getattr(route_cfg, "LAMBDA_SHARED", 0.5))
+        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
+
+        sim_matrix = torch.nan_to_num(
+            sim_matrix.float(),
+            nan=-1e4,
+            posinf=1.0,
+            neginf=-1e4,
+        )
+        sharedness = torch.nan_to_num(
+            sharedness.to(device=sim_matrix.device).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+
+        private_cost = 1.0 - sim_matrix + lambda_shared * sharedness.unsqueeze(0)
+        shared_cost = 1.0 - sharedness
+        cost = torch.cat([private_cost, shared_cost.unsqueeze(0)], dim=0)
+        cost = torch.where(
+            valid_mask.unsqueeze(0),
+            cost,
+            cost.new_full(cost.shape, 1e4),
+        )
+        return torch.nan_to_num(cost, nan=1e4, posinf=1e4, neginf=0.0)
+
+    def _build_label_structure(self, positive_text):
+        """Build label-side distances for private labels plus one shared row."""
+        route_cfg = self.pot_route_cfg
+        beta_text = float(getattr(route_cfg, "FGW_BETA_TEXT", 0.5))
+        beta_sep = float(getattr(route_cfg, "FGW_BETA_SEP", 0.5))
+        shared_tau = float(getattr(route_cfg, "FGW_SHARED_TAU", 0.5))
+
+        positive_text = torch.nan_to_num(
+            positive_text.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        num_labels = positive_text.shape[0]
+        label_structure = positive_text.new_zeros(num_labels + 1, num_labels + 1)
+        if num_labels == 0:
+            return label_structure
+
+        text = F.normalize(positive_text, dim=-1)
+        text_sim = torch.matmul(text, text.transpose(0, 1)).clamp(-1.0, 1.0)
+        text_dist = (1.0 - text_sim) / 2.0
+        sep_dist = torch.ones_like(text_dist)
+        sep_dist.fill_diagonal_(0.0)
+        private_dist = beta_text * text_dist + beta_sep * sep_dist
+        private_dist.fill_diagonal_(0.0)
+
+        label_structure[:num_labels, :num_labels] = private_dist
+        label_structure[num_labels, :num_labels] = shared_tau
+        label_structure[:num_labels, num_labels] = shared_tau
+        return torch.nan_to_num(
+            label_structure.clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+    def _build_visual_structure(
+        self,
+        value_flat,
+        flat_mask,
+        pred_tracks,
+        point_mask,
+        S_inter=None,
+        return_debug=False,
+    ):
+        """Build token-side distances from value features and same-frame relations."""
+        del pred_tracks, point_mask
+        route_cfg = self.pot_route_cfg
+        w_feat = float(getattr(route_cfg, "FGW_W_FEAT", 0.6))
+        w_inter = float(getattr(route_cfg, "FGW_W_INTER", 0.4))
+
+        value_flat = torch.nan_to_num(
+            value_flat.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        flat_mask = flat_mask.to(device=value_flat.device).bool()
+        pair_valid = flat_mask[:, None] & flat_mask[None, :]
+
+        value_norm = F.normalize(value_flat, dim=-1)
+        feat_sim = torch.matmul(value_norm, value_norm.transpose(0, 1)).clamp(-1.0, 1.0)
+        D_feat = ((1.0 - feat_sim) / 2.0).clamp(0.0, 1.0)
+
+        if S_inter is None:
+            R_inter = torch.zeros_like(D_feat)
+            D_inter = torch.full_like(D_feat, 0.5)
+        else:
+            R_inter = torch.nan_to_num(
+                S_inter.to(device=value_flat.device, dtype=D_feat.dtype),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(0.0, 1.0)
+            D_inter = torch.full_like(D_feat, 0.5)
+            D_inter = torch.where(R_inter > 0.0, 1.0 - R_inter, D_inter)
+
+        D_feat = torch.where(pair_valid, D_feat, torch.ones_like(D_feat))
+        D_inter = torch.where(pair_valid, D_inter, torch.ones_like(D_inter))
+        D_feat.fill_diagonal_(0.0)
+        D_inter.fill_diagonal_(0.0)
+
+        D_visual = w_feat * D_feat + w_inter * D_inter
+        D_visual = 0.5 * (D_visual + D_visual.transpose(0, 1))
+        D_visual = torch.where(pair_valid, D_visual, torch.ones_like(D_visual))
+        D_visual.fill_diagonal_(0.0)
+        D_visual = torch.nan_to_num(
+            D_visual.clamp(0.0, 1.0),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        if not return_debug:
+            return D_visual
+
+        offdiag_mask = ~torch.eye(
+            D_visual.shape[0],
+            device=D_visual.device,
+            dtype=torch.bool,
+        )
+        pair_valid = pair_valid & offdiag_mask
+        edge_mask = (R_inter > 0.0) & pair_valid
+        debug = {
+            "D_feat": self._pot_debug_masked_summary(D_feat, pair_valid),
+            "D_inter": self._pot_debug_masked_summary(D_inter, pair_valid),
+            "D_visual": self._pot_debug_masked_summary(D_visual, pair_valid),
+            "D_visual_sym_error": self._pot_debug_scalar(
+                torch.abs(D_visual - D_visual.transpose(0, 1)).mean()
+            ),
+            "D_visual_diag_max": self._pot_debug_scalar(torch.diag(D_visual).abs().max()),
+            "S_inter_edge_density": self._pot_debug_scalar(
+                edge_mask.to(D_visual.dtype).sum() / pair_valid.to(D_visual.dtype).sum().clamp_min(1.0)
+            ),
+            "S_inter_edge_mean": (
+                self._pot_debug_scalar(R_inter[edge_mask].mean())
+                if edge_mask.any()
+                else 0.0
+            ),
+        }
+        return D_visual, debug
+
+    def _compute_fgw_cost(self, D_label, D_visual, transport, valid_mask):
+        """Compute the square-loss GW cost induced by the current transport."""
+        D_label = torch.nan_to_num(
+            D_label.to(device=transport.device).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        D_visual = torch.nan_to_num(
+            D_visual.to(device=transport.device).float(),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        transport = torch.nan_to_num(
+            transport.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid_mask = valid_mask.to(device=transport.device).bool()
+
+        row_mass = transport.sum(dim=1)
+        col_mass = transport.sum(dim=0)
+        term1 = torch.matmul(D_label.pow(2), row_mass).unsqueeze(1)
+        term2 = torch.matmul(D_visual.pow(2), col_mass).unsqueeze(0)
+        middle = torch.matmul(torch.matmul(D_label, transport), D_visual.transpose(0, 1))
+        fgw_cost = (term1 + term2 - 2.0 * middle).clamp_min(0.0)
+
+        shared_weight = float(getattr(self.pot_route_cfg, "FGW_SHARED_WEIGHT", 1.0))
+        if shared_weight != 1.0 and fgw_cost.shape[0] > 0:
+            fgw_cost[-1] = shared_weight * fgw_cost[-1]
+        fgw_cost = torch.where(
+            valid_mask.unsqueeze(0),
+            fgw_cost,
+            fgw_cost.new_full(fgw_cost.shape, 1e4),
+        )
+        return torch.nan_to_num(fgw_cost, nan=1e4, posinf=1e4, neginf=0.0)
+
+    def _scale_fgw_cost_for_unary(self, fgw_cost, unary_cost, valid_columns):
+        """Center and scale FGW costs so they can affect the OT solve."""
+        route_cfg = self.pot_route_cfg
+        if not bool(getattr(route_cfg, "FGW_NORMALIZE_COST", True)):
+            return fgw_cost
+
+        cost_scale = max(float(getattr(route_cfg, "FGW_COST_SCALE", 1.0)), 0.0)
+        min_std = max(float(getattr(route_cfg, "FGW_COST_MIN_STD", 1e-6)), 1e-12)
+        valid_columns = valid_columns.to(device=fgw_cost.device).bool()
+        valid_mask = valid_columns.unsqueeze(0).expand_as(fgw_cost)
+
+        fgw_cost = torch.nan_to_num(
+            fgw_cost.float(),
+            nan=1e4,
+            posinf=1e4,
+            neginf=0.0,
+        )
+        unary_cost = torch.nan_to_num(
+            unary_cost.to(device=fgw_cost.device).float(),
+            nan=1e4,
+            posinf=1e4,
+            neginf=0.0,
+        )
+        centered_fgw = torch.zeros_like(fgw_cost)
+
+        for row_idx in range(fgw_cost.shape[0]):
+            row_mask = valid_mask[row_idx] & (fgw_cost[row_idx] < 1e3)
+            if not row_mask.any():
+                continue
+
+            row_fgw = fgw_cost[row_idx, row_mask]
+            row_unary = unary_cost[row_idx, row_mask]
+            fgw_std = row_fgw.std(unbiased=False)
+            unary_std = row_unary.std(unbiased=False)
+            if float(fgw_std.item()) <= min_std:
+                continue
+
+            if float(unary_std.item()) <= min_std:
+                unary_std = row_unary.abs().mean().clamp_min(min_std)
+            normalized = (row_fgw - row_fgw.mean()) / fgw_std.clamp_min(min_std)
+            centered_fgw[row_idx, row_mask] = normalized * unary_std * cost_scale
+
+        centered_fgw = torch.where(
+            valid_mask,
+            centered_fgw,
+            centered_fgw.new_full(centered_fgw.shape, 1e4),
+        )
+        return torch.nan_to_num(centered_fgw, nan=1e4, posinf=1e4, neginf=-1e4)
+
+    def _compute_private_row_mass(self, sim_matrix, valid_mask):
+        """Compute partial row mass for private label rows."""
+        route_cfg = self.pot_route_cfg
+        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
+        num_labels = sim_matrix.shape[0]
+        if num_labels == 0 or not valid_mask.any():
+            return sim_matrix.new_zeros(num_labels)
+
+        tau_mass = max(float(getattr(route_cfg, "MASS_TAU", 0.07)), 1e-6)
+        mass_topk = max(int(getattr(route_cfg, "MASS_TOPK", 16)), 1)
+        theta_mass = float(getattr(route_cfg, "MASS_THETA", 0.2))
+        tau_quality = max(
+            float(getattr(route_cfg, "MASS_TAU_QUALITY", 0.1)),
+            1e-6,
+        )
+        rho_min = min(max(float(getattr(route_cfg, "RHO_MIN", 0.2)), 0.0), 1.0)
+        rho_max = min(max(float(getattr(route_cfg, "RHO_MAX", 0.9)), rho_min), 1.0)
+
+        sim_matrix = torch.nan_to_num(
+            sim_matrix.float(),
+            nan=-1e4,
+            posinf=1.0,
+            neginf=-1e4,
+        )
+        masked_sim = sim_matrix.masked_fill(~valid_mask.unsqueeze(0), -1e4)
+        affinity = torch.softmax(masked_sim / tau_mass, dim=-1)
+        affinity = affinity * valid_mask.unsqueeze(0).to(affinity.dtype)
+        affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        entropy = -(affinity.clamp_min(1e-12) * affinity.clamp_min(1e-12).log()).sum(
+            dim=-1
+        )
+
+        num_valid = int(valid_mask.sum().item())
+        entropy_normalizer = max(float(np.log(max(num_valid, 2))), 1e-6)
+        entropy = entropy / entropy.new_tensor(entropy_normalizer)
+        effective_area = torch.exp(
+            entropy * entropy.new_tensor(float(np.log(max(num_valid, 1))))
+        ) / max(float(num_valid), 1.0)
+
+        valid_sim = sim_matrix[:, valid_mask]
+        topk = min(mass_topk, valid_sim.shape[-1])
+        topk_sim = torch.topk(valid_sim, k=topk, dim=-1).values.mean(dim=-1)
+        quality = torch.sigmoid((topk_sim - theta_mass) / tau_quality)
+
+        rho = rho_min + (rho_max - rho_min) * effective_area * quality
+        row_mass = rho / max(float(num_labels), 1.0)
+        return torch.nan_to_num(row_mass, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compute_shared_private_column_cap(self, sim_matrix, sharedness, valid_mask):
+        """Compute column capacity that allows shared tokens without favoring private rows."""
+        route_cfg = self.pot_route_cfg
+        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
+        if not valid_mask.any():
+            return sim_matrix.new_zeros(sim_matrix.shape[-1])
+
+        affinity_tau = max(float(getattr(route_cfg, "AFFINITY_TAU", 0.07)), 1e-6)
+        alpha_shared_cap = float(getattr(route_cfg, "ALPHA_SHARED_CAP", 1.0))
+        kappa = max(float(getattr(route_cfg, "KAPPA", 1.5)), 1.0)
+
+        sim_matrix = torch.nan_to_num(
+            sim_matrix.float(),
+            nan=-1e4,
+            posinf=1.0,
+            neginf=-1e4,
+        )
+        masked_sim = sim_matrix.masked_fill(~valid_mask.unsqueeze(0), -1e4)
+        affinity = torch.softmax(masked_sim / affinity_tau, dim=-1)
+        affinity = affinity * valid_mask.unsqueeze(0).to(affinity.dtype)
+        affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+
+        max_affinity = affinity.max(dim=0).values
+        sharedness = sharedness.to(device=sim_matrix.device).float().clamp(0.0, 1.0)
+        private_candidate = max_affinity * (1.0 - sharedness)
+        shared_candidate = sharedness
+        nu = private_candidate + alpha_shared_cap * shared_candidate
+        nu = nu * valid_mask.to(nu.dtype)
+        if float(nu.sum().item()) <= 0.0:
+            nu = valid_mask.to(nu.dtype)
+        nu = nu / nu.sum().clamp_min(1e-12)
+        col_cap = kappa * nu
+        return torch.nan_to_num(col_cap, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _solve_shared_private_fgw_transport(
+        self,
+        unary_cost,
+        row_mass,
+        col_cap,
+        D_label,
+        D_visual,
+        valid_mask,
+        return_debug=False,
+    ):
+        """Solve shared-private partial FGW transport."""
+        route_cfg = self.pot_route_cfg
+        outer_iters = max(int(getattr(route_cfg, "FGW_OUTER_ITERS", 2)), 0)
+        lambda_gw = float(getattr(route_cfg, "FGW_LAMBDA", 0.03))
+        force_total_mass = bool(getattr(route_cfg, "FORCE_TOTAL_MASS", False))
+
+        unary_cost = torch.nan_to_num(
+            unary_cost.float(),
+            nan=1e4,
+            posinf=1e4,
+            neginf=0.0,
+        )
+        transport = self._solve_joint_relaxed_transport(
+            unary_cost,
+            row_mass,
+            col_cap,
+            force_total_mass=force_total_mass,
+        )
+        initial_transport = transport.clone() if return_debug else None
+        debug_iters = []
+        valid_columns = valid_mask.to(device=unary_cost.device).bool()
+        valid_cost_mask = valid_columns.unsqueeze(0).expand_as(unary_cost)
+
+        for outer_idx in range(outer_iters):
+            fgw_cost = self._compute_fgw_cost(
+                D_label,
+                D_visual,
+                transport,
+                valid_mask,
+            )
+            scaled_fgw_cost = self._scale_fgw_cost_for_unary(
+                fgw_cost,
+                unary_cost,
+                valid_columns,
+            )
+            effective_cost = unary_cost + lambda_gw * scaled_fgw_cost
+            if return_debug:
+                delta_cost = lambda_gw * scaled_fgw_cost
+                debug_iters.append({
+                    "iter": outer_idx,
+                    "fgw_cost": self._pot_debug_masked_summary(
+                        fgw_cost,
+                        valid_cost_mask,
+                    ),
+                    "scaled_fgw_cost": self._pot_debug_masked_summary(
+                        scaled_fgw_cost,
+                        valid_cost_mask,
+                    ),
+                    "effective_delta": self._pot_debug_masked_summary(
+                        delta_cost,
+                        valid_cost_mask,
+                    ),
+                    "transport_sum_before": self._pot_debug_scalar(transport.sum()),
+                })
+            effective_cost = torch.where(
+                valid_columns.unsqueeze(0),
+                effective_cost,
+                effective_cost.new_full(effective_cost.shape, 1e4),
+            )
+            effective_cost = torch.nan_to_num(
+                effective_cost,
+                nan=1e4,
+                posinf=1e4,
+                neginf=0.0,
+            )
+            transport = self._solve_joint_relaxed_transport(
+                effective_cost,
+                row_mass,
+                col_cap,
+                force_total_mass=force_total_mass,
+            )
+            if return_debug:
+                debug_iters[-1]["transport_sum_after"] = self._pot_debug_scalar(
+                    transport.sum()
+                )
+
+        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
+        if not return_debug:
+            return transport
+
+        delta = torch.abs(transport - initial_transport)
+        valid_delta = delta[valid_cost_mask] if valid_cost_mask.any() else delta.new_zeros(1)
+        debug = {
+            "outer_iters": outer_iters,
+            "lambda_gw": round(float(lambda_gw), 6),
+            "force_total_mass": bool(force_total_mass),
+            "initial_transport_sum": self._pot_debug_scalar(initial_transport.sum()),
+            "final_transport_sum": self._pot_debug_scalar(transport.sum()),
+            "transport_delta_l1": self._pot_debug_scalar(valid_delta.mean()),
+            "transport_delta_max": self._pot_debug_scalar(valid_delta.max()),
+            "initial_private_row_sum": self._pot_debug_list(initial_transport[:-1].sum(dim=1)),
+            "final_private_row_sum": self._pot_debug_list(transport[:-1].sum(dim=1)),
+            "initial_shared_row_sum": self._pot_debug_scalar(initial_transport[-1].sum()),
+            "final_shared_row_sum": self._pot_debug_scalar(transport[-1].sum()),
+            "iters": debug_iters,
+        }
+        return transport, debug
+
+    def _aggregate_weighted_st_support_tokens(self, feat, point_mask, st_weights):
+        """Aggregate spatio-temporal token weights into per-frame support prototypes."""
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        point_mask = point_mask.to(device=feat.device).bool()
+        st_weights = torch.nan_to_num(
+            st_weights.to(device=feat.device, dtype=feat.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        temporal_dim, num_points = point_mask.shape
+        st_weights = st_weights.view(temporal_dim, num_points)
+
+        frame_weights = point_mask.to(feat.dtype) * st_weights
+        weighted_denom = frame_weights.sum(dim=1, keepdim=True)
+        weighted_proto = (
+            feat * frame_weights.unsqueeze(-1)
+        ).sum(dim=1) / weighted_denom.clamp_min(1e-6)
+
+        valid_weights = point_mask.to(feat.dtype)
+        valid_proto = (
+            feat * valid_weights.unsqueeze(-1)
+        ).sum(dim=1) / valid_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        proto = torch.where(
+            weighted_denom > 0.0,
+            weighted_proto,
+            valid_proto,
+        )
         return torch.nan_to_num(proto, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _build_pot_support_prototypes(self, patch_tokens, metadata):
-        """Build support prototypes with joint positive-label relaxed POT."""
+    def _build_pot_support_prototypes(
+        self,
+        app_tokens,
+        intra_tokens,
+        inter_tokens,
+        value_tokens,
+        metadata,
+    ):
+        """Build support private prototypes with shared-private partial transport."""
+        del app_tokens, intra_tokens, inter_tokens
         support_mask = metadata['support_mask'].bool()
         episode_positive_labels = metadata['episode_positive_labels'].bool()
         base_pt_mask = (
@@ -880,6 +1747,7 @@ class Pointformer(nn.Module):
             if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
             else metadata['pred_visibility']
         ).bool()
+        pred_tracks = metadata['pred_tracks']
         episode_class_ids = metadata['episode_class_ids'].long()
         episode_class_ids = (
             episode_class_ids[0]
@@ -888,13 +1756,16 @@ class Pointformer(nn.Module):
         )
         episode_label_text = self._get_pot_label_text_features(
             episode_class_ids,
-            patch_tokens.dtype,
+            value_tokens.dtype,
         )
+        debug_active = self._should_log_pot_debug()
+        debug_topk = int(getattr(self.pot_route_cfg, "DEBUG_TOPK", 16))
 
         branch_tokens = []
         branch_weights = []
         branch_class_indices = []
         branch_sample_indices = []
+        shared_weights = []
         support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
         for sample_idx in support_indices.tolist():
             sample_positive_labels = torch.nonzero(
@@ -904,50 +1775,257 @@ class Pointformer(nn.Module):
             if sample_positive_labels.numel() == 0:
                 continue
 
-            sample_patch_tokens = patch_tokens[sample_idx]
+            sample_value_tokens = value_tokens[sample_idx]
             sample_point_mask = base_pt_mask[sample_idx]
-            traj_repr = self._masked_temporal_mean_per_traj(
-                sample_patch_tokens.unsqueeze(0),
-                sample_point_mask.unsqueeze(0),
-            ).squeeze(0)
-            support_global = self._masked_space_time_mean(
-                sample_patch_tokens.unsqueeze(0),
-                sample_point_mask.unsqueeze(0),
-            ).squeeze(0)
+            sample_pred_tracks = pred_tracks[sample_idx]
             positive_text = episode_label_text.index_select(
                 0,
                 sample_positive_labels,
             )
-            joint_stats = self._compute_joint_positive_transport(
-                traj_repr,
-                support_global,
-                positive_text,
+
+            value_flat, flat_mask = self._flatten_st_tokens(
+                sample_value_tokens,
+                sample_point_mask,
             )
-            transport = joint_stats["transport"]
-            affinity = joint_stats["affinity"]
+            value_flat_norm = F.normalize(value_flat.float(), dim=-1)
+            positive_text_norm = F.normalize(positive_text.float(), dim=-1)
+            sim_matrix = torch.matmul(
+                positive_text_norm,
+                value_flat_norm.transpose(0, 1),
+            )
+            sim_matrix = torch.nan_to_num(
+                sim_matrix,
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0,
+            ).clamp(-1.0, 1.0)
+            sim_matrix = sim_matrix.masked_fill(~flat_mask.unsqueeze(0), -1e4)
+
+            debug_private_rows = []
+            visual_debug = None
+            solver_debug = None
+            sharedness = self._compute_sharedness(sim_matrix, flat_mask)
+            inter_topk = int(getattr(self.pot_route_cfg, "INTER_TOPK", 16))
+            S_inter = self._compute_inter_relation(
+                sample_pred_tracks,
+                sample_point_mask,
+                topk=inter_topk,
+            )
+            unary_cost = self._build_shared_private_cost(
+                sim_matrix,
+                sharedness,
+                flat_mask,
+            )
+            D_label = self._build_label_structure(positive_text)
+            visual_output = self._build_visual_structure(
+                value_flat=value_flat,
+                flat_mask=flat_mask,
+                pred_tracks=sample_pred_tracks,
+                point_mask=sample_point_mask,
+                S_inter=S_inter,
+                return_debug=debug_active,
+            )
+            if debug_active:
+                D_visual, visual_debug = visual_output
+            else:
+                D_visual = visual_output
+            private_row_mass = self._compute_private_row_mass(
+                sim_matrix,
+                flat_mask,
+            )
+            shared_mass_scale = float(
+                getattr(self.pot_route_cfg, "SHARED_MASS_SCALE", 0.5)
+            )
+            mean_sharedness = (
+                sharedness[flat_mask].mean()
+                if flat_mask.any()
+                else sharedness.new_zeros(())
+            )
+            shared_mass = (
+                shared_mass_scale * private_row_mass.sum() * mean_sharedness
+            ).view(1)
+            row_mass = torch.cat([private_row_mass, shared_mass], dim=0)
+            col_cap = self._compute_shared_private_column_cap(
+                sim_matrix,
+                sharedness,
+                flat_mask,
+            )
+            transport_output = self._solve_shared_private_fgw_transport(
+                unary_cost,
+                row_mass,
+                col_cap,
+                D_label=D_label,
+                D_visual=D_visual,
+                valid_mask=flat_mask,
+                return_debug=debug_active,
+            )
+            if debug_active:
+                transport, solver_debug = transport_output
+            else:
+                transport = transport_output
+
+            shared_row = transport[-1]
+            shared_row_sum = shared_row.sum()
+            if float(shared_row_sum.item()) > 0.0:
+                shared_weights.append(shared_row / shared_row_sum.clamp_min(1e-6))
+            else:
+                shared_weights.append(torch.zeros_like(shared_row))
 
             for branch_idx, positive_label in enumerate(sample_positive_labels):
-                traj_weights = transport[branch_idx]
-                weight_sum = traj_weights.sum()
+                raw_st_weights = transport[branch_idx]
+                st_weights = raw_st_weights
+                weight_sum = st_weights.sum()
                 if float(weight_sum.item()) <= 0.0:
-                    traj_weights = affinity[branch_idx]
-                    weight_sum = traj_weights.sum()
-                traj_weights = traj_weights / weight_sum.clamp_min(1e-6)
-                traj_weights = torch.nan_to_num(
-                    traj_weights,
+                    fallback_sim = sim_matrix[branch_idx].masked_fill(~flat_mask, -1e4)
+                    st_weights = torch.softmax(fallback_sim, dim=-1)
+                    st_weights = st_weights * flat_mask.to(st_weights.dtype)
+                    weight_sum = st_weights.sum()
+                st_weights = st_weights / weight_sum.clamp_min(1e-6)
+                st_weights = torch.nan_to_num(
+                    st_weights,
                     nan=0.0,
                     posinf=0.0,
                     neginf=0.0,
                 )
-                sample_proto = self._aggregate_weighted_support_tokens(
-                    sample_patch_tokens,
+                sample_proto = self._aggregate_weighted_st_support_tokens(
+                    sample_value_tokens,
                     sample_point_mask,
-                    traj_weights,
+                    st_weights,
                 )
                 branch_tokens.append(sample_proto.unsqueeze(1))
-                branch_weights.append(traj_weights)
+                branch_weights.append(st_weights)
                 branch_class_indices.append(positive_label.view(1))
                 branch_sample_indices.append(sample_idx)
+
+                if debug_active:
+                    proto_global = F.normalize(sample_proto.mean(dim=0).float(), dim=-1)
+                    proto_text_sims = torch.matmul(positive_text_norm, proto_global)
+                    if positive_text_norm.shape[0] > 1:
+                        other_mask = torch.ones(
+                            positive_text_norm.shape[0],
+                            device=positive_text_norm.device,
+                            dtype=torch.bool,
+                        )
+                        other_mask[branch_idx] = False
+                        max_other = proto_text_sims[other_mask].max()
+                    else:
+                        max_other = proto_text_sims.new_zeros(())
+                    correct_sim = proto_text_sims[branch_idx]
+                    debug_private_rows.append({
+                        "local_label_index": int(positive_label.item()),
+                        "global_class_id": int(episode_class_ids[positive_label].detach().cpu().item()),
+                        "transport_mass": self._pot_debug_scalar(raw_st_weights.sum()),
+                        "selection": self._pot_debug_weight_summary(
+                            st_weights,
+                            flat_mask,
+                            debug_topk,
+                        ),
+                        "top_sharedness_mean": self._pot_debug_top_value_mean(
+                            sharedness,
+                            st_weights,
+                            flat_mask,
+                            debug_topk,
+                        ),
+                        "top_text_sim_mean": self._pot_debug_top_value_mean(
+                            sim_matrix[branch_idx],
+                            st_weights,
+                            flat_mask,
+                            debug_topk,
+                        ),
+                        "prototype_text_sim_correct": self._pot_debug_scalar(correct_sim),
+                        "prototype_text_sim_max_other": self._pot_debug_scalar(max_other),
+                        "prototype_text_margin": self._pot_debug_scalar(correct_sim - max_other),
+                        "top_tokens": self._pot_debug_top_tokens(
+                            st_weights,
+                            flat_mask,
+                            sample_point_mask,
+                            sharedness,
+                            sim_matrix[branch_idx],
+                            debug_topk,
+                        ),
+                    })
+
+            if debug_active:
+                max_sim = sim_matrix.masked_fill(~flat_mask.unsqueeze(0), -1e4).max(dim=0).values
+                shared_summary = self._pot_debug_weight_summary(
+                    shared_row,
+                    flat_mask,
+                    debug_topk,
+                )
+                shared_top_sharedness = self._pot_debug_top_value_mean(
+                    sharedness,
+                    shared_row,
+                    flat_mask,
+                    debug_topk,
+                )
+                private_top_sharedness = [
+                    item["top_sharedness_mean"] for item in debug_private_rows
+                ]
+                private_top_sharedness_mean = (
+                    round(float(np.mean(private_top_sharedness)), 6)
+                    if private_top_sharedness
+                    else 0.0
+                )
+                positive_global_class_ids = episode_class_ids.index_select(
+                    0,
+                    sample_positive_labels,
+                )
+                valid_cost_mask = flat_mask.unsqueeze(0).expand_as(unary_cost)
+                record = {
+                    "event": "pot_fgw_route",
+                    "sample_idx": int(sample_idx),
+                    "num_positive_labels": int(sample_positive_labels.numel()),
+                    "positive_local_label_indices": [
+                        int(item) for item in sample_positive_labels.detach().cpu().tolist()
+                    ],
+                    "positive_global_class_ids": [
+                        int(item) for item in positive_global_class_ids.detach().cpu().tolist()
+                    ],
+                    "num_valid_tokens": int(flat_mask.sum().item()),
+                    "num_tokens": int(flat_mask.numel()),
+                    "row_mass": self._pot_debug_list(row_mass),
+                    "private_row_mass": self._pot_debug_list(private_row_mass),
+                    "shared_row_mass": self._pot_debug_scalar(row_mass[-1]),
+                    "col_cap": self._pot_debug_masked_summary(col_cap, flat_mask),
+                    "unary_cost": self._pot_debug_masked_summary(
+                        unary_cost,
+                        valid_cost_mask,
+                    ),
+                    "transport_invalid_weight_sum": self._pot_debug_scalar(
+                        transport[:, ~flat_mask].sum()
+                        if (~flat_mask).any()
+                        else transport.new_zeros(())
+                    ),
+                    "sharedness": self._pot_debug_masked_summary(sharedness, flat_mask),
+                    "shared_row": {
+                        "transport_mass": self._pot_debug_scalar(shared_row.sum()),
+                        "selection": shared_summary,
+                        "top_sharedness_mean": shared_top_sharedness,
+                        "shared_private_top_sharedness_gap": round(
+                            float(shared_top_sharedness - private_top_sharedness_mean),
+                            6,
+                        ),
+                        "top_max_text_sim_mean": self._pot_debug_top_value_mean(
+                            max_sim,
+                            shared_row,
+                            flat_mask,
+                            debug_topk,
+                        ),
+                        "top_tokens": self._pot_debug_top_tokens(
+                            shared_row,
+                            flat_mask,
+                            sample_point_mask,
+                            sharedness,
+                            max_sim,
+                            debug_topk,
+                        ),
+                    },
+                    "private_rows": debug_private_rows,
+                    "label_structure": self._pot_debug_label_summary(D_label),
+                    "visual_structure": visual_debug,
+                    "solver": solver_debug,
+                }
+                self._write_pot_debug_record(record)
 
         if not branch_tokens:
             return None
@@ -961,7 +2039,7 @@ class Pointformer(nn.Module):
         )
         support_branch_point_weights = torch.stack(branch_weights, dim=0)
         class_indices = torch.cat(branch_class_indices, dim=0)
-        return {
+        aux = {
             'support_conditioned_patch_tokens': support_tokens,
             'support_branch_point_weights': support_branch_point_weights.to(
                 device=support_tokens.device,
@@ -977,6 +2055,12 @@ class Pointformer(nn.Module):
                 dtype=torch.long,
             ),
         }
+        if shared_weights:
+            aux['support_shared_point_weights'] = torch.stack(
+                shared_weights,
+                dim=0,
+            ).to(device=support_tokens.device, dtype=support_tokens.dtype)
+        return aux
 
     def get_dino_features(self, x):
         """ Get DINO features
@@ -1233,17 +2317,28 @@ class Pointformer(nn.Module):
         else:
             sampled_feat = 0
 
-        hod_motion_feat = None
+        app_feat = sampled_feat if torch.is_tensor(sampled_feat) else None
+        intra_feat = None
+        inter_feat = None
         if self.cfg.MODEL.MOTION_MODULE.USE_HOD_MOTION_MODULE:
-            hod_motion_feat = self.hod_motion_module(metadata['hod_feat'].float())
-            sampled_feat = sampled_feat + hod_motion_feat
+            intra_feat = self.hod_motion_module(metadata['hod_feat'].float())
 
         if self.cfg.MODEL.MOTION_MODULE.USE_CROSS_MOTION_MODULE:
-            cross_motion_feat = self.cross_motion_module(
+            inter_feat = self.cross_motion_module(
                 metadata['pred_tracks'], metadata['pred_visibility'])
-            sampled_feat = sampled_feat + cross_motion_feat
 
-        cls_x, patch_x = self.pt_forward(sampled_feat, metadata)
+        reference_feat = app_feat
+        if reference_feat is None:
+            reference_feat = intra_feat if intra_feat is not None else inter_feat
+        if app_feat is None:
+            app_feat = torch.zeros_like(reference_feat)
+        if intra_feat is None:
+            intra_feat = torch.zeros_like(reference_feat)
+        if inter_feat is None:
+            inter_feat = torch.zeros_like(reference_feat)
+        fused_feat = app_feat + intra_feat + inter_feat
+
+        cls_x, patch_x = self.pt_forward(fused_feat, metadata)
         if 'support_mask' in metadata and 'episode_positive_labels' in metadata:
             if self.use_text_alignment:
                 text_align_aux = self._build_support_text_alignment(
@@ -1254,8 +2349,11 @@ class Pointformer(nn.Module):
                     few_shot_aux.update(text_align_aux)
             if self.use_pot_support_route:
                 route_aux = self._build_pot_support_prototypes(
-                    patch_x,
-                    metadata,
+                    app_tokens=app_feat,
+                    intra_tokens=intra_feat,
+                    inter_tokens=inter_feat,
+                    value_tokens=patch_x,
+                    metadata=metadata,
                 )
                 if route_aux is not None:
                     few_shot_aux.update(route_aux)
