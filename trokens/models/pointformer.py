@@ -814,16 +814,16 @@ class Pointformer(nn.Module):
 
         return torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _compute_joint_positive_st_transport(
+    def _compute_joint_positive_traj_transport(
         self,
-        token_repr,
-        valid_mask,
+        st_tokens,
+        point_mask,
         support_global,
         positive_text,
     ):
-        """Old joint positive-label POT, applied to flattened space-time tokens."""
+        """Solve positive-label POT over full trajectories, then refine over time."""
         route_cfg = self.pot_route_cfg
-        token_repr = torch.nan_to_num(token_repr, nan=0.0, posinf=0.0, neginf=0.0)
+        st_tokens = torch.nan_to_num(st_tokens, nan=0.0, posinf=0.0, neginf=0.0)
         support_global = torch.nan_to_num(
             support_global,
             nan=0.0,
@@ -836,26 +836,80 @@ class Pointformer(nn.Module):
             posinf=0.0,
             neginf=0.0,
         )
-        valid_mask = valid_mask.to(device=token_repr.device).bool()
+        if point_mask is None:
+            point_mask = torch.ones(
+                st_tokens.shape[:2],
+                device=st_tokens.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=st_tokens.device).bool()
         num_labels = positive_text.shape[0]
-        num_tokens = token_repr.shape[0]
-        if num_labels == 0 or num_tokens == 0 or not valid_mask.any():
-            empty = token_repr.new_zeros(num_labels, num_tokens)
-            return {"transport": empty, "affinity": empty}
+        temporal_dim, num_points = st_tokens.shape[:2]
+        valid_traj_mask = point_mask.any(dim=0) if num_points > 0 else point_mask.new_zeros(0)
+        if (
+            num_labels == 0
+            or temporal_dim == 0
+            or num_points == 0
+            or not valid_traj_mask.any()
+        ):
+            traj_empty = st_tokens.new_zeros(num_labels, num_points)
+            st_empty = st_tokens.new_zeros(num_labels, temporal_dim, num_points)
+            return {
+                "transport": traj_empty,
+                "temporal_weights": st_empty,
+                "st_transport": st_empty,
+                "affinity": traj_empty,
+                "traj_sim": traj_empty,
+            }
 
-        token_repr = F.normalize(token_repr.float(), dim=-1)
+        st_tokens = F.normalize(st_tokens.float(), dim=-1)
         support_global = F.normalize(support_global.float(), dim=-1)
         positive_text = F.normalize(positive_text.float(), dim=-1)
 
-        sim_matrix = torch.matmul(positive_text, token_repr.transpose(0, 1))
-        sim_matrix = torch.nan_to_num(
-            sim_matrix,
+        sim = torch.einsum("ld,tnd->ltn", positive_text, st_tokens)
+        sim = torch.nan_to_num(
+            sim,
             nan=0.0,
             posinf=1.0,
             neginf=-1.0,
         ).clamp(-1.0, 1.0)
-        cost = 1.0 - sim_matrix
-        cost = cost.masked_fill(~valid_mask.unsqueeze(0), 1e4)
+
+        valid_time_mask = point_mask.unsqueeze(0)
+        masked_sim = sim.masked_fill(~valid_time_mask, -1e4)
+        temporal_tau = max(
+            float(getattr(route_cfg, "TEMPORAL_TAU", route_cfg.AFFINITY_TAU)),
+            1e-6,
+        )
+        temporal_weights = torch.softmax(masked_sim / temporal_tau, dim=1)
+        temporal_weights = temporal_weights * valid_time_mask.to(temporal_weights.dtype)
+        temporal_weights = temporal_weights / temporal_weights.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+        temporal_weights = torch.where(
+            valid_traj_mask.view(1, 1, num_points),
+            temporal_weights,
+            torch.zeros_like(temporal_weights),
+        )
+        temporal_weights = torch.nan_to_num(
+            temporal_weights,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        traj_sim = (temporal_weights * sim).sum(dim=1)
+        traj_sim = torch.nan_to_num(
+            traj_sim,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        traj_sim = traj_sim.masked_fill(~valid_traj_mask.unsqueeze(0), -1e4)
+
+        cost = 1.0 - traj_sim
+        cost = cost.masked_fill(~valid_traj_mask.unsqueeze(0), 1e4)
 
         mu_logits = max(float(route_cfg.MU_LOGIT_SCALE), 1e-6) * torch.matmul(
             positive_text,
@@ -864,23 +918,28 @@ class Pointformer(nn.Module):
         mu = torch.softmax(mu_logits, dim=0)
 
         affinity_tau = max(float(route_cfg.AFFINITY_TAU), 1e-6)
-        masked_sim = sim_matrix.masked_fill(~valid_mask.unsqueeze(0), -1e4)
-        affinity = torch.softmax(masked_sim / affinity_tau, dim=-1)
-        affinity = affinity * valid_mask.unsqueeze(0).to(affinity.dtype)
+        affinity = torch.softmax(traj_sim / affinity_tau, dim=-1)
+        affinity = affinity * valid_traj_mask.unsqueeze(0).to(affinity.dtype)
         affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+        affinity = torch.nan_to_num(
+            affinity,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
         entropy = self._normalized_distribution_entropy(
             affinity,
-            valid_count=int(valid_mask.sum().item()),
+            valid_count=int(valid_traj_mask.sum().item()),
         )
         rho_min = min(max(float(route_cfg.RHO_MIN), 0.0), 1.0)
         rho_max = min(max(float(route_cfg.RHO_MAX), rho_min), 1.0)
         rho = rho_min + (rho_max - rho_min) * entropy
         row_mass = mu * rho
 
-        nu_shared = affinity.mean(dim=0) * valid_mask.to(affinity.dtype)
+        nu_shared = affinity.mean(dim=0) * valid_traj_mask.to(affinity.dtype)
         if float(nu_shared.sum().item()) <= 0.0:
-            nu_shared = valid_mask.to(affinity.dtype)
+            nu_shared = valid_traj_mask.to(affinity.dtype)
         nu_shared = nu_shared / nu_shared.sum().clamp_min(1e-6)
         kappa = max(float(route_cfg.KAPPA), 1.0)
         col_cap = kappa * nu_shared
@@ -891,9 +950,20 @@ class Pointformer(nn.Module):
             col_cap,
             force_total_mass=True,
         )
+        st_transport = transport[:, None, :] * temporal_weights
+        st_transport = st_transport * valid_time_mask.to(st_transport.dtype)
+        st_transport = torch.nan_to_num(
+            st_transport,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
         return {
             "transport": transport,
+            "temporal_weights": temporal_weights,
+            "st_transport": st_transport,
             "affinity": affinity,
+            "traj_sim": traj_sim,
         }
 
     def _build_support_text_alignment(self, patch_tokens, metadata):
@@ -1829,7 +1899,7 @@ class Pointformer(nn.Module):
         value_tokens,
         metadata,
     ):
-        """Build support prototypes with old joint POT over space-time tokens."""
+        """Build support prototypes with trajectory-level POT support routing."""
         del app_tokens, intra_tokens, inter_tokens
         support_mask = metadata['support_mask'].bool()
         episode_positive_labels = metadata['episode_positive_labels'].bool()
@@ -1872,26 +1942,26 @@ class Pointformer(nn.Module):
                 0,
                 sample_positive_labels,
             )
-            value_flat, flat_mask = self._flatten_st_tokens(
+            joint_stats = self._compute_joint_positive_traj_transport(
                 sample_value_tokens,
                 sample_point_mask,
-            )
-            joint_stats = self._compute_joint_positive_st_transport(
-                value_flat,
-                flat_mask,
                 support_global,
                 positive_text,
             )
-            transport = joint_stats["transport"]
+            st_transport = joint_stats["st_transport"]
+            temporal_weights = joint_stats["temporal_weights"]
             affinity = joint_stats["affinity"]
 
             for branch_idx, positive_label in enumerate(sample_positive_labels):
-                st_weights = transport[branch_idx]
-                st_weights = st_weights * flat_mask.to(st_weights.dtype)
+                st_weights = st_transport[branch_idx]
+                st_weights = st_weights * sample_point_mask.to(st_weights.dtype)
                 weight_sum = st_weights.sum()
                 if float(weight_sum.item()) <= 0.0:
-                    st_weights = affinity[branch_idx]
-                    st_weights = st_weights * flat_mask.to(st_weights.dtype)
+                    st_weights = (
+                        temporal_weights[branch_idx]
+                        * affinity[branch_idx].unsqueeze(0)
+                    )
+                    st_weights = st_weights * sample_point_mask.to(st_weights.dtype)
                     weight_sum = st_weights.sum()
                 st_weights = st_weights / weight_sum.clamp_min(1e-6)
                 st_weights = torch.nan_to_num(
@@ -1906,7 +1976,7 @@ class Pointformer(nn.Module):
                     st_weights,
                 )
                 branch_tokens.append(sample_proto.unsqueeze(1))
-                branch_weights.append(st_weights)
+                branch_weights.append(st_weights.reshape(-1))
                 branch_class_indices.append(positive_label.view(1))
                 branch_sample_indices.append(sample_idx)
 
