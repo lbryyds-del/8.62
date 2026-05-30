@@ -36,6 +36,15 @@ _C.TRAIN.EVAL_PERIOD = 10
 # Save model checkpoint every checkpoint period epochs.
 _C.TRAIN.CHECKPOINT_PERIOD = 10
 
+# Keep one copy of the best checkpoint for each training run.
+_C.TRAIN.CHECKPOINT_ARCHIVE_BEST = True
+
+# Directory under OUTPUT_DIR/checkpoints for per-run best checkpoints.
+_C.TRAIN.CHECKPOINT_ARCHIVE_DIR = "best_by_run"
+
+# Optional stable id for this training run. Empty means auto-generate one.
+_C.TRAIN.CHECKPOINT_RUN_ID = ""
+
 # Resume training from the latest checkpoint in the output directory.
 _C.TRAIN.AUTO_RESUME = True
 

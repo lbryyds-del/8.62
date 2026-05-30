@@ -4,10 +4,13 @@
 """Functions that handle saving and loading of checkpoints."""
 
 import copy
-import numpy as np
 import os
 import pickle
+import shutil
 from collections import OrderedDict
+from datetime import datetime
+
+import numpy as np
 import torch
 
 import trokens.utils.distributed as du
@@ -22,6 +25,9 @@ _CHECKPOINT_EXCLUDE_PREFIXES = (
     "dinotxt_visual_model.",
     "dinotxt_text_model.",
 )
+
+_BEST_CHECKPOINT_ARCHIVE_PATHS = {}
+_PROTECTED_BEST_CHECKPOINT_JOBS = set()
 
 
 def _filter_checkpoint_state_dict(state_dict):
@@ -56,6 +62,107 @@ def get_checkpoint_dir(path_to_job):
         path_to_job (string): the path to the folder of the current job.
     """
     return os.path.join(path_to_job, "checkpoints")
+
+
+def _train_cfg_value(cfg, key, default):
+    train_cfg = getattr(cfg, "TRAIN", None)
+    if train_cfg is None:
+        return default
+    try:
+        return train_cfg.get(key, default)
+    except AttributeError:
+        return getattr(train_cfg, key, default)
+
+
+def _safe_filename_token(value):
+    value = str(value).strip()
+    if not value:
+        value = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    token = "".join(char if char in allowed else "_" for char in value)
+    return token.strip("._-") or datetime.now().strftime("run_%Y%m%d_%H%M%S")
+
+
+def _unique_checkpoint_path(path):
+    if not pathmgr.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    version = 2
+    while True:
+        candidate = "{}_v{:02d}{}".format(root, version, ext)
+        if not pathmgr.exists(candidate):
+            return candidate
+        version += 1
+
+
+def _get_best_archive_dir(path_to_job, cfg):
+    archive_dir = str(
+        _train_cfg_value(cfg, "CHECKPOINT_ARCHIVE_DIR", "best_by_run")
+    ).strip()
+    if not archive_dir:
+        archive_dir = "best_by_run"
+    if os.path.isabs(archive_dir):
+        return archive_dir
+    return os.path.join(get_checkpoint_dir(path_to_job), archive_dir)
+
+
+def _copy_checkpoint_file(src_path, dst_path):
+    pathmgr.mkdirs(os.path.dirname(dst_path))
+    with pathmgr.open(src_path, "rb") as src_file:
+        with pathmgr.open(dst_path, "wb") as dst_file:
+            shutil.copyfileobj(src_file, dst_file, length=16 * 1024 * 1024)
+
+
+def _archive_existing_best_checkpoint(path_to_job, cfg, best_path):
+    key = os.path.abspath(path_to_job)
+    if key in _PROTECTED_BEST_CHECKPOINT_JOBS:
+        return
+    _PROTECTED_BEST_CHECKPOINT_JOBS.add(key)
+
+    if not pathmgr.exists(best_path):
+        return
+
+    try:
+        timestamp = datetime.fromtimestamp(os.path.getmtime(best_path)).strftime(
+            "%Y%m%d_%H%M%S"
+        )
+    except OSError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_path = os.path.join(
+        _get_best_archive_dir(path_to_job, cfg),
+        "checkpoint_best_previous_{}.pyth".format(timestamp),
+    )
+    archive_path = _unique_checkpoint_path(archive_path)
+    _copy_checkpoint_file(best_path, archive_path)
+    logger.info(
+        "Preserved existing best checkpoint at %s before overwrite.",
+        archive_path,
+    )
+
+
+def _get_run_best_archive_path(path_to_job, cfg):
+    key = os.path.abspath(path_to_job)
+    if key in _BEST_CHECKPOINT_ARCHIVE_PATHS:
+        return _BEST_CHECKPOINT_ARCHIVE_PATHS[key]
+
+    run_id = _safe_filename_token(
+        _train_cfg_value(cfg, "CHECKPOINT_RUN_ID", "")
+    )
+    archive_path = os.path.join(
+        _get_best_archive_dir(path_to_job, cfg),
+        "checkpoint_best_{}.pyth".format(run_id),
+    )
+    archive_path = _unique_checkpoint_path(archive_path)
+    _BEST_CHECKPOINT_ARCHIVE_PATHS[key] = archive_path
+    return archive_path
+
+
+def _archive_run_best_checkpoint(path_to_job, cfg, best_path):
+    if not _train_cfg_value(cfg, "CHECKPOINT_ARCHIVE_BEST", True):
+        return
+    archive_path = _get_run_best_archive_path(path_to_job, cfg)
+    _copy_checkpoint_file(best_path, archive_path)
+    logger.info("Archived run best checkpoint to %s.", archive_path)
 
 
 def get_path_to_checkpoint(path_to_job, epoch, best=False):
@@ -175,9 +282,13 @@ def save_checkpoint(path_to_job, model, optimizer, epoch, cfg, scaler=None, best
             os.remove(previous_checkpoint)
     else:
         path_to_checkpoint = get_path_to_checkpoint(path_to_job, epoch + 1, best=True)
+        if _train_cfg_value(cfg, "CHECKPOINT_ARCHIVE_BEST", True):
+            _archive_existing_best_checkpoint(path_to_job, cfg, path_to_checkpoint)
 
     with pathmgr.open(path_to_checkpoint, "wb") as f:
         torch.save(checkpoint, f)
+    if best:
+        _archive_run_best_checkpoint(path_to_job, cfg, path_to_checkpoint)
     return path_to_checkpoint
 
 

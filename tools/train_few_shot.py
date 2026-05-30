@@ -5,6 +5,7 @@ import os
 import pprint
 import sys
 import warnings
+from datetime import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -750,6 +751,11 @@ def train_few_shot(cfg, args, wandb_run=None):
 
     # Setup logging format.
     logging.setup_logging(cfg.OUTPUT_DIR)
+
+    if cfg.TRAIN.CHECKPOINT_ARCHIVE_BEST and cfg.TRAIN.CHECKPOINT_RUN_ID == "":
+        cfg.TRAIN.CHECKPOINT_RUN_ID = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    if cfg.TRAIN.CHECKPOINT_ARCHIVE_BEST:
+        logger.info("Checkpoint run id: %s", cfg.TRAIN.CHECKPOINT_RUN_ID)
 
     if du.get_rank() == 0 and wandb is not None:
         wandb_config_dict = wandb_init_dict(cfg)
