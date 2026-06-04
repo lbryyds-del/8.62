@@ -21,11 +21,15 @@ class FewShotEpisodeSampler(Sampler):
         labels = dataset._labels
         if self.multi_label:
             self.atomic_labels = [set(labels) for labels in dataset._atomic_labels]
+            self.label_combos = [
+                tuple(sorted(labels)) for labels in dataset._atomic_labels
+            ]
             self.class_ids = sorted(
                 {class_id for label_set in self.atomic_labels for class_id in label_set}
             )
         else:
             self.atomic_labels = None
+            self.label_combos = None
             self.class_ids = list(np.unique(labels))
         self.num_way = cfg.FEW_SHOT.N_WAY
         self.num_support = cfg.FEW_SHOT.K_SHOT
@@ -36,6 +40,16 @@ class FewShotEpisodeSampler(Sampler):
 
         # Create a list of indices for each class.
         if self.multi_label:
+            self.combo_indices = {}
+            for idx, label_combo in enumerate(self.label_combos):
+                self.combo_indices.setdefault(label_combo, []).append(idx)
+            self.class_label_combos = {
+                class_label: [
+                    label_combo for label_combo in self.combo_indices
+                    if class_label in label_combo
+                ]
+                for class_label in self.class_ids
+            }
             self.class_indices = {
                 class_label: [
                     idx for idx, label_set in enumerate(self.atomic_labels)
@@ -68,6 +82,42 @@ class FewShotEpisodeSampler(Sampler):
             return rng.sample(pool, num_samples)
         return [rng.choice(pool) for _ in range(num_samples)]
 
+    def _sample_indices_for_label_combo(
+        self, class_label, num_samples, used_indices, rng
+    ):
+        """Sample support/query from one full label combo containing class_label."""
+        label_combos = list(self.class_label_combos[class_label])
+        fresh_label_combos = [
+            label_combo for label_combo in label_combos
+            if len([
+                idx for idx in self.combo_indices[label_combo]
+                if idx not in used_indices
+            ]) >= num_samples
+        ]
+        eligible_label_combos = [
+            label_combo for label_combo in label_combos
+            if len(self.combo_indices[label_combo]) >= num_samples
+        ]
+        if fresh_label_combos:
+            label_combo = rng.choice(fresh_label_combos)
+            pool = [
+                idx for idx in self.combo_indices[label_combo]
+                if idx not in used_indices
+            ]
+        elif eligible_label_combos:
+            label_combo = rng.choice(eligible_label_combos)
+            pool = list(self.combo_indices[label_combo])
+        else:
+            label_combo = rng.choice(label_combos)
+            pool = list(self.combo_indices[label_combo])
+            fresh_pool = [idx for idx in pool if idx not in used_indices]
+            if fresh_pool:
+                pool = fresh_pool
+
+        if len(pool) >= num_samples:
+            return rng.sample(pool, num_samples)
+        return [rng.choice(pool) for _ in range(num_samples)]
+
     def _total_episodes(self):
         if self.mode == 'train':
             return self.cfg.FEW_SHOT.TRAIN_EPISODES
@@ -80,7 +130,12 @@ class FewShotEpisodeSampler(Sampler):
         total = self._total_episodes()
         if self.mode == 'train' and self.cfg.FEW_SHOT.TRAIN_OG_EPISODES:
             return list(range(total))
-        return list(range(self.rank, total, self.world_size))
+        episode_ids = list(range(total))
+        remainder = total % self.world_size
+        if remainder:
+            pad = self.world_size - remainder
+            episode_ids.extend(episode_ids[:pad])
+        return episode_ids[self.rank::self.world_size]
 
     def __iter__(self):
         for global_episode_idx in self.local_episode_ids:
@@ -96,9 +151,10 @@ class FewShotEpisodeSampler(Sampler):
             sample_type = (['support'] * self.num_support +
                                             ['query'] * self.num_queries)
             for idx, class_label in enumerate(selected_classes):
-                # Sample 'samples_per_class' indices from each selected class
+                # Multi-label episodes first bind the class to one full label
+                # combo, then sample support/query from that combo.
                 if self.multi_label:
-                    class_indices = self._sample_indices_for_class(
+                    class_indices = self._sample_indices_for_label_combo(
                         class_label, self.samples_per_class, used_indices, rng
                     )
                     used_indices.update(class_indices)

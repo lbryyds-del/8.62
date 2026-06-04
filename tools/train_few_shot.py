@@ -15,6 +15,7 @@ from few_shot_multilabel import (
     compute_base_novel_hm,
     empty_ap_storage,
     episode_labels_from_global,
+    few_shot_aux_has_query_partial_logits,
     few_shot_aux_has_support_tokens,
     get_text_align_loss,
     get_episode_class_ids,
@@ -311,8 +312,10 @@ def train_epoch(
                     dtype=torch.bool,
                 )
                 episode_class_ids = get_episode_class_ids(meta, labels.device)
+                raw_positive_labels = labels.to(labels.device).float()
+                meta['raw_positive_labels'] = raw_positive_labels
                 meta['episode_positive_labels'] = episode_labels_from_global(
-                    labels.to(labels.device),
+                    raw_positive_labels,
                     episode_class_ids,
                 )
             input_dict = {'video':inputs, 'metadata':meta}
@@ -354,11 +357,14 @@ def train_epoch(
                     patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
-            patch_q2s_logits = process_patch_tokens(
-                                        cfg,
-                                        patch_support_query_dict['support_preds'],
-                                        patch_support_query_dict['query_preds'])
             q2s_labels = patch_support_query_dict['query_batch_labels']
+            if multilabel_episode and few_shot_aux_has_query_partial_logits(few_shot_aux):
+                patch_q2s_logits = few_shot_aux["query_partial_q2s_logits"]
+            else:
+                patch_q2s_logits = process_patch_tokens(
+                                            cfg,
+                                            patch_support_query_dict['support_preds'],
+                                            patch_support_query_dict['query_preds'])
             patch_q2s_logits = patch_q2s_logits / cfg.SOLVER.TEMPRATURE
             patch_q2s_logits = torch.nan_to_num(
                 patch_q2s_logits,
@@ -595,8 +601,10 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
                 dtype=torch.bool,
             )
             episode_class_ids = get_episode_class_ids(meta, labels.device)
+            raw_positive_labels = labels.to(labels.device).float()
+            meta['raw_positive_labels'] = raw_positive_labels
             meta['episode_positive_labels'] = episode_labels_from_global(
-                labels.to(labels.device),
+                raw_positive_labels,
                 episode_class_ids,
             )
         with autocast_context(cfg.TRAIN.MIXED_PRECISION):
@@ -624,11 +632,14 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
                     patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
-            patch_q2s_logits = process_patch_tokens(
-                                        cfg,
-                                        patch_support_query_dict['support_preds'],
-                                        patch_support_query_dict['query_preds'])
             q2s_labels = patch_support_query_dict['query_batch_labels']
+            if multilabel_episode and few_shot_aux_has_query_partial_logits(few_shot_aux):
+                patch_q2s_logits = few_shot_aux["query_partial_q2s_logits"]
+            else:
+                patch_q2s_logits = process_patch_tokens(
+                                            cfg,
+                                            patch_support_query_dict['support_preds'],
+                                            patch_support_query_dict['query_preds'])
             if multilabel_episode:
                 q2s_loss = F.binary_cross_entropy_with_logits(
                     patch_q2s_logits, q2s_labels.float())

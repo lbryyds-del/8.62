@@ -24,6 +24,71 @@ from .build import MODEL_REGISTRY
 
 # pylint: disable=unused-argument,redefined-builtin
 
+class LabelAwareCMWCostNet(nn.Module):
+    """Label-aware CMW-style private reliability estimator."""
+
+    def __init__(
+        self,
+        token_evidence_dim=6,
+        label_context_dim=7,
+        hidden_dim=128,
+        num_families=5,
+    ):
+        super().__init__()
+        self.num_families = int(num_families)
+        self.token_branch = nn.Sequential(
+            nn.Linear(token_evidence_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.num_families),
+        )
+        self.label_branch = nn.Sequential(
+            nn.Linear(label_context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.num_families),
+        )
+
+    def forward(
+        self,
+        token_evidence,
+        label_context,
+        point_mask,
+        min_reliability=0.02,
+    ):
+        """Return private reliability over the raw label axis."""
+        token_evidence = torch.nan_to_num(
+            token_evidence.float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        label_context = torch.nan_to_num(
+            label_context.float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        candidate_reliability = torch.sigmoid(self.token_branch(token_evidence))
+        family_prob = torch.softmax(self.label_branch(label_context), dim=-1)
+        reliability = (
+            candidate_reliability * family_prob[:, None, None, :]
+        ).sum(dim=-1)
+        min_reliability = max(float(min_reliability), 0.0)
+        reliability = torch.nan_to_num(
+            reliability,
+            nan=min_reliability,
+            posinf=1.0,
+            neginf=min_reliability,
+        ).clamp(min=min_reliability, max=1.0)
+        point_mask = point_mask.to(device=reliability.device).bool()
+        reliability = reliability * point_mask.unsqueeze(0).to(reliability.dtype)
+        return reliability, {
+            "candidate_reliability": candidate_reliability,
+            "family_prob": family_prob,
+        }
+
+
 @MODEL_REGISTRY.register()
 class Pointformer(nn.Module):
     """ Main model for point tracking based transformer model.
@@ -95,6 +160,10 @@ class Pointformer(nn.Module):
             and self.feat_extractor_type == "dinotxt_vitl14_reg4"
             and self.pot_route_cfg.ENABLE
         )
+        self.use_query_partial_q2s = (
+            self.use_pot_support_route
+            and bool(getattr(self.pot_route_cfg, "QUERY_PARTIAL_ENABLE", False))
+        )
         self.use_text_alignment = (
             self.is_multilabel_few_shot
             and self.feat_extractor_type == "dinotxt_vitl14_reg4"
@@ -107,6 +176,14 @@ class Pointformer(nn.Module):
         ):
             raise NotImplementedError(
                 "POT support routing currently requires the dinotxt_vitl14_reg4 backbone."
+            )
+        if (
+            self.is_multilabel_few_shot
+            and bool(getattr(self.pot_route_cfg, "QUERY_PARTIAL_ENABLE", False))
+            and not self.pot_route_cfg.ENABLE
+        ):
+            raise NotImplementedError(
+                "QUERY_PARTIAL_ENABLE currently requires POT_ROUTE.ENABLE."
             )
         if (
             self.is_multilabel_few_shot
@@ -236,6 +313,15 @@ class Pointformer(nn.Module):
                 self.text_to_model_proj = nn.Linear(self.text_feature_dim, self.embed_dim)
             if self.use_pot_support_route or self.use_text_alignment:
                 self.atomic_label_names = self._load_atomic_label_names()
+
+        self.use_cmw_cost = self.use_pot_support_route
+        if self.use_cmw_cost:
+            self.cmw_cost_net = LabelAwareCMWCostNet(
+                token_evidence_dim=6,
+                label_context_dim=7,
+                hidden_dim=int(getattr(self.pot_route_cfg, "CMW_COST_HIDDEN_DIM", 128)),
+                num_families=int(getattr(self.pot_route_cfg, "CMW_COST_NUM_FAMILIES", 5)),
+            )
 
         # Initialize weights
         self.init_weights()
@@ -787,6 +873,330 @@ class Pointformer(nn.Module):
         normalizer = max(float(np.log(max(support_size, 2))), 1e-6)
         return entropy / entropy.new_tensor(normalizer)
 
+    def _compute_sharedness_3d(self, sim, point_mask, return_components=False):
+        """Estimate shared evidence over [T,N] from label entropy and semantic strength."""
+        num_labels = sim.shape[0]
+        sharedness = sim.new_zeros(sim.shape[1:])
+        components = {
+            "label_entropy": sharedness,
+            "semantic_strength": sharedness,
+        }
+        if num_labels <= 1:
+            return (sharedness, components) if return_components else sharedness
+
+        route_cfg = self.pot_route_cfg
+        tau_label = max(float(getattr(route_cfg, "SHARED_TAU_LABEL", 0.07)), 1e-6)
+        theta_shared = float(getattr(route_cfg, "SHARED_THETA", 0.2))
+        tau_strength = max(
+            float(getattr(route_cfg, "SHARED_TAU_STRENGTH", 0.1)),
+            1e-6,
+        )
+
+        point_mask = point_mask.to(device=sim.device).bool()
+        sim = torch.nan_to_num(
+            sim.float(),
+            nan=-1e4,
+            posinf=1.0,
+            neginf=-1e4,
+        ).clamp(-1.0, 1.0)
+
+        label_prob = torch.softmax(sim / tau_label, dim=0).clamp_min(1e-12)
+        label_entropy = -(label_prob * label_prob.log()).sum(dim=0)
+        normalizer = max(float(np.log(max(num_labels, 2))), 1e-6)
+        label_entropy = label_entropy / label_entropy.new_tensor(normalizer)
+
+        max_sim = sim.max(dim=0).values
+        semantic_strength = torch.sigmoid((max_sim - theta_shared) / tau_strength)
+        sharedness = label_entropy * semantic_strength
+
+        zeros = torch.zeros_like(sharedness)
+        label_entropy = torch.where(point_mask, label_entropy, zeros)
+        semantic_strength = torch.where(point_mask, semantic_strength, zeros)
+        sharedness = torch.where(point_mask, sharedness, zeros)
+
+        sharedness = torch.nan_to_num(
+            sharedness.clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        if not return_components:
+            return sharedness
+
+        components = {
+            "label_entropy": torch.nan_to_num(
+                label_entropy.clamp(0.0, 1.0),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ),
+            "semantic_strength": torch.nan_to_num(
+                semantic_strength.clamp(0.0, 1.0),
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ),
+        }
+        return sharedness, components
+
+    def _normalized_token_norm(self, tokens, point_mask):
+        """Return a [T,N] min-max normalized token norm map."""
+        point_mask = point_mask.bool()
+        if tokens is None:
+            return point_mask.new_zeros(point_mask.shape, dtype=torch.float32)
+        if tokens.shape[:2] != point_mask.shape:
+            return point_mask.new_zeros(point_mask.shape, dtype=torch.float32)
+
+        tokens = torch.nan_to_num(
+            tokens.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        if tokens.ndim == 2:
+            strength = tokens.abs()
+        else:
+            strength = torch.norm(tokens, dim=-1)
+        strength = torch.nan_to_num(
+            strength,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        normalized = torch.zeros_like(strength)
+        if point_mask.any():
+            valid_strength = strength[point_mask]
+            value_range = valid_strength.max() - valid_strength.min()
+            if float(value_range.item()) > 1e-6:
+                normalized = (strength - valid_strength.min()) / value_range.clamp_min(1e-6)
+        normalized = torch.where(point_mask, normalized, torch.zeros_like(normalized))
+        return torch.nan_to_num(
+            normalized.clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
+    def _build_cmw_token_evidence(
+        self,
+        sim,
+        sim01,
+        sharedness,
+        point_mask,
+        intra_tokens=None,
+        inter_tokens=None,
+        semantic_strength=None,
+    ):
+        """Build CMW token evidence over the raw label axis."""
+        route_cfg = self.pot_route_cfg
+        num_labels = sim.shape[0]
+        tau_margin = max(
+            float(getattr(route_cfg, "CMW_COST_MARGIN_TAU", 0.1)),
+            1e-6,
+        )
+        if num_labels > 1:
+            best_other_sim = []
+            for label_idx in range(num_labels):
+                other_indices = [
+                    other_idx
+                    for other_idx in range(num_labels)
+                    if other_idx != label_idx
+                ]
+                other_sim = sim.index_select(
+                    0,
+                    torch.as_tensor(
+                        other_indices,
+                        device=sim.device,
+                        dtype=torch.long,
+                    ),
+                ).amax(dim=0)
+                best_other_sim.append(other_sim.unsqueeze(0))
+            best_other_sim = torch.cat(best_other_sim, dim=0)
+            margin = sim - best_other_sim
+        else:
+            margin = sim
+
+        margin_score = torch.sigmoid(margin / tau_margin)
+        sharedness = torch.nan_to_num(
+            sharedness.to(device=sim.device).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        shared_map = sharedness.unsqueeze(0).expand_as(margin_score)
+        conflict_shared = torch.maximum(1.0 - margin_score, shared_map)
+
+        motion_strength = self._normalized_token_norm(intra_tokens, point_mask).to(
+            device=sim.device,
+        )
+        inter_strength = self._normalized_token_norm(inter_tokens, point_mask).to(
+            device=sim.device,
+        )
+        if semantic_strength is None or semantic_strength.shape != point_mask.shape:
+            semantic_strength = sim01.max(dim=0).values
+        semantic_strength = torch.nan_to_num(
+            semantic_strength.to(device=sim.device).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+
+        point_mask = point_mask.to(device=sim.device).bool()
+        valid3 = point_mask.unsqueeze(0).expand_as(sim01)
+        text_sim = torch.where(valid3, sim01, torch.zeros_like(sim01))
+        margin_score = torch.where(valid3, margin_score, torch.zeros_like(margin_score))
+        conflict_shared = torch.where(
+            valid3,
+            conflict_shared,
+            torch.zeros_like(conflict_shared),
+        )
+        motion_map = motion_strength.unsqueeze(0).expand_as(text_sim)
+        inter_map = inter_strength.unsqueeze(0).expand_as(text_sim)
+        semantic_map = semantic_strength.unsqueeze(0).expand_as(text_sim)
+
+        token_evidence = torch.stack(
+            [
+                text_sim,
+                margin_score,
+                conflict_shared,
+                motion_map,
+                inter_map,
+                semantic_map,
+            ],
+            dim=-1,
+        )
+        token_evidence = torch.nan_to_num(
+            token_evidence.float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        components = {
+            "text_sim": text_sim,
+            "margin_score": margin_score,
+            "conflict_shared": conflict_shared,
+            "motion_strength": motion_strength,
+            "inter_strength": inter_strength,
+            "semantic_strength": semantic_strength,
+        }
+        return token_evidence, components
+
+    def _build_cmw_label_context(
+        self,
+        episode_positive_labels,
+        support_mask,
+        episode_label_text,
+        sample_positive_labels,
+        support_global,
+        positive_text,
+        raw_positive_labels=None,
+    ):
+        """Build [K,7] label context features for CMW private reliability."""
+        del episode_positive_labels, episode_label_text
+        device = positive_text.device
+        dtype = positive_text.dtype
+        num_labels = positive_text.shape[0]
+        if num_labels == 0:
+            return positive_text.new_zeros(0, 7)
+
+        support_count = positive_text.new_zeros(num_labels)
+        effective_support = positive_text.new_zeros(num_labels)
+        cooccur_degree = positive_text.new_zeros(num_labels)
+        num_support = 0
+        total_label_dim = max(num_labels, 1)
+        if raw_positive_labels is not None:
+            raw_positive_labels = raw_positive_labels.to(device=device).float()
+            if support_mask is None:
+                support_mask = torch.ones(
+                    raw_positive_labels.shape[0],
+                    device=device,
+                    dtype=torch.bool,
+                )
+            else:
+                support_mask = support_mask.to(device=device).bool()
+            support_labels = raw_positive_labels[support_mask]
+            num_support = int(support_mask.sum().item())
+            total_label_dim = max(int(raw_positive_labels.shape[-1]), 1)
+            if support_labels.numel() > 0:
+                sample_positive_labels = sample_positive_labels.to(
+                    device=device,
+                    dtype=torch.long,
+                ).flatten()
+                valid_label_ids = (
+                    (sample_positive_labels >= 0)
+                    & (sample_positive_labels < support_labels.shape[-1])
+                )
+                safe_label_ids = sample_positive_labels.clamp(
+                    min=0,
+                    max=max(int(support_labels.shape[-1]) - 1, 0),
+                )
+                support_subset = support_labels.index_select(1, safe_label_ids)
+                support_subset = support_subset * valid_label_ids.to(dtype).unsqueeze(0)
+                support_count = support_subset.sum(dim=0)
+
+                cardinality = support_labels.sum(dim=1).clamp_min(1.0)
+                effective_support = (
+                    support_subset / cardinality.unsqueeze(1)
+                ).sum(dim=0)
+                if num_labels > 1:
+                    label_cardinality = support_subset.sum(dim=1, keepdim=True)
+                    cooccur_count = (
+                        support_subset * (label_cardinality - support_subset)
+                    ).sum(dim=0)
+                    cooccur_degree = cooccur_count / (
+                        support_count.clamp_min(1.0) * float(num_labels - 1)
+                    )
+
+        support_denom = max(float(num_support), 1.0)
+        log_support = torch.log1p(support_count) / max(float(np.log1p(support_denom)), 1e-6)
+        normalized_support_count = support_count / support_denom
+        normalized_effective_support = effective_support / support_denom
+
+        text_norm = F.normalize(positive_text.float(), dim=-1)
+        if num_labels > 1:
+            text_sim = torch.matmul(text_norm, text_norm.transpose(0, 1)).clamp(-1.0, 1.0)
+            offdiag_mask = ~torch.eye(num_labels, device=device, dtype=torch.bool)
+            ambiguity = text_sim.masked_select(offdiag_mask).view(num_labels, num_labels - 1)
+            ambiguity = ambiguity.mean(dim=-1)
+            ambiguity = ((ambiguity + 1.0) * 0.5).clamp(0.0, 1.0)
+        else:
+            ambiguity = positive_text.new_zeros(num_labels)
+
+        support_global = F.normalize(
+            torch.nan_to_num(
+                support_global.to(device=device).float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ),
+            dim=-1,
+        )
+        global_text_sim = torch.matmul(text_norm, support_global).clamp(-1.0, 1.0)
+        global_text_sim = ((global_text_sim + 1.0) * 0.5).clamp(0.0, 1.0)
+        positive_label_count = positive_text.new_full(
+            (num_labels,),
+            min(float(num_labels) / max(float(total_label_dim), 1.0), 1.0),
+        )
+
+        label_context = torch.stack(
+            [
+                log_support,
+                normalized_support_count,
+                normalized_effective_support,
+                ambiguity,
+                cooccur_degree,
+                global_text_sim,
+                positive_label_count,
+            ],
+            dim=-1,
+        )
+        return torch.nan_to_num(
+            label_context.to(dtype=dtype).clamp(0.0, 1.0),
+            nan=0.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+
     def _solve_avg_3d_uot(
         self,
         cost,
@@ -798,12 +1208,12 @@ class Pointformer(nn.Module):
         """
         Target-conditioned 3D-UOT with three soft plane priors.
 
-        cost: [K,T,N]
-        prior_frame: [K,T], target for sum_n Gamma[k,t,n]
-        prior_traj:  [K,N], target for sum_t Gamma[k,t,n]
-        prior_vis:   [T,N], target for sum_k Gamma[k,t,n]
+        cost: [R,T,N]
+        prior_frame: [R,T], target for sum_n Gamma[r,t,n]
+        prior_traj:  [R,N], target for sum_t Gamma[r,t,n]
+        prior_vis:   [T,N], target for sum_r Gamma[r,t,n]
         valid_mask:  [T,N]
-        return gamma: [K,T,N]
+        return gamma: [R,T,N]
         """
         route_cfg = self.pot_route_cfg
 
@@ -939,7 +1349,15 @@ class Pointformer(nn.Module):
         point_mask,
         support_global,
         positive_text,
+        intra_tokens=None,
+        inter_tokens=None,
+        episode_positive_labels=None,
+        support_mask=None,
+        sample_positive_labels=None,
+        episode_label_text=None,
+        raw_positive_labels=None,
         return_debug=False,
+        target_label_indices=None,
     ):
         """
         Target-conditioned 3D-UOT over label-time-trajectory tensor.
@@ -947,9 +1365,36 @@ class Pointformer(nn.Module):
         st_tokens: [T,N,C]
         point_mask: [T,N]
         support_global: [C]
-        positive_text: [K,C]
+        positive_text: [K,C], where K is the support sample raw-label axis
+        target_label_indices: label-axis rows that should produce episode prototypes
         """
         route_cfg = self.pot_route_cfg
+
+        def _normalize_masked_map(score, mask):
+            score = torch.nan_to_num(
+                score.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            mask = mask.to(device=score.device).bool()
+            score = score * mask.to(score.dtype)
+            if float(score.sum().item()) <= 0.0:
+                score = mask.to(score.dtype)
+            return score / score.sum().clamp_min(1e-12)
+
+        def _normalize_masked_vector(score, mask):
+            score = torch.nan_to_num(
+                score.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            mask = mask.to(device=score.device).bool()
+            score = score * mask.to(score.dtype)
+            if float(score.sum().item()) <= 0.0:
+                score = mask.to(score.dtype)
+            return score / score.sum().clamp_min(1e-12)
 
         st_tokens = torch.nan_to_num(st_tokens, nan=0.0, posinf=0.0, neginf=0.0)
         support_global = torch.nan_to_num(
@@ -976,22 +1421,48 @@ class Pointformer(nn.Module):
 
         temporal_dim, num_points = st_tokens.shape[:2]
         num_labels = positive_text.shape[0]
+        if target_label_indices is None:
+            target_label_indices = torch.arange(
+                num_labels,
+                device=st_tokens.device,
+                dtype=torch.long,
+            )
+        else:
+            target_label_indices = target_label_indices.to(
+                device=st_tokens.device,
+                dtype=torch.long,
+            ).flatten()
+            valid_target_indices = (
+                (target_label_indices >= 0)
+                & (target_label_indices < num_labels)
+            )
+            target_label_indices = target_label_indices[valid_target_indices]
+        num_targets = int(target_label_indices.numel())
 
         if (
             num_labels == 0
+            or num_targets == 0
             or temporal_dim == 0
             or num_points == 0
             or not point_mask.any()
         ):
-            empty = st_tokens.new_zeros(num_labels, temporal_dim, num_points)
+            empty_label = st_tokens.new_zeros(num_labels, temporal_dim, num_points)
+            empty_target = st_tokens.new_zeros(num_targets, temporal_dim, num_points)
             return {
-                "st_transport": empty,
-                "sim": empty,
-                "cost": empty,
+                "st_transport": empty_target,
+                "sim": empty_label,
+                "cost": empty_label,
+                "cost_ext": st_tokens.new_zeros(num_labels + 1, temporal_dim, num_points),
+                "sharedness": st_tokens.new_zeros(temporal_dim, num_points),
+                "label_entropy": st_tokens.new_zeros(temporal_dim, num_points),
+                "semantic_strength": st_tokens.new_zeros(temporal_dim, num_points),
                 "prob_frame": st_tokens.new_zeros(num_labels, temporal_dim),
                 "prob_traj": st_tokens.new_zeros(num_labels, num_points),
-                "prob_vis": empty,
-                "transport_mass": st_tokens.new_zeros(num_labels),
+                "prob_vis": empty_label,
+                "shared_transport": empty_target,
+                "transport_mass": st_tokens.new_zeros(num_targets),
+                "shared_transport_mass": st_tokens.new_zeros(num_targets),
+                "target_label_indices": target_label_indices,
             }
 
         valid_frame_mask = point_mask.any(dim=1)
@@ -1009,11 +1480,104 @@ class Pointformer(nn.Module):
             neginf=-1.0,
         ).clamp(-1.0, 1.0)
 
-        cost = (1.0 - sim) / 2.0
-        cost = cost.masked_fill(~point_mask.unsqueeze(0), 1e4)
+        sim01 = ((sim + 1.0) * 0.5).clamp(0.0, 1.0)
 
+        shared_enabled = bool(getattr(route_cfg, "UOT3D_SHARED_ENABLE", False))
+        sharedness = st_tokens.new_zeros(temporal_dim, num_points)
+        shared_components = {
+            "label_entropy": st_tokens.new_zeros(temporal_dim, num_points),
+            "semantic_strength": st_tokens.new_zeros(temporal_dim, num_points),
+        }
+        if shared_enabled and num_labels > 1:
+            sharedness, shared_components = self._compute_sharedness_3d(
+                sim,
+                point_mask,
+                return_components=True,
+            )
+
+        if not hasattr(self, "cmw_cost_net"):
+            raise RuntimeError(
+                "LabelAwareCMWCostNet is required for POT support routing."
+            )
+
+        semantic_for_cmw = (
+            shared_components["semantic_strength"]
+            if shared_enabled and num_labels > 1
+            else None
+        )
+        cmw_token_evidence, cmw_evidence_components = self._build_cmw_token_evidence(
+            sim,
+            sim01,
+            sharedness,
+            point_mask,
+            intra_tokens=intra_tokens,
+            inter_tokens=inter_tokens,
+            semantic_strength=semantic_for_cmw,
+        )
+        if sample_positive_labels is None:
+            sample_positive_labels = torch.arange(
+                num_labels,
+                device=st_tokens.device,
+                dtype=torch.long,
+            )
+        cmw_label_context = self._build_cmw_label_context(
+            episode_positive_labels,
+            support_mask,
+            episode_label_text,
+            sample_positive_labels,
+            support_global,
+            positive_text,
+            raw_positive_labels=raw_positive_labels,
+        )
+        cmw_min_reliability = float(getattr(
+            route_cfg,
+            "CMW_COST_MIN_RELIABILITY",
+            0.02,
+        ))
+        cmw_private_reliability, cmw_aux = self.cmw_cost_net(
+            cmw_token_evidence,
+            cmw_label_context,
+            point_mask,
+            min_reliability=cmw_min_reliability,
+        )
+        cmw_private_reliability = torch.nan_to_num(
+            cmw_private_reliability.to(device=sim.device).float(),
+            nan=cmw_min_reliability,
+            posinf=1.0,
+            neginf=cmw_min_reliability,
+        ).clamp(min=max(cmw_min_reliability, 0.0), max=1.0)
+        cmw_private_reliability = (
+            cmw_private_reliability
+            * point_mask.unsqueeze(0).to(cmw_private_reliability.dtype)
+        )
+        private_cost = 1.0 - cmw_private_reliability
+        private_cost = torch.nan_to_num(
+            private_cost,
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        private_cost = private_cost.masked_fill(~point_mask.unsqueeze(0), 1e4)
+        cost = private_cost
+        cost_source = "cmw_private_cost"
+
+        shared_cost = torch.nan_to_num(
+            1.0 - sharedness,
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        cost_ext = torch.cat(
+            [private_cost, shared_cost.unsqueeze(0)],
+            dim=0,
+        )
+        cost_ext = cost_ext.masked_fill(~point_mask.unsqueeze(0), 1e4)
+        cost_ext = torch.nan_to_num(cost_ext, nan=1e4, posinf=1e4, neginf=0.0)
+        cost = torch.nan_to_num(cost, nan=1e4, posinf=1e4, neginf=0.0)
+
+        base_mu_logit_scale = float(getattr(route_cfg, "MU_LOGIT_SCALE", 10.0))
         mu_logit_scale = max(
-            float(getattr(route_cfg, "UOT3D_MU_LOGIT_SCALE", route_cfg.MU_LOGIT_SCALE)),
+            float(getattr(route_cfg, "UOT3D_MU_LOGIT_SCALE", base_mu_logit_scale)),
             1e-6,
         )
         mu_logits = mu_logit_scale * torch.matmul(text_norm, support_global)
@@ -1028,6 +1592,20 @@ class Pointformer(nn.Module):
         total_mass = float(getattr(route_cfg, "UOT3D_TOTAL_MASS", 1.0))
         total_mass = max(total_mass, 1e-6)
         debug_topk = max(int(getattr(route_cfg, "DEBUG_TOPK", 8)), 1)
+        shared_ratio = float(getattr(route_cfg, "UOT3D_SHARED_RATIO", 0.2))
+        shared_ratio = min(max(shared_ratio, 0.0), 0.5)
+        use_shared_transport = (
+            shared_enabled
+            and num_labels > 1
+            and shared_ratio > 0.0
+            and float(sharedness.sum().item()) > 0.0
+        )
+        if not use_shared_transport:
+            shared_ratio = 0.0
+        shared_total_mass = total_mass * shared_ratio
+        private_total_mass = total_mass - shared_total_mass
+        alpha_private_vis = float(getattr(route_cfg, "UOT3D_VIS_PRIVATE_WEIGHT", 1.0))
+        alpha_shared_vis = float(getattr(route_cfg, "UOT3D_VIS_SHARED_WEIGHT", 1.0))
 
         frame_feat = self._masked_frame_mean(st_tokens, point_mask)
         frame_feat = F.normalize(frame_feat.float(), dim=-1)
@@ -1101,22 +1679,54 @@ class Pointformer(nn.Module):
         prob_vis = prob_vis_flat.view(num_labels, temporal_dim, num_points)
 
         st_transports = []
+        shared_transports = []
         transport_masses = []
+        shared_transport_masses = []
         target_debug = []
-        for target_idx in range(num_labels):
+        for target_output_idx, target_idx_tensor in enumerate(target_label_indices):
+            target_idx = int(target_idx_tensor.detach().cpu().item())
             one_hot = torch.zeros_like(mu)
             one_hot[target_idx] = 1.0
 
-            label_mass = target_mix * one_hot + (1.0 - target_mix) * mu
-            label_mass = label_mass / label_mass.sum().clamp_min(1e-12)
-            label_mass = total_mass * label_mass
+            label_mass_private = target_mix * one_hot + (1.0 - target_mix) * mu
+            label_mass_private = label_mass_private / label_mass_private.sum().clamp_min(1e-12)
 
-            prior_frame = label_mass[:, None] * prob_frame
-            prior_traj = label_mass[:, None] * prob_traj
-            prior_vis = label_mass[target_idx] * prob_vis[target_idx]
+            if use_shared_transport:
+                label_mass = private_total_mass * label_mass_private
+                prior_frame_private = label_mass[:, None] * prob_frame
+                prior_traj_private = label_mass[:, None] * prob_traj
+
+                shared_frame = sharedness.sum(dim=1)
+                shared_frame = _normalize_masked_vector(shared_frame, valid_frame_mask)
+                shared_frame = shared_total_mass * shared_frame
+
+                shared_traj = sharedness.sum(dim=0)
+                shared_traj = _normalize_masked_vector(shared_traj, valid_traj_mask)
+                shared_traj = shared_total_mass * shared_traj
+
+                prior_frame = torch.cat(
+                    [prior_frame_private, shared_frame.unsqueeze(0)],
+                    dim=0,
+                )
+                prior_traj = torch.cat(
+                    [prior_traj_private, shared_traj.unsqueeze(0)],
+                    dim=0,
+                )
+                token_score = (
+                    alpha_private_vis * prob_vis[target_idx]
+                    + alpha_shared_vis * sharedness
+                )
+                prior_vis = total_mass * _normalize_masked_map(token_score, point_mask)
+                solve_cost = cost_ext
+            else:
+                label_mass = total_mass * label_mass_private
+                prior_frame = label_mass[:, None] * prob_frame
+                prior_traj = label_mass[:, None] * prob_traj
+                prior_vis = label_mass[target_idx] * prob_vis[target_idx]
+                solve_cost = cost
 
             gamma = self._solve_avg_3d_uot(
-                cost=cost,
+                cost=solve_cost,
                 prior_frame=prior_frame,
                 prior_traj=prior_traj,
                 prior_vis=prior_vis,
@@ -1125,10 +1735,18 @@ class Pointformer(nn.Module):
 
             target_weight = gamma[target_idx]
             target_weight = target_weight * point_mask.to(target_weight.dtype)
+            shared_weight = (
+                gamma[-1] * point_mask.to(gamma.dtype)
+                if use_shared_transport
+                else target_weight.new_zeros(target_weight.shape)
+            )
             st_transports.append(target_weight.unsqueeze(0))
+            shared_transports.append(shared_weight.unsqueeze(0))
             transport_masses.append(target_weight.sum().view(1))
+            shared_transport_masses.append(shared_weight.sum().view(1))
             if return_debug:
                 target_weight_sum = target_weight.sum()
+                shared_weight_sum = shared_weight.sum()
                 gamma_total = gamma.sum()
                 gamma_row_mass = gamma.sum(dim=(1, 2))
                 gamma_frame = gamma.sum(dim=2)
@@ -1162,10 +1780,14 @@ class Pointformer(nn.Module):
 
                 frame_mass = target_weight.sum(dim=1)
                 traj_mass = target_weight.sum(dim=0)
-                target_debug.append({
+                target_debug_item = {
+                    "target_output_idx": int(target_output_idx),
                     "target_idx": int(target_idx),
+                    "label_axis_idx": int(target_idx),
                     "label_mass": self._pot_debug_list(label_mass),
                     "target_label_mass": self._pot_debug_scalar(label_mass[target_idx]),
+                    "private_mass": self._pot_debug_scalar(private_total_mass),
+                    "shared_mass": self._pot_debug_scalar(shared_total_mass),
                     "gamma_total_mass": self._pot_debug_scalar(gamma_total),
                     "gamma_row_mass": self._pot_debug_list(gamma_row_mass),
                     "target_row_mass": self._pot_debug_scalar(target_weight_sum),
@@ -1178,6 +1800,9 @@ class Pointformer(nn.Module):
                     "weighted_sim_target": self._pot_debug_scalar(weighted_target_sim),
                     "weighted_sim_best_other": self._pot_debug_scalar(weighted_best_other_sim),
                     "weighted_sim_margin": self._pot_debug_scalar(
+                        weighted_target_sim - weighted_best_other_sim
+                    ),
+                    "private_weighted_sim_margin": self._pot_debug_scalar(
                         weighted_target_sim - weighted_best_other_sim
                     ),
                     "frame_plane_l1_to_prior": self._pot_debug_scalar(
@@ -1216,21 +1841,97 @@ class Pointformer(nn.Module):
                         sim=sim[target_idx],
                         topk=debug_topk,
                     ),
-                })
+                    "target_weighted_sharedness": self._pot_debug_scalar(
+                        self._pot_debug_weighted_map_mean(
+                            sharedness,
+                            target_weight,
+                            point_mask,
+                        )
+                    ),
+                    "shared_row_mass": self._pot_debug_scalar(shared_weight_sum),
+                    "shared_row_ratio": self._pot_debug_scalar(
+                        shared_weight_sum / gamma_total.clamp_min(1e-12)
+                    ),
+                    "shared_absorption_ratio": self._pot_debug_scalar(
+                        shared_weight_sum / gamma_total.clamp_min(1e-12)
+                    ),
+                    "shared_weighted_sharedness": self._pot_debug_scalar(
+                        self._pot_debug_weighted_map_mean(
+                            sharedness,
+                            shared_weight,
+                            point_mask,
+                        )
+                    ),
+                    "target_vs_shared_overlap": self._pot_debug_pair_st_overlap(
+                        target_weight,
+                        shared_weight,
+                        point_mask,
+                        topk=debug_topk,
+                    ),
+                    "shared_top_tokens": self._pot_debug_top_tokens(
+                        shared_weight.reshape(-1),
+                        point_mask.reshape(-1),
+                        point_mask,
+                        sharedness.reshape(-1),
+                        sim[target_idx].reshape(-1),
+                        debug_topk,
+                    ),
+                }
+                family_prob = cmw_aux.get("family_prob")
+                if family_prob is not None:
+                    target_debug_item.update({
+                        "cmw_target_reliability_summary": (
+                            self._pot_debug_masked_summary(
+                                cmw_private_reliability[target_idx],
+                                point_mask,
+                            )
+                        ),
+                        "cmw_target_family_prob": (
+                            self._pot_debug_list(family_prob[target_idx])
+                            if family_prob is not None
+                            else []
+                        ),
+                    })
+                if use_shared_transport:
+                    target_debug_item.update({
+                        "shared_frame_l1_to_prior": self._pot_debug_scalar(
+                            torch.abs(gamma_frame[-1] - prior_frame[-1]).sum()
+                        ),
+                        "shared_traj_l1_to_prior": self._pot_debug_scalar(
+                            torch.abs(gamma_traj[-1] - prior_traj[-1]).sum()
+                        ),
+                    })
+                target_debug.append(target_debug_item)
 
         st_transport = (
             torch.cat(st_transports, dim=0)
             if st_transports
-            else st_tokens.new_zeros(num_labels, temporal_dim, num_points)
+            else st_tokens.new_zeros(num_targets, temporal_dim, num_points)
         )
         transport_mass = (
             torch.cat(transport_masses, dim=0)
             if transport_masses
-            else st_tokens.new_zeros(num_labels)
+            else st_tokens.new_zeros(num_targets)
         )
 
         st_transport = torch.nan_to_num(
             st_transport,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        shared_transport = (
+            torch.cat(shared_transports, dim=0)
+            if shared_transports
+            else st_tokens.new_zeros(num_targets, temporal_dim, num_points)
+        )
+        shared_transport_mass = (
+            torch.cat(shared_transport_masses, dim=0)
+            if shared_transport_masses
+            else st_tokens.new_zeros(num_targets)
+        )
+        shared_transport = torch.nan_to_num(
+            shared_transport,
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
@@ -1240,15 +1941,35 @@ class Pointformer(nn.Module):
             "st_transport": st_transport,
             "sim": sim,
             "cost": cost,
+            "cost_ext": cost_ext,
+            "private_cost": private_cost,
+            "shared_cost": shared_cost,
+            "sharedness": sharedness,
+            "label_entropy": shared_components["label_entropy"],
+            "semantic_strength": shared_components["semantic_strength"],
             "prob_frame": prob_frame,
             "prob_traj": prob_traj,
             "prob_vis": prob_vis,
+            "shared_transport": shared_transport,
             "transport_mass": transport_mass,
+            "shared_transport_mass": shared_transport_mass,
+            "target_label_indices": target_label_indices,
         }
+        result["cmw_private_reliability"] = cmw_private_reliability
+        result["cmw_family_prob"] = cmw_aux.get("family_prob")
         if return_debug:
+            valid_cost_mask = point_mask.unsqueeze(0).expand_as(private_cost)
+            shared_cost_mask = point_mask
+            max_sim = sim.max(dim=0).values
             result["debug"] = {
+                "debug_type": (
+                    "psr_3d_uot_soft"
+                    if use_shared_transport
+                    else "target_conditioned_3d_uot"
+                ),
                 "shape": {
                     "num_labels": int(num_labels),
+                    "num_targets": int(num_targets),
                     "temporal_dim": int(temporal_dim),
                     "num_points": int(num_points),
                     "feature_dim": int(st_tokens.shape[-1]),
@@ -1264,9 +1985,52 @@ class Pointformer(nn.Module):
                     "tau_frame": round(float(tau_frame), 6),
                     "tau_traj": round(float(tau_traj), 6),
                     "tau_vis": round(float(tau_vis), 6),
+                    "shared_enable": bool(shared_enabled),
+                    "shared_effective": bool(use_shared_transport),
+                    "shared_ratio": round(float(shared_ratio), 6),
+                    "vis_private_weight": round(float(alpha_private_vis), 6),
+                    "vis_shared_weight": round(float(alpha_shared_vis), 6),
+                    "shared_tau_label": round(float(getattr(route_cfg, "SHARED_TAU_LABEL", 0.07)), 6),
+                    "shared_theta": round(float(getattr(route_cfg, "SHARED_THETA", 0.2)), 6),
+                    "shared_tau_strength": round(float(getattr(route_cfg, "SHARED_TAU_STRENGTH", 0.1)), 6),
+                    "private_cost_source": "cmw",
                 },
+                "cost_source": cost_source,
+                "target_label_indices": [
+                    int(target_idx)
+                    for target_idx in target_label_indices.detach().cpu().tolist()
+                ],
                 "mu": self._pot_debug_list(mu),
                 "transport_mass": self._pot_debug_list(transport_mass),
+                "shared_transport_mass": self._pot_debug_list(shared_transport_mass),
+                "sharedness_summary": self._pot_debug_masked_summary(
+                    sharedness,
+                    point_mask,
+                ),
+                "label_entropy_summary": self._pot_debug_masked_summary(
+                    shared_components["label_entropy"],
+                    point_mask,
+                ),
+                "semantic_strength_summary": self._pot_debug_masked_summary(
+                    shared_components["semantic_strength"],
+                    point_mask,
+                ),
+                "private_cost_summary": self._pot_debug_masked_summary(
+                    private_cost,
+                    valid_cost_mask,
+                ),
+                "shared_cost_summary": self._pot_debug_masked_summary(
+                    shared_cost,
+                    shared_cost_mask,
+                ),
+                "shared_top_tokens": self._pot_debug_top_tokens(
+                    sharedness.reshape(-1),
+                    point_mask.reshape(-1),
+                    point_mask,
+                    sharedness.reshape(-1),
+                    max_sim.reshape(-1),
+                    debug_topk,
+                ),
                 "prob_frame_entropy": self._pot_debug_list(
                     self._normalized_distribution_entropy(
                         prob_frame,
@@ -1290,8 +2054,39 @@ class Pointformer(nn.Module):
                     point_mask,
                     topk=debug_topk,
                 ),
+                "shared_transport_overlap": self._pot_debug_transport_overlap(
+                    shared_transport,
+                    point_mask,
+                    topk=debug_topk,
+                ),
                 "targets": target_debug,
             }
+            cmw_valid_mask = point_mask.unsqueeze(0).expand_as(
+                cmw_private_reliability
+            )
+            cmw_family_prob = cmw_aux.get("family_prob")
+            result["debug"].update({
+                "cmw_private_reliability_summary": self._pot_debug_masked_summary(
+                    cmw_private_reliability,
+                    cmw_valid_mask,
+                ),
+                "cmw_family_prob": (
+                    [
+                        self._pot_debug_list(cmw_family_prob[label_idx])
+                        for label_idx in range(cmw_family_prob.shape[0])
+                    ]
+                    if cmw_family_prob is not None
+                    else []
+                ),
+                "cmw_evidence_mean": {
+                    name: self._pot_debug_scalar(value[point_mask].mean())
+                    if value.ndim == 2
+                    else self._pot_debug_scalar(
+                        value[point_mask.unsqueeze(0).expand_as(value)].mean()
+                    )
+                    for name, value in cmw_evidence_components.items()
+                },
+            })
         return result
 
     def _solve_joint_relaxed_transport(
@@ -1826,6 +2621,84 @@ class Pointformer(nn.Module):
             "topk_overlap_max": round(float(np.max(overlap_values)), 6) if overlap_values else 0.0,
             "pairs": pairs,
         }
+
+    def _pot_debug_pair_st_overlap(self, left_weights, right_weights, point_mask, topk=8):
+        """Summarize overlap between two spatio-temporal transport maps."""
+        left_weights = torch.nan_to_num(
+            left_weights.detach().float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        right_weights = torch.nan_to_num(
+            right_weights.detach().float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        point_mask = point_mask.to(device=left_weights.device).bool()
+        flat_mask = point_mask.reshape(-1)
+        if left_weights.numel() == 0 or right_weights.numel() == 0 or not flat_mask.any():
+            return {
+                "cosine": 0.0,
+                "topk_overlap": 0.0,
+                "left_mass": 0.0,
+                "right_mass": 0.0,
+                "shared_min_mass": 0.0,
+            }
+
+        left_flat = left_weights.reshape(-1) * flat_mask.to(left_weights.dtype)
+        right_flat = right_weights.reshape(-1) * flat_mask.to(right_weights.dtype)
+        left_sum = left_flat.sum()
+        right_sum = right_flat.sum()
+        if float(left_sum.item()) <= 0.0 or float(right_sum.item()) <= 0.0:
+            return {
+                "cosine": 0.0,
+                "topk_overlap": 0.0,
+                "left_mass": self._pot_debug_scalar(left_sum),
+                "right_mass": self._pot_debug_scalar(right_sum),
+                "shared_min_mass": 0.0,
+            }
+        denom = left_flat.pow(2).sum().sqrt() * right_flat.pow(2).sum().sqrt()
+        cosine = (left_flat * right_flat).sum() / denom.clamp_min(1e-12)
+
+        valid_count = int(flat_mask.sum().item())
+        topk = min(max(int(topk), 1), valid_count)
+        left_norm = left_flat / left_sum.clamp_min(1e-12)
+        right_norm = right_flat / right_sum.clamp_min(1e-12)
+        left_top = set(
+            torch.topk(left_norm.masked_fill(~flat_mask, -1.0), k=topk)
+            .indices.detach().cpu().tolist()
+        )
+        right_top = set(
+            torch.topk(right_norm.masked_fill(~flat_mask, -1.0), k=topk)
+            .indices.detach().cpu().tolist()
+        )
+        return {
+            "cosine": self._pot_debug_scalar(cosine.clamp(0.0, 1.0)),
+            "topk_overlap": round(len(left_top & right_top) / max(float(topk), 1.0), 6),
+            "left_mass": self._pot_debug_scalar(left_sum),
+            "right_mass": self._pot_debug_scalar(right_sum),
+            "shared_min_mass": self._pot_debug_scalar(torch.minimum(left_flat, right_flat).sum()),
+        }
+
+    def _pot_debug_weighted_map_mean(self, values, weights, valid_mask):
+        """Mean of values under non-negative map weights on valid tokens."""
+        values = torch.nan_to_num(
+            values.detach().float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        weights = torch.nan_to_num(
+            weights.detach().float().to(device=values.device),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        valid_mask = valid_mask.to(device=values.device).bool()
+        weights = weights * valid_mask.to(weights.dtype)
+        return (values * weights).sum() / weights.sum().clamp_min(1e-12)
 
     def _pot_debug_top_value_mean(self, values, weights, valid_mask, topk):
         """Mean value over top-weighted valid tokens."""
@@ -2566,6 +3439,668 @@ class Pointformer(nn.Module):
         )
         return torch.nan_to_num(proto, nan=0.0, posinf=0.0, neginf=0.0)
 
+    def _safe_l2_normalize(self, value, dim=-1):
+        """Normalize features without producing NaNs for zero vectors."""
+        value = torch.nan_to_num(
+            value.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        return value / value.norm(dim=dim, keepdim=True).clamp_min(1e-12)
+
+    def _aggregate_weighted_query_tokens(self, feat, point_mask, st_weights):
+        """Aggregate one query sample into a label-conditioned global prototype."""
+        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
+        point_mask = point_mask.to(device=feat.device).bool()
+        st_weights = torch.nan_to_num(
+            st_weights.to(device=feat.device, dtype=feat.dtype),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        weights = point_mask.to(feat.dtype) * st_weights
+        denom = weights.sum()
+        if float(denom.item()) <= 0.0:
+            return feat.new_zeros(feat.shape[-1])
+        proto = (feat * weights.unsqueeze(-1)).sum(dim=(0, 1)) / denom.clamp_min(1e-6)
+        return torch.nan_to_num(proto, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_query_partial_label_axis(
+        self,
+        episode_class_ids,
+        raw_positive_labels,
+        support_mask,
+    ):
+        """Build query label rows from episode classes plus support raw-label union."""
+        device = episode_class_ids.device
+        episode_class_ids = episode_class_ids.to(device=device, dtype=torch.long).flatten()
+        support_mask = support_mask.to(device=device).bool().flatten()
+        raw_positive_labels = raw_positive_labels.to(device=device).bool()
+        raw_positive_labels = raw_positive_labels.reshape(support_mask.shape[0], -1)
+
+        support_raw_labels = raw_positive_labels[support_mask]
+        if support_raw_labels.numel() > 0:
+            support_raw_union = torch.nonzero(
+                support_raw_labels.any(dim=0),
+                as_tuple=False,
+            ).flatten()
+        else:
+            support_raw_union = episode_class_ids.new_zeros(0)
+
+        if support_raw_union.numel() > 0:
+            label_axis_global_labels = torch.unique(
+                torch.cat([episode_class_ids, support_raw_union.to(device)])
+            )
+        else:
+            label_axis_global_labels = episode_class_ids
+        label_axis_global_labels = label_axis_global_labels.to(
+            device=device,
+            dtype=torch.long,
+        )
+
+        if episode_class_ids.numel() == 0 or label_axis_global_labels.numel() == 0:
+            return label_axis_global_labels, episode_class_ids.new_zeros(0)
+
+        episode_to_axis = (
+            episode_class_ids[:, None] == label_axis_global_labels[None, :]
+        )
+        valid_episode = episode_to_axis.any(dim=1)
+        if not valid_episode.all():
+            episode_class_ids = episode_class_ids[valid_episode]
+            episode_to_axis = episode_to_axis[valid_episode]
+        target_label_indices = episode_to_axis.to(torch.long).argmax(dim=1)
+        return label_axis_global_labels, target_label_indices.to(dtype=torch.long)
+
+    def _solve_query_partial_3d_uot(
+        self,
+        cost,
+        frame_cap,
+        traj_cap,
+        vis_cap,
+        valid_mask,
+    ):
+        """Solve capped query-side 3D-UOT without mass amplification."""
+        route_cfg = self.pot_route_cfg
+        entropic_eps = max(
+            float(getattr(route_cfg, "UOT3D_ENTROPIC_EPS", route_cfg.ENTROPIC_EPS)),
+            1e-6,
+        )
+        max_iters = max(int(route_cfg.MAX_ITERS), 1)
+        stop_tol = max(float(route_cfg.STOP_TOL), 0.0)
+
+        cost = torch.nan_to_num(cost.float(), nan=1e4, posinf=1e4, neginf=0.0)
+        frame_cap = torch.nan_to_num(
+            frame_cap.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        traj_cap = torch.nan_to_num(
+            traj_cap.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        vis_cap = torch.nan_to_num(
+            vis_cap.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+
+        if cost.numel() == 0:
+            return cost.new_zeros(cost.shape)
+
+        valid_mask = valid_mask.to(device=cost.device).bool()
+        valid3 = valid_mask.unsqueeze(0).expand_as(cost)
+        valid_cost = cost.masked_fill(~valid3, 1e4)
+        gamma = torch.exp((-valid_cost / entropic_eps).clamp(min=-80.0, max=0.0))
+        gamma = torch.where(valid3, gamma, torch.zeros_like(gamma))
+        if float(gamma.sum().item()) <= 0.0:
+            return cost.new_zeros(cost.shape)
+
+        for _ in range(max_iters):
+            prev_gamma = gamma
+
+            cur_frame = gamma.sum(dim=2)
+            scale_frame = torch.minimum(
+                frame_cap / cur_frame.clamp_min(1e-12),
+                torch.ones_like(cur_frame),
+            )
+            gamma = gamma * torch.nan_to_num(
+                scale_frame,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).unsqueeze(2)
+
+            cur_traj = gamma.sum(dim=1)
+            scale_traj = torch.minimum(
+                traj_cap / cur_traj.clamp_min(1e-12),
+                torch.ones_like(cur_traj),
+            )
+            gamma = gamma * torch.nan_to_num(
+                scale_traj,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).unsqueeze(1)
+
+            cur_vis = gamma.sum(dim=0)
+            scale_vis = torch.minimum(
+                vis_cap / cur_vis.clamp_min(1e-12),
+                torch.ones_like(cur_vis),
+            )
+            gamma = gamma * torch.nan_to_num(
+                scale_vis,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).unsqueeze(0)
+
+            gamma = torch.where(valid3, gamma, torch.zeros_like(gamma))
+            gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
+            delta = torch.max(torch.abs(gamma - prev_gamma))
+            if float(delta.item()) <= stop_tol:
+                break
+
+        return gamma
+
+    def _compute_query_partial_3d_transport(
+        self,
+        st_tokens,
+        point_mask,
+        label_axis_text,
+        label_axis_global_labels,
+        target_label_indices,
+        support_mask=None,
+        episode_positive_labels=None,
+        raw_positive_labels=None,
+        intra_tokens=None,
+        inter_tokens=None,
+    ):
+        """Build query-side capped 3D-UOT over extended label-axis rows."""
+        route_cfg = self.pot_route_cfg
+        st_tokens = torch.nan_to_num(st_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+        label_axis_text = torch.nan_to_num(
+            label_axis_text,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+        if point_mask is None:
+            point_mask = torch.ones(
+                st_tokens.shape[:2],
+                device=st_tokens.device,
+                dtype=torch.bool,
+            )
+        else:
+            point_mask = point_mask.to(device=st_tokens.device).bool()
+
+        label_axis_global_labels = label_axis_global_labels.to(
+            device=st_tokens.device,
+            dtype=torch.long,
+        ).flatten()
+        target_label_indices = target_label_indices.to(
+            device=st_tokens.device,
+            dtype=torch.long,
+        ).flatten()
+        valid_target = (
+            (target_label_indices >= 0)
+            & (target_label_indices < label_axis_text.shape[0])
+        )
+        target_label_indices = target_label_indices[valid_target]
+
+        temporal_dim, num_points = st_tokens.shape[:2]
+        num_labels = label_axis_text.shape[0]
+        num_targets = int(target_label_indices.numel())
+        if (
+            num_labels == 0
+            or num_targets == 0
+            or temporal_dim == 0
+            or num_points == 0
+            or not point_mask.any()
+        ):
+            empty_label = st_tokens.new_zeros(num_labels, temporal_dim, num_points)
+            empty_target = st_tokens.new_zeros(num_targets, temporal_dim, num_points)
+            return {
+                "st_transport": empty_target,
+                "transport_mass": st_tokens.new_zeros(num_targets),
+                "sim": empty_label,
+                "cost": empty_label,
+                "cmw_private_reliability": empty_label,
+                "prob_frame": st_tokens.new_zeros(num_labels, temporal_dim),
+                "prob_traj": st_tokens.new_zeros(num_labels, num_points),
+                "prob_vis": empty_label,
+                "vis_cap": st_tokens.new_zeros(temporal_dim, num_points),
+                "target_label_indices": target_label_indices,
+                "label_axis_global_labels": label_axis_global_labels,
+            }
+
+        valid_frame_mask = point_mask.any(dim=1)
+        valid_traj_mask = point_mask.any(dim=0)
+        st_norm = self._safe_l2_normalize(st_tokens, dim=-1)
+        text_norm = self._safe_l2_normalize(label_axis_text, dim=-1)
+
+        sim = torch.einsum("kc,tnc->ktn", text_norm, st_norm)
+        sim = torch.nan_to_num(
+            sim,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        sim01 = ((sim + 1.0) * 0.5).clamp(0.0, 1.0)
+
+        shared_enabled = bool(getattr(route_cfg, "UOT3D_SHARED_ENABLE", False))
+        sharedness = st_tokens.new_zeros(temporal_dim, num_points)
+        shared_components = {
+            "label_entropy": st_tokens.new_zeros(temporal_dim, num_points),
+            "semantic_strength": st_tokens.new_zeros(temporal_dim, num_points),
+        }
+        if shared_enabled and num_labels > 1:
+            sharedness, shared_components = self._compute_sharedness_3d(
+                sim,
+                point_mask,
+                return_components=True,
+            )
+
+        if not hasattr(self, "cmw_cost_net"):
+            raise RuntimeError(
+                "LabelAwareCMWCostNet is required for query partial routing."
+            )
+        semantic_for_cmw = (
+            shared_components["semantic_strength"]
+            if shared_enabled and num_labels > 1
+            else None
+        )
+        cmw_token_evidence, _ = self._build_cmw_token_evidence(
+            sim,
+            sim01,
+            sharedness,
+            point_mask,
+            intra_tokens=intra_tokens,
+            inter_tokens=inter_tokens,
+            semantic_strength=semantic_for_cmw,
+        )
+        query_global = self._masked_space_time_mean(
+            st_tokens.unsqueeze(0),
+            point_mask.unsqueeze(0),
+        ).squeeze(0)
+        cmw_label_context = self._build_cmw_label_context(
+            episode_positive_labels,
+            support_mask,
+            label_axis_text,
+            label_axis_global_labels,
+            query_global,
+            label_axis_text,
+            raw_positive_labels=raw_positive_labels,
+        )
+        cmw_min_reliability = float(getattr(
+            route_cfg,
+            "CMW_COST_MIN_RELIABILITY",
+            0.02,
+        ))
+        cmw_private_reliability, _ = self.cmw_cost_net(
+            cmw_token_evidence,
+            cmw_label_context,
+            point_mask,
+            min_reliability=cmw_min_reliability,
+        )
+        cmw_private_reliability = torch.nan_to_num(
+            cmw_private_reliability.to(device=sim.device).float(),
+            nan=cmw_min_reliability,
+            posinf=1.0,
+            neginf=cmw_min_reliability,
+        ).clamp(min=max(cmw_min_reliability, 0.0), max=1.0)
+        cmw_private_reliability = (
+            cmw_private_reliability
+            * point_mask.unsqueeze(0).to(cmw_private_reliability.dtype)
+        )
+        cost = 1.0 - cmw_private_reliability
+        cost = torch.nan_to_num(cost, nan=1.0, posinf=1.0, neginf=0.0)
+        cost = cost.masked_fill(~point_mask.unsqueeze(0), 1e4)
+
+        frame_feat = self._masked_frame_mean(st_tokens, point_mask)
+        frame_feat = self._safe_l2_normalize(frame_feat, dim=-1)
+        sim_frame = torch.matmul(text_norm, frame_feat.transpose(0, 1))
+        sim_frame = torch.nan_to_num(
+            sim_frame,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        tau_frame = max(
+            float(getattr(route_cfg, "UOT3D_TAU_FRAME", route_cfg.AFFINITY_TAU)),
+            1e-6,
+        )
+        prob_frame = self._masked_softmax_1d(
+            sim_frame,
+            valid_frame_mask.unsqueeze(0).expand(num_labels, temporal_dim),
+            dim=-1,
+            tau=tau_frame,
+        )
+
+        traj_feat = self._masked_traj_mean(st_tokens, point_mask)
+        traj_feat = self._safe_l2_normalize(traj_feat, dim=-1)
+        sim_traj = torch.matmul(text_norm, traj_feat.transpose(0, 1))
+        sim_traj = torch.nan_to_num(
+            sim_traj,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        tau_traj = max(
+            float(getattr(route_cfg, "UOT3D_TAU_TRAJ", route_cfg.AFFINITY_TAU)),
+            1e-6,
+        )
+        prob_traj = self._masked_softmax_1d(
+            sim_traj,
+            valid_traj_mask.unsqueeze(0).expand(num_labels, num_points),
+            dim=-1,
+            tau=tau_traj,
+        )
+
+        tau_vis = max(
+            float(getattr(route_cfg, "UOT3D_TAU_VIS", route_cfg.AFFINITY_TAU)),
+            1e-6,
+        )
+        sim_flat = sim.reshape(num_labels, temporal_dim * num_points)
+        flat_mask = point_mask.reshape(-1)
+        prob_vis_flat = self._masked_softmax_1d(
+            sim_flat,
+            flat_mask.unsqueeze(0).expand(num_labels, temporal_dim * num_points),
+            dim=-1,
+            tau=tau_vis,
+        )
+        prob_vis = prob_vis_flat.view(num_labels, temporal_dim, num_points)
+        overall_vis_cap = prob_vis.mean(dim=0)
+        overall_vis_cap = overall_vis_cap * point_mask.to(overall_vis_cap.dtype)
+
+        label_cap = max(float(getattr(route_cfg, "QUERY_PARTIAL_LABEL_CAP", 1.0)), 0.0)
+        vis_cap = max(float(getattr(route_cfg, "QUERY_PARTIAL_VIS_CAP", 1.0)), 0.0)
+        gamma = self._solve_query_partial_3d_uot(
+            cost=cost,
+            frame_cap=label_cap * prob_frame,
+            traj_cap=label_cap * prob_traj,
+            vis_cap=vis_cap * overall_vis_cap,
+            valid_mask=point_mask,
+        )
+        gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
+        st_transport = gamma.index_select(0, target_label_indices)
+        return {
+            "st_transport": st_transport,
+            "transport_mass": st_transport.sum(dim=(1, 2)),
+            "sim": sim,
+            "cost": cost,
+            "cmw_private_reliability": cmw_private_reliability,
+            "prob_frame": prob_frame,
+            "prob_traj": prob_traj,
+            "prob_vis": prob_vis,
+            "vis_cap": vis_cap * overall_vis_cap,
+            "target_label_indices": target_label_indices,
+            "label_axis_global_labels": label_axis_global_labels,
+        }
+
+    def _build_query_partial_support_prototypes(
+        self,
+        value_tokens,
+        point_mask,
+        support_mask,
+        episode_positive_labels,
+        route_aux=None,
+    ):
+        """Build one support prototype per episode label for query-side routing."""
+        num_labels = episode_positive_labels.shape[1]
+        support_prototypes = value_tokens.new_zeros(num_labels, value_tokens.shape[-1])
+
+        if (
+            isinstance(route_aux, dict)
+            and "support_conditioned_patch_tokens" in route_aux
+            and "support_branch_class_indices" in route_aux
+        ):
+            branch_tokens = route_aux["support_conditioned_patch_tokens"]
+            branch_class_indices = route_aux["support_branch_class_indices"].long()
+            for class_idx in range(num_labels):
+                class_mask = branch_class_indices == class_idx
+                if class_mask.any():
+                    support_prototypes[class_idx] = branch_tokens[class_mask].mean(
+                        dim=(0, 1, 2)
+                    )
+
+        support_value_tokens = value_tokens[support_mask]
+        support_point_mask = point_mask[support_mask]
+        support_targets = episode_positive_labels[support_mask]
+        for class_idx in range(num_labels):
+            if float(support_prototypes[class_idx].abs().sum().item()) > 0.0:
+                continue
+            class_mask = support_targets[:, class_idx].bool()
+            if class_mask.any():
+                pooled = self._masked_space_time_mean(
+                    support_value_tokens[class_mask],
+                    support_point_mask[class_mask],
+                )
+                support_prototypes[class_idx] = pooled.mean(dim=0)
+
+        return torch.nan_to_num(
+            support_prototypes,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    def _compute_query_partial_diag_logits(
+        self,
+        query_prototypes,
+        support_prototypes,
+        query_mass,
+    ):
+        """Map query/support prototypes to diagonal multi-label logits."""
+        query_norm = self._safe_l2_normalize(query_prototypes, dim=-1)
+        support_norm = self._safe_l2_normalize(support_prototypes, dim=-1)
+        query_mass = torch.nan_to_num(
+            query_mass.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        sim_matrix = torch.einsum("qkc,mc->qkm", query_norm, support_norm)
+        sim_matrix = torch.nan_to_num(
+            sim_matrix,
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        ).clamp(-1.0, 1.0)
+        diag_sim = sim_matrix.diagonal(dim1=1, dim2=2)
+        alpha = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_ALPHA", 10.0))
+        beta = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BETA", 1.0))
+        bias = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BIAS", -2.0))
+        logits = alpha * diag_sim + beta * query_mass + bias
+        logits = torch.nan_to_num(logits, nan=bias, posinf=1e4, neginf=-1e4)
+        return logits, sim_matrix
+
+    def _build_query_partial_q2s_aux(
+        self,
+        value_tokens,
+        metadata,
+        route_aux=None,
+        intra_tokens=None,
+        inter_tokens=None,
+    ):
+        """Build query-side partial 3D-UOT prototypes and q2s logits."""
+        support_mask = metadata["support_mask"].to(device=value_tokens.device).bool()
+        query_mask = ~support_mask
+        if not query_mask.any():
+            return None
+
+        point_mask = (
+            metadata["pred_query_mask"]
+            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
+            else metadata["pred_visibility"]
+        ).to(device=value_tokens.device).bool()
+        episode_positive_labels = metadata["episode_positive_labels"].to(
+            device=value_tokens.device,
+        ).bool()
+        episode_class_ids = metadata["episode_class_ids"].to(
+            device=value_tokens.device,
+        ).long()
+        episode_class_ids = (
+            episode_class_ids[0]
+            if episode_class_ids.ndim == 2
+            else episode_class_ids
+        )
+
+        raw_positive_labels = metadata.get("raw_positive_labels")
+        if raw_positive_labels is None:
+            max_episode_id = (
+                int(episode_class_ids.max().item()) + 1
+                if episode_class_ids.numel() > 0
+                else 0
+            )
+            fallback_num_classes = (
+                int(self.num_classes)
+                if isinstance(self.num_classes, int)
+                else max_episode_id
+            )
+            fallback_num_classes = max(fallback_num_classes, max_episode_id)
+            raw_positive_labels = value_tokens.new_zeros(
+                value_tokens.shape[0],
+                fallback_num_classes,
+            )
+            raw_positive_labels[:, episode_class_ids] = episode_positive_labels.to(
+                dtype=raw_positive_labels.dtype,
+            )
+        raw_positive_labels = raw_positive_labels.to(
+            device=value_tokens.device,
+        ).bool()
+        raw_positive_labels = raw_positive_labels.reshape(value_tokens.shape[0], -1)
+
+        label_axis_global_labels, target_label_indices = (
+            self._build_query_partial_label_axis(
+                episode_class_ids,
+                raw_positive_labels,
+                support_mask,
+            )
+        )
+        if target_label_indices.numel() == 0:
+            return None
+
+        label_axis_text = self._get_pot_label_text_features(
+            label_axis_global_labels,
+            value_tokens.dtype,
+        )
+        support_prototypes = self._build_query_partial_support_prototypes(
+            value_tokens,
+            point_mask,
+            support_mask,
+            episode_positive_labels,
+            route_aux=route_aux,
+        )
+
+        query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
+        query_prototypes = []
+        query_masses = []
+        for sample_idx in query_indices.tolist():
+            sample_tokens = value_tokens[sample_idx]
+            sample_point_mask = point_mask[sample_idx]
+            sample_intra_tokens = (
+                intra_tokens[sample_idx]
+                if torch.is_tensor(intra_tokens)
+                else None
+            )
+            sample_inter_tokens = (
+                inter_tokens[sample_idx]
+                if torch.is_tensor(inter_tokens)
+                else None
+            )
+            transport_stats = self._compute_query_partial_3d_transport(
+                sample_tokens,
+                sample_point_mask,
+                label_axis_text,
+                label_axis_global_labels,
+                target_label_indices,
+                support_mask=support_mask,
+                episode_positive_labels=episode_positive_labels,
+                raw_positive_labels=raw_positive_labels,
+                intra_tokens=sample_intra_tokens,
+                inter_tokens=sample_inter_tokens,
+            )
+            sample_prototypes = []
+            for class_idx in range(target_label_indices.shape[0]):
+                sample_prototypes.append(
+                    self._aggregate_weighted_query_tokens(
+                        sample_tokens,
+                        sample_point_mask,
+                        transport_stats["st_transport"][class_idx],
+                    ).unsqueeze(0)
+                )
+            query_prototypes.append(torch.cat(sample_prototypes, dim=0).unsqueeze(0))
+            query_masses.append(transport_stats["transport_mass"].unsqueeze(0))
+
+        if not query_prototypes:
+            return None
+
+        query_prototypes = torch.cat(query_prototypes, dim=0)
+        query_masses = torch.cat(query_masses, dim=0)
+        q2s_logits, sim_matrix = self._compute_query_partial_diag_logits(
+            query_prototypes,
+            support_prototypes,
+            query_masses,
+        )
+        diag_similarity = sim_matrix.diagonal(dim1=1, dim2=2)
+        alpha = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_ALPHA", 10.0))
+        beta = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BETA", 1.0))
+        bias = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BIAS", -2.0))
+        return {
+            "query_partial_q2s_logits": q2s_logits.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_query_prototypes": query_prototypes.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_support_prototypes": support_prototypes.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_transport_mass": query_masses.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_diag_similarity": diag_similarity.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_alpha_sim_term": (alpha * diag_similarity).to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_beta_mass_term": (beta * query_masses).to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_bias_term": torch.full_like(
+                q2s_logits,
+                fill_value=bias,
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_query_sample_indices": query_indices.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+            "query_partial_label_axis_global_labels": label_axis_global_labels.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+            "query_partial_target_label_indices": target_label_indices.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+        }
+
     def _build_pot_support_prototypes(
         self,
         app_tokens,
@@ -2575,30 +4110,95 @@ class Pointformer(nn.Module):
         metadata,
     ):
         """Build support prototypes with target-conditioned 3D-UOT routing."""
-        del app_tokens, intra_tokens, inter_tokens
+        del app_tokens
         support_mask = metadata['support_mask'].bool()
-        episode_positive_labels = metadata['episode_positive_labels'].bool()
+        episode_positive_labels = metadata['episode_positive_labels'].to(
+            device=value_tokens.device,
+        ).bool()
         base_pt_mask = (
             metadata['pred_query_mask']
             if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
             else metadata['pred_visibility']
         ).bool()
-        episode_class_ids = metadata['episode_class_ids'].long()
+        episode_class_ids = metadata['episode_class_ids'].to(
+            device=value_tokens.device,
+        ).long()
         episode_class_ids = (
             episode_class_ids[0]
             if episode_class_ids.ndim == 2
             else episode_class_ids
         )
-        episode_label_text = self._get_pot_label_text_features(
-            episode_class_ids,
+
+        raw_positive_labels = metadata.get('raw_positive_labels')
+        if raw_positive_labels is None:
+            max_episode_id = (
+                int(episode_class_ids.max().item()) + 1
+                if episode_class_ids.numel() > 0
+                else 0
+            )
+            fallback_num_classes = (
+                int(self.num_classes)
+                if isinstance(self.num_classes, int)
+                else max_episode_id
+            )
+            fallback_num_classes = max(fallback_num_classes, max_episode_id)
+            raw_positive_labels = value_tokens.new_zeros(
+                value_tokens.shape[0],
+                fallback_num_classes,
+            )
+            raw_positive_labels[:, episode_class_ids] = episode_positive_labels.to(
+                dtype=raw_positive_labels.dtype,
+            )
+        raw_positive_labels = raw_positive_labels.to(
+            device=value_tokens.device,
+        ).bool()
+        raw_positive_labels = raw_positive_labels.view(value_tokens.shape[0], -1)
+
+        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
+        support_raw_positive_labels = raw_positive_labels.index_select(
+            0,
+            support_indices.to(device=value_tokens.device),
+        )
+        raw_label_union = torch.nonzero(
+            support_raw_positive_labels.any(dim=0),
+            as_tuple=False,
+        ).flatten()
+        if raw_label_union.numel() > 0:
+            label_text_class_ids = torch.unique(
+                torch.cat([episode_class_ids, raw_label_union.to(episode_class_ids.device)])
+            )
+        else:
+            label_text_class_ids = episode_class_ids
+        label_text_class_ids = label_text_class_ids.to(
+            device=value_tokens.device,
+            dtype=torch.long,
+        )
+        label_text_features = self._get_pot_label_text_features(
+            label_text_class_ids,
             value_tokens.dtype,
+        )
+        text_lookup_size = raw_positive_labels.shape[1]
+        if label_text_class_ids.numel() > 0:
+            text_lookup_size = max(
+                int(text_lookup_size),
+                int(label_text_class_ids.max().item()) + 1,
+            )
+        global_to_text_index = torch.full(
+            (text_lookup_size,),
+            -1,
+            device=value_tokens.device,
+            dtype=torch.long,
+        )
+        global_to_text_index[label_text_class_ids] = torch.arange(
+            label_text_class_ids.numel(),
+            device=value_tokens.device,
+            dtype=torch.long,
         )
 
         branch_tokens = []
         branch_weights = []
         branch_class_indices = []
         branch_sample_indices = []
-        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
         log_pot_debug = self._should_log_pot_debug()
         debug_max_samples = max(
             int(getattr(self.pot_route_cfg, "DEBUG_MAX_SAMPLES_PER_CALL", 2)),
@@ -2607,11 +4207,34 @@ class Pointformer(nn.Module):
         debug_topk = max(int(getattr(self.pot_route_cfg, "DEBUG_TOPK", 8)), 1)
         debug_records_this_call = 0
         for sample_idx in support_indices.tolist():
-            sample_positive_labels = torch.nonzero(
+            sample_episode_positive_labels = torch.nonzero(
                 episode_positive_labels[sample_idx],
                 as_tuple=False,
             ).flatten()
-            if sample_positive_labels.numel() == 0:
+            label_axis_global_labels = torch.nonzero(
+                raw_positive_labels[sample_idx],
+                as_tuple=False,
+            ).flatten().long()
+            if label_axis_global_labels.numel() == 0:
+                label_axis_global_labels = episode_class_ids.index_select(
+                    0,
+                    sample_episode_positive_labels,
+                )
+            if label_axis_global_labels.numel() == 0:
+                continue
+
+            label_axis_global_labels = label_axis_global_labels.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            )
+            axis_episode_match = (
+                label_axis_global_labels[:, None] == episode_class_ids[None, :]
+            )
+            label_axis_proto_indices, proto_episode_labels = torch.nonzero(
+                axis_episode_match,
+                as_tuple=True,
+            )
+            if proto_episode_labels.numel() == 0:
                 continue
 
             sample_value_tokens = value_tokens[sample_idx]
@@ -2620,13 +4243,38 @@ class Pointformer(nn.Module):
                 sample_value_tokens.unsqueeze(0),
                 sample_point_mask.unsqueeze(0),
             ).squeeze(0)
-            positive_text = episode_label_text.index_select(
+
+            text_indices = global_to_text_index.index_select(
                 0,
-                sample_positive_labels,
+                label_axis_global_labels,
             )
-            sample_global_labels = episode_class_ids.index_select(
+            valid_text = text_indices >= 0
+            if not valid_text.all():
+                label_axis_global_labels = label_axis_global_labels[valid_text]
+                text_indices = text_indices[valid_text]
+                axis_episode_match = (
+                    label_axis_global_labels[:, None] == episode_class_ids[None, :]
+                )
+                label_axis_proto_indices, proto_episode_labels = torch.nonzero(
+                    axis_episode_match,
+                    as_tuple=True,
+                )
+                if proto_episode_labels.numel() == 0:
+                    continue
+
+            positive_text = label_text_features.index_select(
                 0,
-                sample_positive_labels,
+                text_indices,
+            )
+            sample_intra_tokens = (
+                intra_tokens[sample_idx]
+                if torch.is_tensor(intra_tokens)
+                else None
+            )
+            sample_inter_tokens = (
+                inter_tokens[sample_idx]
+                if torch.is_tensor(inter_tokens)
+                else None
             )
             debug_this_sample = (
                 log_pot_debug
@@ -2637,13 +4285,23 @@ class Pointformer(nn.Module):
                 sample_point_mask,
                 support_global,
                 positive_text,
+                intra_tokens=sample_intra_tokens,
+                inter_tokens=sample_inter_tokens,
+                episode_positive_labels=episode_positive_labels,
+                support_mask=support_mask,
+                sample_positive_labels=label_axis_global_labels,
+                episode_label_text=label_text_features,
+                raw_positive_labels=raw_positive_labels,
                 return_debug=debug_this_sample,
+                target_label_indices=label_axis_proto_indices,
             )
             st_transport = joint_stats["st_transport"]
             debug_branch_summaries = []
 
-            for branch_idx, positive_label in enumerate(sample_positive_labels):
-                st_weights = st_transport[branch_idx]
+            for target_output_idx, (label_axis_idx, proto_episode_label) in enumerate(
+                zip(label_axis_proto_indices, proto_episode_labels)
+            ):
+                st_weights = st_transport[target_output_idx]
                 st_weights = st_weights * sample_point_mask.to(st_weights.dtype)
                 weight_sum = st_weights.sum()
                 if float(weight_sum.item()) <= 0.0:
@@ -2663,13 +4321,16 @@ class Pointformer(nn.Module):
                 )
                 branch_tokens.append(sample_proto.unsqueeze(1))
                 branch_weights.append(st_weights.reshape(-1))
-                branch_class_indices.append(positive_label.view(1))
+                branch_class_indices.append(proto_episode_label.view(1))
                 branch_sample_indices.append(sample_idx)
                 if debug_this_sample:
+                    global_class_id = label_axis_global_labels[label_axis_idx]
                     debug_branch_summaries.append({
-                        "target_idx": int(branch_idx),
-                        "episode_class_idx": int(positive_label.detach().cpu().item()),
-                        "global_class_id": int(sample_global_labels[branch_idx].detach().cpu().item()),
+                        "target_idx": int(label_axis_idx.detach().cpu().item()),
+                        "target_output_idx": int(target_output_idx),
+                        "label_axis_idx": int(label_axis_idx.detach().cpu().item()),
+                        "episode_class_idx": int(proto_episode_label.detach().cpu().item()),
+                        "global_class_id": int(global_class_id.detach().cpu().item()),
                         "normalized_weight_summary": self._pot_debug_weight_summary(
                             st_weights.reshape(-1),
                             sample_point_mask.reshape(-1),
@@ -2679,33 +4340,93 @@ class Pointformer(nn.Module):
                         "top_tokens": self._pot_debug_top_st_tokens(
                             st_weights,
                             sample_point_mask,
-                            sim=joint_stats["sim"][branch_idx],
+                            sim=joint_stats["sim"][label_axis_idx],
                             topk=debug_topk,
                         ),
                     })
 
             if debug_this_sample and "debug" in joint_stats:
-                global_ids = [
-                    int(class_id)
-                    for class_id in sample_global_labels.detach().cpu().tolist()
+                label_axis_episode_indices = torch.full(
+                    (label_axis_global_labels.numel(),),
+                    -1,
+                    device=value_tokens.device,
+                    dtype=torch.long,
+                )
+                label_axis_episode_indices[label_axis_proto_indices] = proto_episode_labels
+                proto_global_labels = label_axis_global_labels.index_select(
+                    0,
+                    label_axis_proto_indices,
+                )
+                auxiliary_global_labels = label_axis_global_labels[
+                    label_axis_episode_indices < 0
                 ]
-                label_names = [
+
+                label_axis_global_ids = [
+                    int(class_id)
+                    for class_id in label_axis_global_labels.detach().cpu().tolist()
+                ]
+                label_axis_names = [
                     (
                         self.atomic_label_names[class_id]
                         if 0 <= class_id < len(self.atomic_label_names)
                         else str(class_id)
                     )
-                    for class_id in global_ids
+                    for class_id in label_axis_global_ids
+                ]
+                proto_global_ids = [
+                    int(class_id)
+                    for class_id in proto_global_labels.detach().cpu().tolist()
+                ]
+                proto_label_names = [
+                    (
+                        self.atomic_label_names[class_id]
+                        if 0 <= class_id < len(self.atomic_label_names)
+                        else str(class_id)
+                    )
+                    for class_id in proto_global_ids
+                ]
+                auxiliary_global_ids = [
+                    int(class_id)
+                    for class_id in auxiliary_global_labels.detach().cpu().tolist()
+                ]
+                auxiliary_label_names = [
+                    (
+                        self.atomic_label_names[class_id]
+                        if 0 <= class_id < len(self.atomic_label_names)
+                        else str(class_id)
+                    )
+                    for class_id in auxiliary_global_ids
                 ]
                 self._write_pot_debug_record({
-                    "debug_type": "target_conditioned_3d_uot",
+                    "debug_type": joint_stats["debug"].get(
+                        "debug_type",
+                        "target_conditioned_3d_uot",
+                    ),
                     "sample_idx": int(sample_idx),
                     "positive_episode_class_indices": [
                         int(class_idx)
-                        for class_idx in sample_positive_labels.detach().cpu().tolist()
+                        for class_idx in label_axis_episode_indices.detach().cpu().tolist()
                     ],
-                    "positive_global_class_ids": global_ids,
-                    "positive_label_names": label_names,
+                    "positive_global_class_ids": label_axis_global_ids,
+                    "positive_label_names": label_axis_names,
+                    "label_axis_global_class_ids": label_axis_global_ids,
+                    "label_axis_episode_class_indices": [
+                        int(class_idx)
+                        for class_idx in label_axis_episode_indices.detach().cpu().tolist()
+                    ],
+                    "label_axis_label_names": label_axis_names,
+                    "prototype_episode_class_indices": [
+                        int(class_idx)
+                        for class_idx in proto_episode_labels.detach().cpu().tolist()
+                    ],
+                    "target_label_axis_indices": [
+                        int(class_idx)
+                        for class_idx in label_axis_proto_indices.detach().cpu().tolist()
+                    ],
+                    "prototype_global_class_ids": proto_global_ids,
+                    "prototype_label_names": proto_label_names,
+                    "auxiliary_global_class_ids": auxiliary_global_ids,
+                    "auxiliary_label_names": auxiliary_label_names,
                     "support_valid_points": int(sample_point_mask.sum().item()),
                     "uot3d": joint_stats["debug"],
                     "branches": debug_branch_summaries,
@@ -3020,6 +4741,7 @@ class Pointformer(nn.Module):
 
         cls_x, patch_x = self.pt_forward(fused_feat, metadata)
         if 'support_mask' in metadata and 'episode_positive_labels' in metadata:
+            route_aux = None
             if self.use_text_alignment:
                 text_align_aux = self._build_support_text_alignment(
                     patch_x,
@@ -3037,6 +4759,16 @@ class Pointformer(nn.Module):
                 )
                 if route_aux is not None:
                     few_shot_aux.update(route_aux)
+            if self.use_query_partial_q2s:
+                query_partial_aux = self._build_query_partial_q2s_aux(
+                    patch_x,
+                    metadata,
+                    route_aux=route_aux,
+                    intra_tokens=intra_feat,
+                    inter_tokens=inter_feat,
+                )
+                if query_partial_aux is not None:
+                    few_shot_aux.update(query_partial_aux)
         if not few_shot_aux:
             few_shot_aux = None
         # x = self.forward_features(x, metadata) # [BS, d]
