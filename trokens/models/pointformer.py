@@ -1343,6 +1343,169 @@ class Pointformer(nn.Module):
 
         return gamma
 
+    def _solve_avg_3d_uot_batched(
+        self,
+        cost,
+        prior_frame,
+        prior_traj,
+        prior_vis,
+        valid_mask,
+    ):
+        """
+        Batched target-conditioned 3D-UOT.
+
+        cost: [B,R,T,N]
+        prior_frame: [B,R,T]
+        prior_traj:  [B,R,N]
+        prior_vis:   [B,T,N]
+        valid_mask:  [T,N] or [B,T,N]
+        return gamma: [B,R,T,N]
+        """
+        route_cfg = self.pot_route_cfg
+
+        entropic_eps = max(
+            float(getattr(route_cfg, "UOT3D_ENTROPIC_EPS", route_cfg.ENTROPIC_EPS)),
+            1e-6,
+        )
+        max_iters = max(int(route_cfg.MAX_ITERS), 1)
+        stop_tol = max(float(route_cfg.STOP_TOL), 0.0)
+
+        alpha_frame = float(getattr(
+            route_cfg,
+            "UOT3D_RHO_FRAME",
+            getattr(route_cfg, "UOT3D_RHO_LT", 0.3),
+        ))
+        alpha_traj = float(getattr(
+            route_cfg,
+            "UOT3D_RHO_TRAJ",
+            getattr(route_cfg, "UOT3D_RHO_LN", 0.5),
+        ))
+        alpha_vis = float(getattr(
+            route_cfg,
+            "UOT3D_RHO_VIS",
+            getattr(route_cfg, "UOT3D_RHO_TN", 0.5),
+        ))
+
+        alpha_frame = min(max(alpha_frame, 0.0), 1.0)
+        alpha_traj = min(max(alpha_traj, 0.0), 1.0)
+        alpha_vis = min(max(alpha_vis, 0.0), 1.0)
+
+        cost = torch.nan_to_num(cost.float(), nan=1e4, posinf=1e4, neginf=0.0)
+        prior_frame = torch.nan_to_num(
+            prior_frame.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        prior_traj = torch.nan_to_num(
+            prior_traj.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        prior_vis = torch.nan_to_num(
+            prior_vis.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+
+        if cost.numel() == 0:
+            return cost.new_zeros(cost.shape)
+
+        valid_mask = valid_mask.to(device=cost.device).bool()
+        if valid_mask.ndim == 2:
+            valid4 = valid_mask.unsqueeze(0).unsqueeze(1).expand_as(cost)
+        elif valid_mask.ndim == 3:
+            valid4 = valid_mask.unsqueeze(1).expand_as(cost)
+        else:
+            raise ValueError("valid_mask must have shape [T,N] or [B,T,N].")
+        valid_cost = cost.masked_fill(~valid4, 1e4)
+
+        row_min = valid_cost.flatten(2).amin(dim=2).view(
+            cost.shape[0],
+            cost.shape[1],
+            1,
+            1,
+        )
+        row_min = torch.where(
+            torch.isfinite(row_min),
+            row_min,
+            torch.zeros_like(row_min),
+        )
+        shifted_cost = valid_cost - row_min
+
+        gamma = torch.exp((-shifted_cost / entropic_eps).clamp(min=-80.0, max=0.0))
+        gamma = torch.where(valid4, gamma, torch.zeros_like(gamma))
+
+        gamma_sum = gamma.sum(dim=(1, 2, 3), keepdim=True)
+        if not bool((gamma_sum > 0.0).any().item()):
+            return cost.new_zeros(cost.shape)
+
+        target_mass = prior_vis.sum(dim=(1, 2))
+        frame_mass = prior_frame.sum(dim=(1, 2))
+        traj_mass = prior_traj.sum(dim=(1, 2))
+        target_mass = torch.where(target_mass > 0.0, target_mass, frame_mass)
+        target_mass = torch.where(target_mass > 0.0, target_mass, traj_mass)
+        target_mass = torch.where(
+            target_mass > 0.0,
+            target_mass,
+            torch.ones_like(target_mass),
+        )
+        gamma = torch.where(
+            gamma_sum > 0.0,
+            gamma * (target_mass.view(-1, 1, 1, 1) / gamma_sum.clamp_min(1e-12)),
+            torch.zeros_like(gamma),
+        )
+
+        for _ in range(max_iters):
+            prev_gamma = gamma
+
+            cur_frame = gamma.sum(dim=3)
+            scale_frame = (
+                prior_frame / cur_frame.clamp_min(1e-12)
+            ).clamp_min(0.0).pow(alpha_frame)
+            scale_frame = torch.nan_to_num(
+                scale_frame,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            gamma = gamma * scale_frame.unsqueeze(3)
+
+            cur_traj = gamma.sum(dim=2)
+            scale_traj = (
+                prior_traj / cur_traj.clamp_min(1e-12)
+            ).clamp_min(0.0).pow(alpha_traj)
+            scale_traj = torch.nan_to_num(
+                scale_traj,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            gamma = gamma * scale_traj.unsqueeze(2)
+
+            cur_vis = gamma.sum(dim=1)
+            scale_vis = (
+                prior_vis / cur_vis.clamp_min(1e-12)
+            ).clamp_min(0.0).pow(alpha_vis)
+            scale_vis = torch.nan_to_num(
+                scale_vis,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            gamma = gamma * scale_vis.unsqueeze(1)
+
+            gamma = torch.where(valid4, gamma, torch.zeros_like(gamma))
+            gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
+
+            delta = torch.max(torch.abs(gamma - prev_gamma))
+            if float(delta.item()) <= stop_tol:
+                break
+
+        return gamma
+
     def _compute_avg_3d_uot_transport(
         self,
         st_tokens,
@@ -3472,45 +3635,16 @@ class Pointformer(nn.Module):
         raw_positive_labels,
         support_mask,
     ):
-        """Build query label rows from episode classes plus support raw-label union."""
+        """Build query rows from all episode candidates; query positives are unknown."""
+        del raw_positive_labels, support_mask
         device = episode_class_ids.device
         episode_class_ids = episode_class_ids.to(device=device, dtype=torch.long).flatten()
-        support_mask = support_mask.to(device=device).bool().flatten()
-        raw_positive_labels = raw_positive_labels.to(device=device).bool()
-        raw_positive_labels = raw_positive_labels.reshape(support_mask.shape[0], -1)
-
-        support_raw_labels = raw_positive_labels[support_mask]
-        if support_raw_labels.numel() > 0:
-            support_raw_union = torch.nonzero(
-                support_raw_labels.any(dim=0),
-                as_tuple=False,
-            ).flatten()
-        else:
-            support_raw_union = episode_class_ids.new_zeros(0)
-
-        if support_raw_union.numel() > 0:
-            label_axis_global_labels = torch.unique(
-                torch.cat([episode_class_ids, support_raw_union.to(device)])
-            )
-        else:
-            label_axis_global_labels = episode_class_ids
-        label_axis_global_labels = label_axis_global_labels.to(
+        target_label_indices = torch.arange(
+            episode_class_ids.numel(),
             device=device,
             dtype=torch.long,
         )
-
-        if episode_class_ids.numel() == 0 or label_axis_global_labels.numel() == 0:
-            return label_axis_global_labels, episode_class_ids.new_zeros(0)
-
-        episode_to_axis = (
-            episode_class_ids[:, None] == label_axis_global_labels[None, :]
-        )
-        valid_episode = episode_to_axis.any(dim=1)
-        if not valid_episode.all():
-            episode_class_ids = episode_class_ids[valid_episode]
-            episode_to_axis = episode_to_axis[valid_episode]
-        target_label_indices = episode_to_axis.to(torch.long).argmax(dim=1)
-        return label_axis_global_labels, target_label_indices.to(dtype=torch.long)
+        return episode_class_ids, target_label_indices
 
     def _solve_query_partial_3d_uot(
         self,
@@ -3553,53 +3687,107 @@ class Pointformer(nn.Module):
             return cost.new_zeros(cost.shape)
 
         valid_mask = valid_mask.to(device=cost.device).bool()
-        valid3 = valid_mask.unsqueeze(0).expand_as(cost)
-        valid_cost = cost.masked_fill(~valid3, 1e4)
+        if cost.ndim == 3:
+            valid = valid_mask.unsqueeze(0).expand_as(cost)
+        elif cost.ndim == 4:
+            if valid_mask.ndim == 2:
+                valid = valid_mask.unsqueeze(0).unsqueeze(1).expand_as(cost)
+            elif valid_mask.ndim == 3:
+                valid = valid_mask.unsqueeze(1).expand_as(cost)
+            else:
+                raise ValueError("valid_mask must have shape [T,N] or [B,T,N].")
+            if frame_cap.ndim == 2:
+                frame_cap = frame_cap.unsqueeze(0).expand(cost.shape[0], -1, -1)
+            if traj_cap.ndim == 2:
+                traj_cap = traj_cap.unsqueeze(0).expand(cost.shape[0], -1, -1)
+            if vis_cap.ndim == 2:
+                vis_cap = vis_cap.unsqueeze(0).expand(cost.shape[0], -1, -1)
+        else:
+            raise ValueError("cost must have shape [R,T,N] or [B,R,T,N].")
+
+        valid_cost = cost.masked_fill(~valid, 1e4)
         gamma = torch.exp((-valid_cost / entropic_eps).clamp(min=-80.0, max=0.0))
-        gamma = torch.where(valid3, gamma, torch.zeros_like(gamma))
-        if float(gamma.sum().item()) <= 0.0:
+        gamma = torch.where(valid, gamma, torch.zeros_like(gamma))
+        if not bool((gamma.sum() > 0.0).item()):
             return cost.new_zeros(cost.shape)
 
         for _ in range(max_iters):
             prev_gamma = gamma
 
-            cur_frame = gamma.sum(dim=2)
-            scale_frame = torch.minimum(
-                frame_cap / cur_frame.clamp_min(1e-12),
-                torch.ones_like(cur_frame),
-            )
-            gamma = gamma * torch.nan_to_num(
-                scale_frame,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).unsqueeze(2)
+            if cost.ndim == 3:
+                cur_frame = gamma.sum(dim=2)
+                scale_frame = torch.minimum(
+                    frame_cap / cur_frame.clamp_min(1e-12),
+                    torch.ones_like(cur_frame),
+                )
+                gamma = gamma * torch.nan_to_num(
+                    scale_frame,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).unsqueeze(2)
 
-            cur_traj = gamma.sum(dim=1)
-            scale_traj = torch.minimum(
-                traj_cap / cur_traj.clamp_min(1e-12),
-                torch.ones_like(cur_traj),
-            )
-            gamma = gamma * torch.nan_to_num(
-                scale_traj,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).unsqueeze(1)
+                cur_traj = gamma.sum(dim=1)
+                scale_traj = torch.minimum(
+                    traj_cap / cur_traj.clamp_min(1e-12),
+                    torch.ones_like(cur_traj),
+                )
+                gamma = gamma * torch.nan_to_num(
+                    scale_traj,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).unsqueeze(1)
 
-            cur_vis = gamma.sum(dim=0)
-            scale_vis = torch.minimum(
-                vis_cap / cur_vis.clamp_min(1e-12),
-                torch.ones_like(cur_vis),
-            )
-            gamma = gamma * torch.nan_to_num(
-                scale_vis,
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            ).unsqueeze(0)
+                cur_vis = gamma.sum(dim=0)
+                scale_vis = torch.minimum(
+                    vis_cap / cur_vis.clamp_min(1e-12),
+                    torch.ones_like(cur_vis),
+                )
+                gamma = gamma * torch.nan_to_num(
+                    scale_vis,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).unsqueeze(0)
+            else:
+                cur_frame = gamma.sum(dim=3)
+                scale_frame = torch.minimum(
+                    frame_cap / cur_frame.clamp_min(1e-12),
+                    torch.ones_like(cur_frame),
+                )
+                gamma = gamma * torch.nan_to_num(
+                    scale_frame,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).unsqueeze(3)
 
-            gamma = torch.where(valid3, gamma, torch.zeros_like(gamma))
+                cur_traj = gamma.sum(dim=2)
+                scale_traj = torch.minimum(
+                    traj_cap / cur_traj.clamp_min(1e-12),
+                    torch.ones_like(cur_traj),
+                )
+                gamma = gamma * torch.nan_to_num(
+                    scale_traj,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).unsqueeze(2)
+
+                cur_vis = gamma.sum(dim=1)
+                scale_vis = torch.minimum(
+                    vis_cap / cur_vis.clamp_min(1e-12),
+                    torch.ones_like(cur_vis),
+                )
+                gamma = gamma * torch.nan_to_num(
+                    scale_vis,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).unsqueeze(1)
+
+            gamma = torch.where(valid, gamma, torch.zeros_like(gamma))
             gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
             delta = torch.max(torch.abs(gamma - prev_gamma))
             if float(delta.item()) <= stop_tol:
@@ -3620,8 +3808,35 @@ class Pointformer(nn.Module):
         intra_tokens=None,
         inter_tokens=None,
     ):
-        """Build query-side capped 3D-UOT over extended label-axis rows."""
+        """Build query-side capped 3D-UOT over episode candidate label rows."""
         route_cfg = self.pot_route_cfg
+
+        def _normalize_masked_map(score, mask):
+            score = torch.nan_to_num(
+                score.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            mask = mask.to(device=score.device).bool()
+            score = score * mask.to(score.dtype)
+            if float(score.sum().item()) <= 0.0:
+                score = mask.to(score.dtype)
+            return score / score.sum().clamp_min(1e-12)
+
+        def _normalize_masked_vector(score, mask):
+            score = torch.nan_to_num(
+                score.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            mask = mask.to(device=score.device).bool()
+            score = score * mask.to(score.dtype)
+            if float(score.sum().item()) <= 0.0:
+                score = mask.to(score.dtype)
+            return score / score.sum().clamp_min(1e-12)
+
         st_tokens = torch.nan_to_num(st_tokens, nan=0.0, posinf=0.0, neginf=0.0)
         label_axis_text = torch.nan_to_num(
             label_axis_text,
@@ -3670,10 +3885,20 @@ class Pointformer(nn.Module):
                 "transport_mass": st_tokens.new_zeros(num_targets),
                 "sim": empty_label,
                 "cost": empty_label,
+                "private_cost": empty_label,
+                "shared_cost": st_tokens.new_zeros(temporal_dim, num_points),
+                "cost_ext": st_tokens.new_zeros(num_labels + 1, temporal_dim, num_points),
+                "sharedness": st_tokens.new_zeros(temporal_dim, num_points),
+                "label_entropy": st_tokens.new_zeros(temporal_dim, num_points),
+                "semantic_strength": st_tokens.new_zeros(temporal_dim, num_points),
                 "cmw_private_reliability": empty_label,
                 "prob_frame": st_tokens.new_zeros(num_labels, temporal_dim),
                 "prob_traj": st_tokens.new_zeros(num_labels, num_points),
                 "prob_vis": empty_label,
+                "shared_transport": empty_target,
+                "shared_transport_mass": st_tokens.new_zeros(num_targets),
+                "target_vis_prior": empty_target,
+                "vis_prior": st_tokens.new_zeros(temporal_dim, num_points),
                 "vis_cap": st_tokens.new_zeros(temporal_dim, num_points),
                 "target_label_indices": target_label_indices,
                 "label_axis_global_labels": label_axis_global_labels,
@@ -3761,6 +3986,20 @@ class Pointformer(nn.Module):
         cost = 1.0 - cmw_private_reliability
         cost = torch.nan_to_num(cost, nan=1.0, posinf=1.0, neginf=0.0)
         cost = cost.masked_fill(~point_mask.unsqueeze(0), 1e4)
+        private_cost = cost
+        shared_cost = torch.nan_to_num(
+            1.0 - sharedness,
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        )
+        cost_ext = torch.cat(
+            [private_cost, shared_cost.unsqueeze(0)],
+            dim=0,
+        )
+        cost_ext = cost_ext.masked_fill(~point_mask.unsqueeze(0), 1e4)
+        cost_ext = torch.nan_to_num(cost_ext, nan=1e4, posinf=1e4, neginf=0.0)
+        cost = torch.nan_to_num(cost, nan=1e4, posinf=1e4, neginf=0.0)
 
         frame_feat = self._masked_frame_mean(st_tokens, point_mask)
         frame_feat = self._safe_l2_normalize(frame_feat, dim=-1)
@@ -3815,30 +4054,206 @@ class Pointformer(nn.Module):
             tau=tau_vis,
         )
         prob_vis = prob_vis_flat.view(num_labels, temporal_dim, num_points)
-        overall_vis_cap = prob_vis.mean(dim=0)
-        overall_vis_cap = overall_vis_cap * point_mask.to(overall_vis_cap.dtype)
 
+        query_global_norm = self._safe_l2_normalize(query_global, dim=-1)
+        base_mu_logit_scale = float(getattr(route_cfg, "MU_LOGIT_SCALE", 10.0))
+        mu_logit_scale = max(
+            float(getattr(route_cfg, "UOT3D_MU_LOGIT_SCALE", base_mu_logit_scale)),
+            1e-6,
+        )
+        mu_logits = mu_logit_scale * torch.matmul(text_norm, query_global_norm)
+        mu = torch.softmax(mu_logits, dim=0)
+        mu = torch.nan_to_num(mu, nan=0.0, posinf=0.0, neginf=0.0)
+        if float(mu.sum().item()) <= 0.0:
+            mu = torch.full_like(mu, 1.0 / max(float(num_labels), 1.0))
+
+        target_mix = float(getattr(route_cfg, "UOT3D_TARGET_MIX", 0.85))
+        target_mix = min(max(target_mix, 0.0), 1.0)
+        total_mass = max(float(getattr(route_cfg, "UOT3D_TOTAL_MASS", 1.0)), 1e-6)
+        shared_ratio = float(getattr(route_cfg, "UOT3D_SHARED_RATIO", 0.2))
+        shared_ratio = min(max(shared_ratio, 0.0), 0.5)
+        use_shared_transport = (
+            shared_enabled
+            and num_labels > 1
+            and shared_ratio > 0.0
+            and float(sharedness.sum().item()) > 0.0
+        )
+        if not use_shared_transport:
+            shared_ratio = 0.0
+        shared_total_mass = total_mass * shared_ratio
+        private_total_mass = total_mass - shared_total_mass
+        alpha_private_vis = float(getattr(route_cfg, "UOT3D_VIS_PRIVATE_WEIGHT", 1.0))
+        alpha_shared_vis = float(getattr(route_cfg, "UOT3D_VIS_SHARED_WEIGHT", 1.0))
         label_cap = max(float(getattr(route_cfg, "QUERY_PARTIAL_LABEL_CAP", 1.0)), 0.0)
-        vis_cap = max(float(getattr(route_cfg, "QUERY_PARTIAL_VIS_CAP", 1.0)), 0.0)
+        vis_cap_scale = max(float(getattr(route_cfg, "QUERY_PARTIAL_VIS_CAP", 1.0)), 0.0)
+
+        one_hot = st_tokens.new_zeros(num_targets, num_labels)
+        one_hot.scatter_(1, target_label_indices.view(-1, 1), 1.0)
+        label_mass_private = target_mix * one_hot + (1.0 - target_mix) * mu.unsqueeze(0)
+        label_mass_private = label_mass_private / label_mass_private.sum(
+            dim=1,
+            keepdim=True,
+        ).clamp_min(1e-12)
+
+        if use_shared_transport:
+            label_mass = private_total_mass * label_mass_private
+            frame_cap_private = label_cap * label_mass[:, :, None] * prob_frame.unsqueeze(0)
+            traj_cap_private = label_cap * label_mass[:, :, None] * prob_traj.unsqueeze(0)
+
+            shared_frame = sharedness.sum(dim=1)
+            shared_frame = _normalize_masked_vector(shared_frame, valid_frame_mask)
+            shared_frame = label_cap * shared_total_mass * shared_frame
+
+            shared_traj = sharedness.sum(dim=0)
+            shared_traj = _normalize_masked_vector(shared_traj, valid_traj_mask)
+            shared_traj = label_cap * shared_total_mass * shared_traj
+
+            frame_cap = torch.cat(
+                [
+                    frame_cap_private,
+                    shared_frame.view(1, 1, temporal_dim).expand(
+                        num_targets,
+                        1,
+                        temporal_dim,
+                    ),
+                ],
+                dim=1,
+            )
+            traj_cap = torch.cat(
+                [
+                    traj_cap_private,
+                    shared_traj.view(1, 1, num_points).expand(
+                        num_targets,
+                        1,
+                        num_points,
+                    ),
+                ],
+                dim=1,
+            )
+            token_score = (
+                alpha_private_vis * prob_vis.index_select(0, target_label_indices)
+                + alpha_shared_vis * sharedness.unsqueeze(0)
+            )
+            token_score = torch.nan_to_num(
+                token_score.float(),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).clamp_min(0.0)
+            token_score = token_score * point_mask.unsqueeze(0).to(token_score.dtype)
+            score_sum = token_score.sum(dim=(1, 2), keepdim=True)
+            fallback_score = point_mask.unsqueeze(0).to(token_score.dtype).expand_as(
+                token_score
+            )
+            token_score = torch.where(score_sum > 0.0, token_score, fallback_score)
+            vis_cap = vis_cap_scale * total_mass * token_score / token_score.sum(
+                dim=(1, 2),
+                keepdim=True,
+            ).clamp_min(1e-12)
+            solve_cost = cost_ext.unsqueeze(0).expand(
+                num_targets,
+                -1,
+                -1,
+                -1,
+            )
+        else:
+            label_mass = total_mass * label_mass_private
+            frame_cap = label_cap * label_mass[:, :, None] * prob_frame.unsqueeze(0)
+            traj_cap = label_cap * label_mass[:, :, None] * prob_traj.unsqueeze(0)
+            target_label_mass = label_mass.gather(
+                1,
+                target_label_indices.view(-1, 1),
+            ).view(num_targets, 1, 1)
+            vis_cap = vis_cap_scale * target_label_mass * prob_vis.index_select(
+                0,
+                target_label_indices,
+            )
+            solve_cost = cost.unsqueeze(0).expand(
+                num_targets,
+                -1,
+                -1,
+                -1,
+            )
+
         gamma = self._solve_query_partial_3d_uot(
-            cost=cost,
-            frame_cap=label_cap * prob_frame,
-            traj_cap=label_cap * prob_traj,
-            vis_cap=vis_cap * overall_vis_cap,
+            cost=solve_cost,
+            frame_cap=frame_cap,
+            traj_cap=traj_cap,
+            vis_cap=vis_cap,
             valid_mask=point_mask,
         )
         gamma = torch.nan_to_num(gamma, nan=0.0, posinf=0.0, neginf=0.0)
-        st_transport = gamma.index_select(0, target_label_indices)
+        batch_indices = torch.arange(
+            num_targets,
+            device=gamma.device,
+            dtype=torch.long,
+        )
+        st_transport = gamma[batch_indices, target_label_indices]
+        st_transport = st_transport * point_mask.unsqueeze(0).to(st_transport.dtype)
+        shared_transport = (
+            gamma[:, -1] * point_mask.unsqueeze(0).to(gamma.dtype)
+            if use_shared_transport
+            else st_transport.new_zeros(st_transport.shape)
+        )
+        transport_mass = st_transport.sum(dim=(1, 2))
+        shared_transport_mass = shared_transport.sum(dim=(1, 2))
+        target_vis_prior = vis_cap
+
+        st_transport = torch.nan_to_num(
+            st_transport,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        shared_transport = torch.nan_to_num(
+            shared_transport,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        transport_mass = torch.nan_to_num(
+            transport_mass,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        shared_transport_mass = torch.nan_to_num(
+            shared_transport_mass,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        target_vis_prior = torch.nan_to_num(
+            target_vis_prior,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        vis_prior = (
+            target_vis_prior.mean(dim=0)
+            if target_vis_prior.numel() > 0
+            else st_tokens.new_zeros(temporal_dim, num_points)
+        )
         return {
             "st_transport": st_transport,
-            "transport_mass": st_transport.sum(dim=(1, 2)),
+            "transport_mass": transport_mass,
             "sim": sim,
             "cost": cost,
+            "private_cost": private_cost,
+            "shared_cost": shared_cost,
+            "cost_ext": cost_ext,
+            "sharedness": sharedness,
+            "label_entropy": shared_components["label_entropy"],
+            "semantic_strength": shared_components["semantic_strength"],
             "cmw_private_reliability": cmw_private_reliability,
             "prob_frame": prob_frame,
             "prob_traj": prob_traj,
             "prob_vis": prob_vis,
-            "vis_cap": vis_cap * overall_vis_cap,
+            "shared_transport": shared_transport,
+            "shared_transport_mass": shared_transport_mass,
+            "target_vis_prior": target_vis_prior,
+            "vis_prior": vis_prior,
+            "vis_cap": vis_prior,
             "target_label_indices": target_label_indices,
             "label_axis_global_labels": label_axis_global_labels,
         }
