@@ -69,6 +69,11 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_LOGIT_ALPHA = 10.0
     cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_LOGIT_BETA = 1.0
     cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_LOGIT_BIAS = -2.0
+    # B' experiment: keep the temporal dim in query/support prototypes ([T,C]) and
+    # match them frame-to-frame (MoLo-style bidirectional nearest-neighbor cosine)
+    # instead of pooling to a single vector + diagonal cosine. Isolates the effect of
+    # "keep time + frame matching" while holding the decoupling fixed. Default off.
+    cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_FRAME_MATCH = False
     cfg.FEW_SHOT.POT_ROUTE.MAX_ITERS = 50
     cfg.FEW_SHOT.POT_ROUTE.STOP_TOL = 1e-4
     cfg.FEW_SHOT.POT_ROUTE.DEBUG_ENABLE = False

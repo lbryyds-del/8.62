@@ -4335,6 +4335,102 @@ class Pointformer(nn.Module):
         logits = torch.nan_to_num(logits, nan=bias, posinf=1e4, neginf=-1e4)
         return logits, sim_matrix
 
+    def _build_query_partial_support_prototypes_frame(
+        self,
+        value_tokens,
+        point_mask,
+        support_mask,
+        episode_positive_labels,
+        route_aux=None,
+    ):
+        """Frame-preserving support prototypes [num_labels, T, C] for B' matching."""
+        num_labels = episode_positive_labels.shape[1]
+        temporal_dim = value_tokens.shape[1]
+        feat_dim = value_tokens.shape[-1]
+        support_prototypes = value_tokens.new_zeros(num_labels, temporal_dim, feat_dim)
+        filled = [False] * num_labels
+
+        if (
+            isinstance(route_aux, dict)
+            and "support_conditioned_patch_tokens" in route_aux
+            and "support_branch_class_indices" in route_aux
+        ):
+            branch_tokens = route_aux["support_conditioned_patch_tokens"]
+            branch_class_indices = route_aux["support_branch_class_indices"].long()
+            for class_idx in range(num_labels):
+                class_mask = branch_class_indices == class_idx
+                if class_mask.any():
+                    # [n, T, 1, C] -> mean over branches -> [T, 1, C] -> [T, C]
+                    support_prototypes[class_idx] = branch_tokens[class_mask].mean(
+                        dim=0
+                    ).mean(dim=1)
+                    filled[class_idx] = True
+
+        support_value_tokens = value_tokens[support_mask]
+        support_point_mask = point_mask[support_mask]
+        support_targets = episode_positive_labels[support_mask]
+        for class_idx in range(num_labels):
+            if filled[class_idx]:
+                continue
+            class_mask = support_targets[:, class_idx].bool()
+            if class_mask.any():
+                sel = support_value_tokens[class_mask]
+                sel_mask = support_point_mask[class_mask]
+                per_sample = [
+                    self._masked_frame_mean(sel[i], sel_mask[i])
+                    for i in range(sel.shape[0])
+                ]
+                support_prototypes[class_idx] = torch.stack(per_sample, dim=0).mean(
+                    dim=0
+                )
+
+        return torch.nan_to_num(
+            support_prototypes,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
+    def _compute_query_partial_frame_logits(
+        self,
+        query_prototypes_frame,
+        support_prototypes_frame,
+        query_mass,
+    ):
+        """B': per-class frame nearest-neighbor matching, calibrated like C.
+
+        Keeps the temporal dim and matches frame-to-frame (each frame takes its
+        nearest frame in the other set), but expresses it as a *bounded*
+        bidirectional max-cosine similarity in [-1, 1] -- equivalent to the
+        min-distance form since ``max cos = 1 - min(1 - cos)`` -- and feeds it through
+        the same ``alpha * sim + beta * mass + bias`` as the pooled-cosine path. This
+        way B' differs from C only in geometry (frame-level vs pooled), with identical
+        BCE calibration (no early-training collapse from a mis-scaled logit).
+        """
+        # query_prototypes_frame: [Q, N, Tq, C]; support_prototypes_frame: [N, Ts, C]
+        query_norm = self._safe_l2_normalize(query_prototypes_frame, dim=-1)
+        support_norm = self._safe_l2_normalize(support_prototypes_frame, dim=-1)
+        # Diagonal per class: query class-n prototype vs support class-n prototype.
+        sim = torch.einsum("qntc,nsc->qnts", query_norm, support_norm)
+        sim = torch.nan_to_num(sim, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        # Bidirectional nearest-neighbor cosine (max over the other set's frames,
+        # averaged over this set's frames), both directions -> bounded [-1, 1].
+        bidir_sim = 0.5 * (
+            sim.max(dim=3)[0].mean(dim=2) + sim.max(dim=2)[0].mean(dim=2)
+        )
+        query_mass = torch.nan_to_num(
+            query_mass.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(0.0)
+        alpha = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_ALPHA", 10.0))
+        beta = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BETA", 1.0))
+        bias = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BIAS", -2.0))
+        logits = alpha * bidir_sim + beta * query_mass + bias
+        logits = torch.nan_to_num(logits, nan=bias, posinf=1e4, neginf=-1e4)
+        return logits, bidir_sim
+
     def _build_query_partial_q2s_aux(
         self,
         value_tokens,
@@ -4412,9 +4508,24 @@ class Pointformer(nn.Module):
             episode_positive_labels,
             route_aux=route_aux,
         )
+        frame_match = bool(
+            getattr(self.pot_route_cfg, "QUERY_PARTIAL_FRAME_MATCH", False)
+        )
+        support_prototypes_frame = None
+        if frame_match:
+            support_prototypes_frame = (
+                self._build_query_partial_support_prototypes_frame(
+                    value_tokens,
+                    point_mask,
+                    support_mask,
+                    episode_positive_labels,
+                    route_aux=route_aux,
+                )
+            )
 
         query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
         query_prototypes = []
+        query_prototypes_frame = []
         query_masses = []
         for sample_idx in query_indices.tolist():
             sample_tokens = value_tokens[sample_idx]
@@ -4442,15 +4553,29 @@ class Pointformer(nn.Module):
                 inter_tokens=sample_inter_tokens,
             )
             sample_prototypes = []
+            sample_prototypes_frame = []
             for class_idx in range(target_label_indices.shape[0]):
+                st_weights_c = transport_stats["st_transport"][class_idx]
                 sample_prototypes.append(
                     self._aggregate_weighted_query_tokens(
                         sample_tokens,
                         sample_point_mask,
-                        transport_stats["st_transport"][class_idx],
+                        st_weights_c,
                     ).unsqueeze(0)
                 )
+                if frame_match:
+                    sample_prototypes_frame.append(
+                        self._aggregate_weighted_st_support_tokens(
+                            sample_tokens,
+                            sample_point_mask,
+                            st_weights_c,
+                        ).unsqueeze(0)
+                    )
             query_prototypes.append(torch.cat(sample_prototypes, dim=0).unsqueeze(0))
+            if frame_match:
+                query_prototypes_frame.append(
+                    torch.cat(sample_prototypes_frame, dim=0).unsqueeze(0)
+                )
             query_masses.append(transport_stats["transport_mass"].unsqueeze(0))
 
         if not query_prototypes:
@@ -4458,12 +4583,20 @@ class Pointformer(nn.Module):
 
         query_prototypes = torch.cat(query_prototypes, dim=0)
         query_masses = torch.cat(query_masses, dim=0)
-        q2s_logits, sim_matrix = self._compute_query_partial_diag_logits(
-            query_prototypes,
-            support_prototypes,
-            query_masses,
-        )
-        diag_similarity = sim_matrix.diagonal(dim1=1, dim2=2)
+        if frame_match:
+            query_prototypes_frame = torch.cat(query_prototypes_frame, dim=0)
+            q2s_logits, diag_similarity = self._compute_query_partial_frame_logits(
+                query_prototypes_frame,
+                support_prototypes_frame,
+                query_masses,
+            )
+        else:
+            q2s_logits, sim_matrix = self._compute_query_partial_diag_logits(
+                query_prototypes,
+                support_prototypes,
+                query_masses,
+            )
+            diag_similarity = sim_matrix.diagonal(dim1=1, dim2=2)
         alpha = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_ALPHA", 10.0))
         beta = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BETA", 1.0))
         bias = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BIAS", -2.0))
