@@ -660,15 +660,22 @@ def test_query_partial_q2s_uses_episode_candidate_axis_and_ignores_query_labels(
     assert aux["query_partial_target_label_indices"].detach().cpu().tolist() == list(
         range(n_way)
     )
+    temporal_dim = value_tokens.shape[1]
     assert aux["query_partial_q2s_logits"].shape == (2, n_way)
-    assert aux["query_partial_query_prototypes"].shape == (2, n_way, feature_dim)
+    # Frame matching keeps the temporal dim: prototypes are [.., T, C].
+    assert aux["query_partial_query_prototypes"].shape == (
+        2,
+        n_way,
+        temporal_dim,
+        feature_dim,
+    )
     assert torch.allclose(
         aux["query_partial_support_prototypes"][0],
-        value_tokens.new_full((feature_dim,), 0.25),
+        value_tokens.new_full((temporal_dim, feature_dim), 0.25),
     )
     assert torch.allclose(
         aux["query_partial_support_prototypes"][2],
-        value_tokens.new_full((feature_dim,), 0.75),
+        value_tokens.new_full((temporal_dim, feature_dim), 0.75),
     )
     assert torch.allclose(
         aux["query_partial_q2s_logits"],

@@ -41,10 +41,9 @@ FEW_SHOT:
     QUERY_PARTIAL_LOGIT_ALPHA: 10.0
     QUERY_PARTIAL_LOGIT_BETA: 1.0
     QUERY_PARTIAL_LOGIT_BIAS: -2.0
-    QUERY_PARTIAL_FRAME_MATCH: True   # B'实验:保留时间维,查询/支持都[T,C],逐帧匹配
     MAX_ITERS: 50
     STOP_TOL: 1e-4
-    DEBUG_ENABLE: True
+    DEBUG_ENABLE: False          # 关掉:全部 debug 分支短路 -> 提速、消除进行性变慢
     DEBUG_FILE: pot_3d_uot_debug.jsonl
     DEBUG_LOG_PERIOD: 20
     DEBUG_MAX_RECORDS: 0
@@ -52,7 +51,7 @@ FEW_SHOT:
     DEBUG_TOPK: 8
     DEBUG_RANK0_ONLY: True
     DEBUG_RESET_FILE: True
-    DEBUG_SAVE_TOP_TOKENS: True
+    DEBUG_SAVE_TOP_TOKENS: False
   TEXT_ALIGN:
     ENABLE: True
     LOSS_WEIGHT: 0.1

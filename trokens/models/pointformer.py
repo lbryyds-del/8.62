@@ -25,55 +25,38 @@ from .build import MODEL_REGISTRY
 # pylint: disable=unused-argument,redefined-builtin
 
 class LabelAwareCMWCostNet(nn.Module):
-    """Label-aware CMW-style private reliability estimator."""
+    """Token-only CMW-style private reliability estimator (no label context)."""
 
     def __init__(
         self,
-        token_evidence_dim=6,
-        label_context_dim=7,
+        token_evidence_dim=4,
         hidden_dim=128,
-        num_families=5,
     ):
         super().__init__()
-        self.num_families = int(num_families)
         self.token_branch = nn.Sequential(
             nn.Linear(token_evidence_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.num_families),
-        )
-        self.label_branch = nn.Sequential(
-            nn.Linear(label_context_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, self.num_families),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(
         self,
         token_evidence,
-        label_context,
-        point_mask,
+        label_context=None,
+        point_mask=None,
         min_reliability=0.02,
     ):
-        """Return private reliability over the raw label axis."""
+        """Return per-token private reliability from token evidence only."""
+        del label_context
         token_evidence = torch.nan_to_num(
             token_evidence.float(),
             nan=0.0,
             posinf=1.0,
             neginf=0.0,
         ).clamp(0.0, 1.0)
-        label_context = torch.nan_to_num(
-            label_context.float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        ).clamp(0.0, 1.0)
-        candidate_reliability = torch.sigmoid(self.token_branch(token_evidence))
-        family_prob = torch.softmax(self.label_branch(label_context), dim=-1)
-        reliability = (
-            candidate_reliability * family_prob[:, None, None, :]
-        ).sum(dim=-1)
+        reliability = torch.sigmoid(self.token_branch(token_evidence)).squeeze(-1)
         min_reliability = max(float(min_reliability), 0.0)
         reliability = torch.nan_to_num(
             reliability,
@@ -83,10 +66,7 @@ class LabelAwareCMWCostNet(nn.Module):
         ).clamp(min=min_reliability, max=1.0)
         point_mask = point_mask.to(device=reliability.device).bool()
         reliability = reliability * point_mask.unsqueeze(0).to(reliability.dtype)
-        return reliability, {
-            "candidate_reliability": candidate_reliability,
-            "family_prob": family_prob,
-        }
+        return reliability, {}
 
 
 @MODEL_REGISTRY.register()
@@ -317,10 +297,8 @@ class Pointformer(nn.Module):
         self.use_cmw_cost = self.use_pot_support_route
         if self.use_cmw_cost:
             self.cmw_cost_net = LabelAwareCMWCostNet(
-                token_evidence_dim=6,
-                label_context_dim=7,
+                token_evidence_dim=4,
                 hidden_dim=int(getattr(self.pot_route_cfg, "CMW_COST_HIDDEN_DIM", 128)),
-                num_families=int(getattr(self.pot_route_cfg, "CMW_COST_NUM_FAMILIES", 5)),
             )
 
         # Initialize weights
@@ -1023,8 +1001,6 @@ class Pointformer(nn.Module):
             posinf=1.0,
             neginf=0.0,
         ).clamp(0.0, 1.0)
-        shared_map = sharedness.unsqueeze(0).expand_as(margin_score)
-        conflict_shared = torch.maximum(1.0 - margin_score, shared_map)
 
         motion_strength = self._normalized_token_norm(intra_tokens, point_mask).to(
             device=sim.device,
@@ -1045,22 +1021,18 @@ class Pointformer(nn.Module):
         valid3 = point_mask.unsqueeze(0).expand_as(sim01)
         text_sim = torch.where(valid3, sim01, torch.zeros_like(sim01))
         margin_score = torch.where(valid3, margin_score, torch.zeros_like(margin_score))
-        conflict_shared = torch.where(
-            valid3,
-            conflict_shared,
-            torch.zeros_like(conflict_shared),
-        )
+        # Collapse intra/inter motion into a single "is there motion" signal so the
+        # cost net only ingests four orthogonal cues: relevance, privateness,
+        # motion, foreground.
+        motion_strength = torch.maximum(motion_strength, inter_strength)
         motion_map = motion_strength.unsqueeze(0).expand_as(text_sim)
-        inter_map = inter_strength.unsqueeze(0).expand_as(text_sim)
         semantic_map = semantic_strength.unsqueeze(0).expand_as(text_sim)
 
         token_evidence = torch.stack(
             [
                 text_sim,
                 margin_score,
-                conflict_shared,
                 motion_map,
-                inter_map,
                 semantic_map,
             ],
             dim=-1,
@@ -1074,9 +1046,7 @@ class Pointformer(nn.Module):
         components = {
             "text_sim": text_sim,
             "margin_score": margin_score,
-            "conflict_shared": conflict_shared,
             "motion_strength": motion_strength,
-            "inter_strength": inter_strength,
             "semantic_strength": semantic_strength,
         }
         return token_evidence, components
@@ -1683,15 +1653,6 @@ class Pointformer(nn.Module):
                 device=st_tokens.device,
                 dtype=torch.long,
             )
-        cmw_label_context = self._build_cmw_label_context(
-            episode_positive_labels,
-            support_mask,
-            episode_label_text,
-            sample_positive_labels,
-            support_global,
-            positive_text,
-            raw_positive_labels=raw_positive_labels,
-        )
         cmw_min_reliability = float(getattr(
             route_cfg,
             "CMW_COST_MIN_RELIABILITY",
@@ -1699,7 +1660,7 @@ class Pointformer(nn.Module):
         ))
         cmw_private_reliability, cmw_aux = self.cmw_cost_net(
             cmw_token_evidence,
-            cmw_label_context,
+            None,
             point_mask,
             min_reliability=cmw_min_reliability,
         )
@@ -2252,246 +2213,7 @@ class Pointformer(nn.Module):
             })
         return result
 
-    def _solve_joint_relaxed_transport(
-        self,
-        cost,
-        row_mass,
-        col_cap,
-        force_total_mass=True,
-    ):
-        """Solve a joint relaxed POT problem over positive labels and trajectories."""
-        route_cfg = self.pot_route_cfg
-        entropic_eps = max(float(route_cfg.ENTROPIC_EPS), 1e-6)
-        max_iters = max(int(route_cfg.MAX_ITERS), 1)
-        stop_tol = max(float(route_cfg.STOP_TOL), 0.0)
 
-        cost = torch.nan_to_num(cost.float(), nan=1e4, posinf=1e4, neginf=0.0)
-        row_mass = torch.nan_to_num(
-            row_mass.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0)
-        col_cap = torch.nan_to_num(
-            col_cap.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0)
-        total_mass = row_mass.sum()
-        if cost.numel() == 0 or float(total_mass.item()) <= 0.0:
-            return cost.new_zeros(cost.shape)
-
-        cap_sum = col_cap.sum()
-        if float(cap_sum.item()) <= 0.0:
-            return cost.new_zeros(cost.shape)
-        if force_total_mass and float(cap_sum.item()) < float(total_mass.item()):
-            col_cap = col_cap * (total_mass / cap_sum.clamp_min(1e-12))
-
-        valid_entries = (
-            (cost < 1e3)
-            & (row_mass[:, None] > 0.0)
-            & (col_cap[None, :] > 0.0)
-        )
-        row_min = cost.masked_fill(~valid_entries, float("inf")).amin(dim=1)
-        has_valid_row = torch.isfinite(row_min)
-        if not has_valid_row.any():
-            return cost.new_zeros(cost.shape)
-
-        row_min = torch.where(has_valid_row, row_min, torch.zeros_like(row_min))
-        shifted_cost = cost - row_min[:, None]
-        log_kernel = (-shifted_cost / entropic_eps).clamp(min=-80.0, max=0.0)
-        transport = torch.where(
-            valid_entries,
-            torch.exp(log_kernel),
-            torch.zeros_like(cost),
-        )
-        if float(transport.sum().item()) <= 0.0:
-            return cost.new_zeros(cost.shape)
-        transport = transport * (
-            total_mass / transport.sum().clamp_min(1e-12)
-        )
-
-        for _ in range(max_iters):
-            prev_transport = transport
-
-            row_sum = prev_transport.sum(dim=1)
-            row_scale = torch.minimum(
-                row_mass / row_sum.clamp_min(1e-12),
-                torch.ones_like(row_sum),
-            )
-            transport = row_scale[:, None] * prev_transport
-
-            col_sum = transport.sum(dim=0)
-            col_scale = torch.minimum(
-                col_cap / col_sum.clamp_min(1e-12),
-                torch.ones_like(col_sum),
-            )
-            transport = transport * col_scale[None, :]
-
-            if force_total_mass:
-                current_mass = transport.sum()
-                if float(current_mass.item()) > 0.0:
-                    transport = transport * (
-                        total_mass / current_mass.clamp_min(1e-12)
-                    )
-            delta = torch.max(torch.abs(transport - prev_transport))
-            if float(delta.item()) <= stop_tol:
-                break
-
-        return torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _compute_joint_positive_traj_transport(
-        self,
-        st_tokens,
-        point_mask,
-        support_global,
-        positive_text,
-    ):
-        """Solve positive-label POT over full trajectories, then refine over time."""
-        route_cfg = self.pot_route_cfg
-        st_tokens = torch.nan_to_num(st_tokens, nan=0.0, posinf=0.0, neginf=0.0)
-        support_global = torch.nan_to_num(
-            support_global,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        positive_text = torch.nan_to_num(
-            positive_text,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        if point_mask is None:
-            point_mask = torch.ones(
-                st_tokens.shape[:2],
-                device=st_tokens.device,
-                dtype=torch.bool,
-            )
-        else:
-            point_mask = point_mask.to(device=st_tokens.device).bool()
-        num_labels = positive_text.shape[0]
-        temporal_dim, num_points = st_tokens.shape[:2]
-        valid_traj_mask = point_mask.any(dim=0) if num_points > 0 else point_mask.new_zeros(0)
-        if (
-            num_labels == 0
-            or temporal_dim == 0
-            or num_points == 0
-            or not valid_traj_mask.any()
-        ):
-            traj_empty = st_tokens.new_zeros(num_labels, num_points)
-            st_empty = st_tokens.new_zeros(num_labels, temporal_dim, num_points)
-            return {
-                "transport": traj_empty,
-                "temporal_weights": st_empty,
-                "st_transport": st_empty,
-                "affinity": traj_empty,
-                "traj_sim": traj_empty,
-            }
-
-        st_tokens = F.normalize(st_tokens.float(), dim=-1)
-        support_global = F.normalize(support_global.float(), dim=-1)
-        positive_text = F.normalize(positive_text.float(), dim=-1)
-
-        sim = torch.einsum("ld,tnd->ltn", positive_text, st_tokens)
-        sim = torch.nan_to_num(
-            sim,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-
-        valid_time_mask = point_mask.unsqueeze(0)
-        masked_sim = sim.masked_fill(~valid_time_mask, -1e4)
-        temporal_tau = max(
-            float(getattr(route_cfg, "TEMPORAL_TAU", route_cfg.AFFINITY_TAU)),
-            1e-6,
-        )
-        temporal_weights = torch.softmax(masked_sim / temporal_tau, dim=1)
-        temporal_weights = temporal_weights * valid_time_mask.to(temporal_weights.dtype)
-        temporal_weights = temporal_weights / temporal_weights.sum(
-            dim=1,
-            keepdim=True,
-        ).clamp_min(1e-12)
-        temporal_weights = torch.where(
-            valid_traj_mask.view(1, 1, num_points),
-            temporal_weights,
-            torch.zeros_like(temporal_weights),
-        )
-        temporal_weights = torch.nan_to_num(
-            temporal_weights,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        traj_sim = (temporal_weights * sim).sum(dim=1)
-        traj_sim = torch.nan_to_num(
-            traj_sim,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-        traj_sim = traj_sim.masked_fill(~valid_traj_mask.unsqueeze(0), -1e4)
-
-        cost = 1.0 - traj_sim
-        cost = cost.masked_fill(~valid_traj_mask.unsqueeze(0), 1e4)
-
-        mu_logits = max(float(route_cfg.MU_LOGIT_SCALE), 1e-6) * torch.matmul(
-            positive_text,
-            support_global,
-        )
-        mu = torch.softmax(mu_logits, dim=0)
-
-        affinity_tau = max(float(route_cfg.AFFINITY_TAU), 1e-6)
-        affinity = torch.softmax(traj_sim / affinity_tau, dim=-1)
-        affinity = affinity * valid_traj_mask.unsqueeze(0).to(affinity.dtype)
-        affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        affinity = torch.nan_to_num(
-            affinity,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        entropy = self._normalized_distribution_entropy(
-            affinity,
-            valid_count=int(valid_traj_mask.sum().item()),
-        )
-        rho_min = min(max(float(route_cfg.RHO_MIN), 0.0), 1.0)
-        rho_max = min(max(float(route_cfg.RHO_MAX), rho_min), 1.0)
-        rho = rho_min + (rho_max - rho_min) * entropy
-        row_mass = mu * rho
-
-        nu_shared = affinity.mean(dim=0) * valid_traj_mask.to(affinity.dtype)
-        if float(nu_shared.sum().item()) <= 0.0:
-            nu_shared = valid_traj_mask.to(affinity.dtype)
-        nu_shared = nu_shared / nu_shared.sum().clamp_min(1e-6)
-        kappa = max(float(route_cfg.KAPPA), 1.0)
-        col_cap = kappa * nu_shared
-
-        transport = self._solve_joint_relaxed_transport(
-            cost,
-            row_mass,
-            col_cap,
-            force_total_mass=True,
-        )
-        st_transport = transport[:, None, :] * temporal_weights
-        st_transport = st_transport * valid_time_mask.to(st_transport.dtype)
-        st_transport = torch.nan_to_num(
-            st_transport,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        return {
-            "transport": transport,
-            "temporal_weights": temporal_weights,
-            "st_transport": st_transport,
-            "affinity": affinity,
-            "traj_sim": traj_sim,
-        }
 
     def _build_support_text_alignment(self, patch_tokens, metadata):
         """Align support global visual features with episode label text features."""
@@ -2998,579 +2720,16 @@ class Pointformer(nn.Module):
         flat_mask = rearrange(point_mask, 't n -> (t n)')
         return flat_feat, flat_mask
 
-    def _compute_sharedness(self, sim_matrix, valid_mask):
-        """Estimate how much each token is shared across positive labels."""
-        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
-        num_labels = sim_matrix.shape[0]
-        if num_labels <= 1:
-            return sim_matrix.new_zeros(sim_matrix.shape[-1])
 
-        route_cfg = self.pot_route_cfg
-        tau_label = max(float(getattr(route_cfg, "SHARED_TAU_LABEL", 0.07)), 1e-6)
-        theta_shared = float(getattr(route_cfg, "SHARED_THETA", 0.2))
-        tau_strength = max(
-            float(getattr(route_cfg, "SHARED_TAU_STRENGTH", 0.1)),
-            1e-6,
-        )
 
-        sim_matrix = torch.nan_to_num(
-            sim_matrix.float(),
-            nan=-1e4,
-            posinf=1.0,
-            neginf=-1e4,
-        )
-        label_prob = torch.softmax(sim_matrix / tau_label, dim=0).clamp_min(1e-12)
-        entropy = -(label_prob * label_prob.log()).sum(dim=0)
-        normalizer = max(float(np.log(max(num_labels, 2))), 1e-6)
-        entropy = entropy / entropy.new_tensor(normalizer)
-        max_sim = sim_matrix.max(dim=0).values
-        semantic_strength = torch.sigmoid((max_sim - theta_shared) / tau_strength)
-        sharedness = entropy * semantic_strength
-        sharedness = torch.where(valid_mask, sharedness, torch.zeros_like(sharedness))
-        return torch.nan_to_num(
-            sharedness.clamp(0.0, 1.0),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
 
-    def _compute_intra_evidence(self, pred_tracks, valid_mask):
-        """Compute intra-motion evidence from velocity and acceleration."""
-        pred_tracks = torch.nan_to_num(
-            pred_tracks.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        valid_mask = valid_mask.to(device=pred_tracks.device).bool()
-        if valid_mask.ndim == 1:
-            valid_mask_2d = valid_mask.view(pred_tracks.shape[:2])
-        else:
-            valid_mask_2d = valid_mask
 
-        velocity = pred_tracks.new_zeros(pred_tracks.shape[:2])
-        if pred_tracks.shape[0] > 1:
-            velocity[1:] = torch.norm(pred_tracks[1:] - pred_tracks[:-1], dim=-1)
 
-        acceleration = pred_tracks.new_zeros(pred_tracks.shape[:2])
-        if pred_tracks.shape[0] > 1:
-            acceleration[1:] = torch.abs(velocity[1:] - velocity[:-1])
 
-        evidence = velocity + 0.5 * acceleration
-        evidence_flat = rearrange(evidence, 't n -> (t n)')
-        valid_flat = rearrange(valid_mask_2d, 't n -> (t n)')
-        normalized = torch.zeros_like(evidence_flat)
-        if valid_flat.any():
-            valid_evidence = evidence_flat[valid_flat]
-            if float((valid_evidence.max() - valid_evidence.min()).item()) > 1e-6:
-                median = valid_evidence.median()
-                mad = (valid_evidence - median).abs().median().clamp_min(1e-6)
-                normalized = torch.sigmoid((evidence_flat - median) / mad)
-                normalized = torch.where(
-                    valid_flat,
-                    normalized,
-                    torch.zeros_like(normalized),
-                )
-        return torch.nan_to_num(
-            normalized.clamp(0.0, 1.0),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
 
-    def _compute_inter_relation(self, pred_tracks, valid_mask, topk=16):
-        """Build a same-frame sparse-like dense relation matrix from point tracks."""
-        pred_tracks = torch.nan_to_num(
-            pred_tracks.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        valid_mask = valid_mask.to(device=pred_tracks.device).bool()
-        temporal_dim, num_points = pred_tracks.shape[:2]
-        num_tokens = temporal_dim * num_points
-        relation_matrix = pred_tracks.new_zeros(num_tokens, num_tokens)
-        if num_points <= 1:
-            return relation_matrix
 
-        route_cfg = self.pot_route_cfg
-        sigma = max(float(getattr(route_cfg, "INTER_SIGMA", 0.5)), 1e-6)
-        topk = max(int(topk), 1)
-        topk = min(topk, num_points - 1)
 
-        prev_dist = None
-        for frame_idx in range(temporal_dim):
-            frame_tracks = pred_tracks[frame_idx]
-            dist = torch.cdist(frame_tracks, frame_tracks, p=2)
-            if prev_dist is None:
-                delta_dist = torch.zeros_like(dist)
-            else:
-                delta_dist = torch.abs(dist - prev_dist)
 
-            frame_valid = valid_mask[frame_idx]
-            pair_valid = frame_valid[:, None] & frame_valid[None, :]
-            if frame_idx > 0:
-                prev_valid = valid_mask[frame_idx - 1]
-                pair_valid = pair_valid & prev_valid[:, None] & prev_valid[None, :]
-            pair_valid.fill_diagonal_(False)
-
-            delta_norm = torch.zeros_like(delta_dist)
-            if pair_valid.any():
-                max_delta = delta_dist[pair_valid].max().clamp_min(1e-6)
-                delta_norm = delta_dist / max_delta
-
-            relation = torch.exp(-(dist ** 2) / (sigma ** 2)) * delta_norm
-            relation = torch.where(pair_valid, relation, torch.zeros_like(relation))
-            if topk < num_points:
-                values, indices = torch.topk(relation, k=topk, dim=-1)
-                sparse_relation = torch.zeros_like(relation)
-                sparse_relation.scatter_(dim=-1, index=indices, src=values)
-                relation = sparse_relation
-
-            start_idx = frame_idx * num_points
-            end_idx = start_idx + num_points
-            relation_matrix[start_idx:end_idx, start_idx:end_idx] = relation
-            prev_dist = dist
-
-        return torch.nan_to_num(
-            relation_matrix.clamp(0.0, 1.0),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
-
-    def _build_shared_private_cost(
-        self,
-        sim_matrix,
-        sharedness,
-        valid_mask,
-    ):
-        """Construct unary private-label and shared-row transport costs."""
-        route_cfg = self.pot_route_cfg
-        lambda_shared = float(getattr(route_cfg, "LAMBDA_SHARED", 0.5))
-        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
-
-        sim_matrix = torch.nan_to_num(
-            sim_matrix.float(),
-            nan=-1e4,
-            posinf=1.0,
-            neginf=-1e4,
-        )
-        sharedness = torch.nan_to_num(
-            sharedness.to(device=sim_matrix.device).float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        ).clamp(0.0, 1.0)
-
-        private_cost = 1.0 - sim_matrix + lambda_shared * sharedness.unsqueeze(0)
-        shared_cost = 1.0 - sharedness
-        cost = torch.cat([private_cost, shared_cost.unsqueeze(0)], dim=0)
-        cost = torch.where(
-            valid_mask.unsqueeze(0),
-            cost,
-            cost.new_full(cost.shape, 1e4),
-        )
-        return torch.nan_to_num(cost, nan=1e4, posinf=1e4, neginf=0.0)
-
-    def _build_label_structure(self, positive_text):
-        """Build label-side distances for private labels plus one shared row."""
-        route_cfg = self.pot_route_cfg
-        beta_text = float(getattr(route_cfg, "FGW_BETA_TEXT", 0.5))
-        beta_sep = float(getattr(route_cfg, "FGW_BETA_SEP", 0.5))
-        shared_tau = float(getattr(route_cfg, "FGW_SHARED_TAU", 0.5))
-
-        positive_text = torch.nan_to_num(
-            positive_text.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        num_labels = positive_text.shape[0]
-        label_structure = positive_text.new_zeros(num_labels + 1, num_labels + 1)
-        if num_labels == 0:
-            return label_structure
-
-        text = F.normalize(positive_text, dim=-1)
-        text_sim = torch.matmul(text, text.transpose(0, 1)).clamp(-1.0, 1.0)
-        text_dist = (1.0 - text_sim) / 2.0
-        sep_dist = torch.ones_like(text_dist)
-        sep_dist.fill_diagonal_(0.0)
-        private_dist = beta_text * text_dist + beta_sep * sep_dist
-        private_dist.fill_diagonal_(0.0)
-
-        label_structure[:num_labels, :num_labels] = private_dist
-        label_structure[num_labels, :num_labels] = shared_tau
-        label_structure[:num_labels, num_labels] = shared_tau
-        return torch.nan_to_num(
-            label_structure.clamp(0.0, 1.0),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
-
-    def _build_visual_structure(
-        self,
-        value_flat,
-        flat_mask,
-        pred_tracks,
-        point_mask,
-        S_inter=None,
-        return_debug=False,
-    ):
-        """Build token-side distances from value features and same-frame relations."""
-        del pred_tracks, point_mask
-        route_cfg = self.pot_route_cfg
-        w_feat = float(getattr(route_cfg, "FGW_W_FEAT", 0.6))
-        w_inter = float(getattr(route_cfg, "FGW_W_INTER", 0.4))
-
-        value_flat = torch.nan_to_num(
-            value_flat.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        flat_mask = flat_mask.to(device=value_flat.device).bool()
-        pair_valid = flat_mask[:, None] & flat_mask[None, :]
-
-        value_norm = F.normalize(value_flat, dim=-1)
-        feat_sim = torch.matmul(value_norm, value_norm.transpose(0, 1)).clamp(-1.0, 1.0)
-        D_feat = ((1.0 - feat_sim) / 2.0).clamp(0.0, 1.0)
-
-        if S_inter is None:
-            R_inter = torch.zeros_like(D_feat)
-            D_inter = torch.full_like(D_feat, 0.5)
-        else:
-            R_inter = torch.nan_to_num(
-                S_inter.to(device=value_flat.device, dtype=D_feat.dtype),
-                nan=0.0,
-                posinf=1.0,
-                neginf=0.0,
-            ).clamp(0.0, 1.0)
-            D_inter = torch.full_like(D_feat, 0.5)
-            D_inter = torch.where(R_inter > 0.0, 1.0 - R_inter, D_inter)
-
-        D_feat = torch.where(pair_valid, D_feat, torch.ones_like(D_feat))
-        D_inter = torch.where(pair_valid, D_inter, torch.ones_like(D_inter))
-        D_feat.fill_diagonal_(0.0)
-        D_inter.fill_diagonal_(0.0)
-
-        D_visual = w_feat * D_feat + w_inter * D_inter
-        D_visual = 0.5 * (D_visual + D_visual.transpose(0, 1))
-        D_visual = torch.where(pair_valid, D_visual, torch.ones_like(D_visual))
-        D_visual.fill_diagonal_(0.0)
-        D_visual = torch.nan_to_num(
-            D_visual.clamp(0.0, 1.0),
-            nan=1.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
-        if not return_debug:
-            return D_visual
-
-        offdiag_mask = ~torch.eye(
-            D_visual.shape[0],
-            device=D_visual.device,
-            dtype=torch.bool,
-        )
-        pair_valid = pair_valid & offdiag_mask
-        edge_mask = (R_inter > 0.0) & pair_valid
-        debug = {
-            "D_feat": self._pot_debug_masked_summary(D_feat, pair_valid),
-            "D_inter": self._pot_debug_masked_summary(D_inter, pair_valid),
-            "D_visual": self._pot_debug_masked_summary(D_visual, pair_valid),
-            "D_visual_sym_error": self._pot_debug_scalar(
-                torch.abs(D_visual - D_visual.transpose(0, 1)).mean()
-            ),
-            "D_visual_diag_max": self._pot_debug_scalar(torch.diag(D_visual).abs().max()),
-            "S_inter_edge_density": self._pot_debug_scalar(
-                edge_mask.to(D_visual.dtype).sum() / pair_valid.to(D_visual.dtype).sum().clamp_min(1.0)
-            ),
-            "S_inter_edge_mean": (
-                self._pot_debug_scalar(R_inter[edge_mask].mean())
-                if edge_mask.any()
-                else 0.0
-            ),
-        }
-        return D_visual, debug
-
-    def _compute_fgw_cost(self, D_label, D_visual, transport, valid_mask):
-        """Compute the square-loss GW cost induced by the current transport."""
-        D_label = torch.nan_to_num(
-            D_label.to(device=transport.device).float(),
-            nan=0.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
-        D_visual = torch.nan_to_num(
-            D_visual.to(device=transport.device).float(),
-            nan=1.0,
-            posinf=1.0,
-            neginf=0.0,
-        )
-        transport = torch.nan_to_num(
-            transport.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        valid_mask = valid_mask.to(device=transport.device).bool()
-
-        row_mass = transport.sum(dim=1)
-        col_mass = transport.sum(dim=0)
-        term1 = torch.matmul(D_label.pow(2), row_mass).unsqueeze(1)
-        term2 = torch.matmul(D_visual.pow(2), col_mass).unsqueeze(0)
-        middle = torch.matmul(torch.matmul(D_label, transport), D_visual.transpose(0, 1))
-        fgw_cost = (term1 + term2 - 2.0 * middle).clamp_min(0.0)
-
-        shared_weight = float(getattr(self.pot_route_cfg, "FGW_SHARED_WEIGHT", 1.0))
-        if shared_weight != 1.0 and fgw_cost.shape[0] > 0:
-            fgw_cost[-1] = shared_weight * fgw_cost[-1]
-        fgw_cost = torch.where(
-            valid_mask.unsqueeze(0),
-            fgw_cost,
-            fgw_cost.new_full(fgw_cost.shape, 1e4),
-        )
-        return torch.nan_to_num(fgw_cost, nan=1e4, posinf=1e4, neginf=0.0)
-
-    def _scale_fgw_cost_for_unary(self, fgw_cost, unary_cost, valid_columns):
-        """Center and scale FGW costs so they can affect the OT solve."""
-        route_cfg = self.pot_route_cfg
-        if not bool(getattr(route_cfg, "FGW_NORMALIZE_COST", True)):
-            return fgw_cost
-
-        cost_scale = max(float(getattr(route_cfg, "FGW_COST_SCALE", 1.0)), 0.0)
-        min_std = max(float(getattr(route_cfg, "FGW_COST_MIN_STD", 1e-6)), 1e-12)
-        valid_columns = valid_columns.to(device=fgw_cost.device).bool()
-        valid_mask = valid_columns.unsqueeze(0).expand_as(fgw_cost)
-
-        fgw_cost = torch.nan_to_num(
-            fgw_cost.float(),
-            nan=1e4,
-            posinf=1e4,
-            neginf=0.0,
-        )
-        unary_cost = torch.nan_to_num(
-            unary_cost.to(device=fgw_cost.device).float(),
-            nan=1e4,
-            posinf=1e4,
-            neginf=0.0,
-        )
-        centered_fgw = torch.zeros_like(fgw_cost)
-
-        for row_idx in range(fgw_cost.shape[0]):
-            row_mask = valid_mask[row_idx] & (fgw_cost[row_idx] < 1e3)
-            if not row_mask.any():
-                continue
-
-            row_fgw = fgw_cost[row_idx, row_mask]
-            row_unary = unary_cost[row_idx, row_mask]
-            fgw_std = row_fgw.std(unbiased=False)
-            unary_std = row_unary.std(unbiased=False)
-            if float(fgw_std.item()) <= min_std:
-                continue
-
-            if float(unary_std.item()) <= min_std:
-                unary_std = row_unary.abs().mean().clamp_min(min_std)
-            normalized = (row_fgw - row_fgw.mean()) / fgw_std.clamp_min(min_std)
-            centered_fgw[row_idx, row_mask] = normalized * unary_std * cost_scale
-
-        centered_fgw = torch.where(
-            valid_mask,
-            centered_fgw,
-            centered_fgw.new_full(centered_fgw.shape, 1e4),
-        )
-        return torch.nan_to_num(centered_fgw, nan=1e4, posinf=1e4, neginf=-1e4)
-
-    def _compute_private_row_mass(self, sim_matrix, valid_mask):
-        """Compute partial row mass for private label rows."""
-        route_cfg = self.pot_route_cfg
-        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
-        num_labels = sim_matrix.shape[0]
-        if num_labels == 0 or not valid_mask.any():
-            return sim_matrix.new_zeros(num_labels)
-
-        tau_mass = max(float(getattr(route_cfg, "MASS_TAU", 0.07)), 1e-6)
-        mass_topk = max(int(getattr(route_cfg, "MASS_TOPK", 16)), 1)
-        theta_mass = float(getattr(route_cfg, "MASS_THETA", 0.2))
-        tau_quality = max(
-            float(getattr(route_cfg, "MASS_TAU_QUALITY", 0.1)),
-            1e-6,
-        )
-        rho_min = min(max(float(getattr(route_cfg, "RHO_MIN", 0.2)), 0.0), 1.0)
-        rho_max = min(max(float(getattr(route_cfg, "RHO_MAX", 0.9)), rho_min), 1.0)
-
-        sim_matrix = torch.nan_to_num(
-            sim_matrix.float(),
-            nan=-1e4,
-            posinf=1.0,
-            neginf=-1e4,
-        )
-        masked_sim = sim_matrix.masked_fill(~valid_mask.unsqueeze(0), -1e4)
-        affinity = torch.softmax(masked_sim / tau_mass, dim=-1)
-        affinity = affinity * valid_mask.unsqueeze(0).to(affinity.dtype)
-        affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-        entropy = -(affinity.clamp_min(1e-12) * affinity.clamp_min(1e-12).log()).sum(
-            dim=-1
-        )
-
-        num_valid = int(valid_mask.sum().item())
-        entropy_normalizer = max(float(np.log(max(num_valid, 2))), 1e-6)
-        entropy = entropy / entropy.new_tensor(entropy_normalizer)
-        effective_area = torch.exp(
-            entropy * entropy.new_tensor(float(np.log(max(num_valid, 1))))
-        ) / max(float(num_valid), 1.0)
-
-        valid_sim = sim_matrix[:, valid_mask]
-        topk = min(mass_topk, valid_sim.shape[-1])
-        topk_sim = torch.topk(valid_sim, k=topk, dim=-1).values.mean(dim=-1)
-        quality = torch.sigmoid((topk_sim - theta_mass) / tau_quality)
-
-        rho = rho_min + (rho_max - rho_min) * effective_area * quality
-        row_mass = rho / max(float(num_labels), 1.0)
-        return torch.nan_to_num(row_mass, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _compute_shared_private_column_cap(self, sim_matrix, sharedness, valid_mask):
-        """Compute column capacity that allows shared tokens without favoring private rows."""
-        route_cfg = self.pot_route_cfg
-        valid_mask = valid_mask.to(device=sim_matrix.device).bool()
-        if not valid_mask.any():
-            return sim_matrix.new_zeros(sim_matrix.shape[-1])
-
-        affinity_tau = max(float(getattr(route_cfg, "AFFINITY_TAU", 0.07)), 1e-6)
-        alpha_shared_cap = float(getattr(route_cfg, "ALPHA_SHARED_CAP", 1.0))
-        kappa = max(float(getattr(route_cfg, "KAPPA", 1.5)), 1.0)
-
-        sim_matrix = torch.nan_to_num(
-            sim_matrix.float(),
-            nan=-1e4,
-            posinf=1.0,
-            neginf=-1e4,
-        )
-        masked_sim = sim_matrix.masked_fill(~valid_mask.unsqueeze(0), -1e4)
-        affinity = torch.softmax(masked_sim / affinity_tau, dim=-1)
-        affinity = affinity * valid_mask.unsqueeze(0).to(affinity.dtype)
-        affinity = affinity / affinity.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-        max_affinity = affinity.max(dim=0).values
-        sharedness = sharedness.to(device=sim_matrix.device).float().clamp(0.0, 1.0)
-        private_candidate = max_affinity * (1.0 - sharedness)
-        shared_candidate = sharedness
-        nu = private_candidate + alpha_shared_cap * shared_candidate
-        nu = nu * valid_mask.to(nu.dtype)
-        if float(nu.sum().item()) <= 0.0:
-            nu = valid_mask.to(nu.dtype)
-        nu = nu / nu.sum().clamp_min(1e-12)
-        col_cap = kappa * nu
-        return torch.nan_to_num(col_cap, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _solve_shared_private_fgw_transport(
-        self,
-        unary_cost,
-        row_mass,
-        col_cap,
-        D_label,
-        D_visual,
-        valid_mask,
-        return_debug=False,
-    ):
-        """Solve shared-private partial FGW transport."""
-        route_cfg = self.pot_route_cfg
-        outer_iters = max(int(getattr(route_cfg, "FGW_OUTER_ITERS", 2)), 0)
-        lambda_gw = float(getattr(route_cfg, "FGW_LAMBDA", 0.03))
-        force_total_mass = bool(getattr(route_cfg, "FORCE_TOTAL_MASS", False))
-
-        unary_cost = torch.nan_to_num(
-            unary_cost.float(),
-            nan=1e4,
-            posinf=1e4,
-            neginf=0.0,
-        )
-        transport = self._solve_joint_relaxed_transport(
-            unary_cost,
-            row_mass,
-            col_cap,
-            force_total_mass=force_total_mass,
-        )
-        initial_transport = transport.clone() if return_debug else None
-        debug_iters = []
-        valid_columns = valid_mask.to(device=unary_cost.device).bool()
-        valid_cost_mask = valid_columns.unsqueeze(0).expand_as(unary_cost)
-
-        for outer_idx in range(outer_iters):
-            fgw_cost = self._compute_fgw_cost(
-                D_label,
-                D_visual,
-                transport,
-                valid_mask,
-            )
-            scaled_fgw_cost = self._scale_fgw_cost_for_unary(
-                fgw_cost,
-                unary_cost,
-                valid_columns,
-            )
-            effective_cost = unary_cost + lambda_gw * scaled_fgw_cost
-            if return_debug:
-                delta_cost = lambda_gw * scaled_fgw_cost
-                debug_iters.append({
-                    "iter": outer_idx,
-                    "fgw_cost": self._pot_debug_masked_summary(
-                        fgw_cost,
-                        valid_cost_mask,
-                    ),
-                    "scaled_fgw_cost": self._pot_debug_masked_summary(
-                        scaled_fgw_cost,
-                        valid_cost_mask,
-                    ),
-                    "effective_delta": self._pot_debug_masked_summary(
-                        delta_cost,
-                        valid_cost_mask,
-                    ),
-                    "transport_sum_before": self._pot_debug_scalar(transport.sum()),
-                })
-            effective_cost = torch.where(
-                valid_columns.unsqueeze(0),
-                effective_cost,
-                effective_cost.new_full(effective_cost.shape, 1e4),
-            )
-            effective_cost = torch.nan_to_num(
-                effective_cost,
-                nan=1e4,
-                posinf=1e4,
-                neginf=0.0,
-            )
-            transport = self._solve_joint_relaxed_transport(
-                effective_cost,
-                row_mass,
-                col_cap,
-                force_total_mass=force_total_mass,
-            )
-            if return_debug:
-                debug_iters[-1]["transport_sum_after"] = self._pot_debug_scalar(
-                    transport.sum()
-                )
-
-        transport = torch.nan_to_num(transport, nan=0.0, posinf=0.0, neginf=0.0)
-        if not return_debug:
-            return transport
-
-        delta = torch.abs(transport - initial_transport)
-        valid_delta = delta[valid_cost_mask] if valid_cost_mask.any() else delta.new_zeros(1)
-        debug = {
-            "outer_iters": outer_iters,
-            "lambda_gw": round(float(lambda_gw), 6),
-            "force_total_mass": bool(force_total_mass),
-            "initial_transport_sum": self._pot_debug_scalar(initial_transport.sum()),
-            "final_transport_sum": self._pot_debug_scalar(transport.sum()),
-            "transport_delta_l1": self._pot_debug_scalar(valid_delta.mean()),
-            "transport_delta_max": self._pot_debug_scalar(valid_delta.max()),
-            "initial_private_row_sum": self._pot_debug_list(initial_transport[:-1].sum(dim=1)),
-            "final_private_row_sum": self._pot_debug_list(transport[:-1].sum(dim=1)),
-            "initial_shared_row_sum": self._pot_debug_scalar(initial_transport[-1].sum()),
-            "final_shared_row_sum": self._pot_debug_scalar(transport[-1].sum()),
-            "iters": debug_iters,
-        }
-        return transport, debug
 
     def _aggregate_weighted_st_support_tokens(self, feat, point_mask, st_weights):
         """Aggregate spatio-temporal token weights into per-frame support prototypes."""
@@ -3612,22 +2771,6 @@ class Pointformer(nn.Module):
         )
         return value / value.norm(dim=dim, keepdim=True).clamp_min(1e-12)
 
-    def _aggregate_weighted_query_tokens(self, feat, point_mask, st_weights):
-        """Aggregate one query sample into a label-conditioned global prototype."""
-        feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
-        point_mask = point_mask.to(device=feat.device).bool()
-        st_weights = torch.nan_to_num(
-            st_weights.to(device=feat.device, dtype=feat.dtype),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0)
-        weights = point_mask.to(feat.dtype) * st_weights
-        denom = weights.sum()
-        if float(denom.item()) <= 0.0:
-            return feat.new_zeros(feat.shape[-1])
-        proto = (feat * weights.unsqueeze(-1)).sum(dim=(0, 1)) / denom.clamp_min(1e-6)
-        return torch.nan_to_num(proto, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _build_query_partial_label_axis(
         self,
@@ -3953,15 +3096,6 @@ class Pointformer(nn.Module):
             st_tokens.unsqueeze(0),
             point_mask.unsqueeze(0),
         ).squeeze(0)
-        cmw_label_context = self._build_cmw_label_context(
-            episode_positive_labels,
-            support_mask,
-            label_axis_text,
-            label_axis_global_labels,
-            query_global,
-            label_axis_text,
-            raw_positive_labels=raw_positive_labels,
-        )
         cmw_min_reliability = float(getattr(
             route_cfg,
             "CMW_COST_MIN_RELIABILITY",
@@ -3969,7 +3103,7 @@ class Pointformer(nn.Module):
         ))
         cmw_private_reliability, _ = self.cmw_cost_net(
             cmw_token_evidence,
-            cmw_label_context,
+            None,
             point_mask,
             min_reliability=cmw_min_reliability,
         )
@@ -4258,82 +3392,7 @@ class Pointformer(nn.Module):
             "label_axis_global_labels": label_axis_global_labels,
         }
 
-    def _build_query_partial_support_prototypes(
-        self,
-        value_tokens,
-        point_mask,
-        support_mask,
-        episode_positive_labels,
-        route_aux=None,
-    ):
-        """Build one support prototype per episode label for query-side routing."""
-        num_labels = episode_positive_labels.shape[1]
-        support_prototypes = value_tokens.new_zeros(num_labels, value_tokens.shape[-1])
 
-        if (
-            isinstance(route_aux, dict)
-            and "support_conditioned_patch_tokens" in route_aux
-            and "support_branch_class_indices" in route_aux
-        ):
-            branch_tokens = route_aux["support_conditioned_patch_tokens"]
-            branch_class_indices = route_aux["support_branch_class_indices"].long()
-            for class_idx in range(num_labels):
-                class_mask = branch_class_indices == class_idx
-                if class_mask.any():
-                    support_prototypes[class_idx] = branch_tokens[class_mask].mean(
-                        dim=(0, 1, 2)
-                    )
-
-        support_value_tokens = value_tokens[support_mask]
-        support_point_mask = point_mask[support_mask]
-        support_targets = episode_positive_labels[support_mask]
-        for class_idx in range(num_labels):
-            if float(support_prototypes[class_idx].abs().sum().item()) > 0.0:
-                continue
-            class_mask = support_targets[:, class_idx].bool()
-            if class_mask.any():
-                pooled = self._masked_space_time_mean(
-                    support_value_tokens[class_mask],
-                    support_point_mask[class_mask],
-                )
-                support_prototypes[class_idx] = pooled.mean(dim=0)
-
-        return torch.nan_to_num(
-            support_prototypes,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-    def _compute_query_partial_diag_logits(
-        self,
-        query_prototypes,
-        support_prototypes,
-        query_mass,
-    ):
-        """Map query/support prototypes to diagonal multi-label logits."""
-        query_norm = self._safe_l2_normalize(query_prototypes, dim=-1)
-        support_norm = self._safe_l2_normalize(support_prototypes, dim=-1)
-        query_mass = torch.nan_to_num(
-            query_mass.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).clamp_min(0.0)
-        sim_matrix = torch.einsum("qkc,mc->qkm", query_norm, support_norm)
-        sim_matrix = torch.nan_to_num(
-            sim_matrix,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-        diag_sim = sim_matrix.diagonal(dim1=1, dim2=2)
-        alpha = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_ALPHA", 10.0))
-        beta = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BETA", 1.0))
-        bias = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BIAS", -2.0))
-        logits = alpha * diag_sim + beta * query_mass + bias
-        logits = torch.nan_to_num(logits, nan=bias, posinf=1e4, neginf=-1e4)
-        return logits, sim_matrix
 
     def _build_query_partial_support_prototypes_frame(
         self,
@@ -4501,31 +3560,18 @@ class Pointformer(nn.Module):
             label_axis_global_labels,
             value_tokens.dtype,
         )
-        support_prototypes = self._build_query_partial_support_prototypes(
+        # Frame-to-frame matching is the only path: keep the temporal dim and match
+        # the per-class decoupled [T,C] prototypes (query class-n vs support class-n).
+        support_prototypes = self._build_query_partial_support_prototypes_frame(
             value_tokens,
             point_mask,
             support_mask,
             episode_positive_labels,
             route_aux=route_aux,
         )
-        frame_match = bool(
-            getattr(self.pot_route_cfg, "QUERY_PARTIAL_FRAME_MATCH", False)
-        )
-        support_prototypes_frame = None
-        if frame_match:
-            support_prototypes_frame = (
-                self._build_query_partial_support_prototypes_frame(
-                    value_tokens,
-                    point_mask,
-                    support_mask,
-                    episode_positive_labels,
-                    route_aux=route_aux,
-                )
-            )
 
         query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
         query_prototypes = []
-        query_prototypes_frame = []
         query_masses = []
         for sample_idx in query_indices.tolist():
             sample_tokens = value_tokens[sample_idx]
@@ -4553,29 +3599,15 @@ class Pointformer(nn.Module):
                 inter_tokens=sample_inter_tokens,
             )
             sample_prototypes = []
-            sample_prototypes_frame = []
             for class_idx in range(target_label_indices.shape[0]):
-                st_weights_c = transport_stats["st_transport"][class_idx]
                 sample_prototypes.append(
-                    self._aggregate_weighted_query_tokens(
+                    self._aggregate_weighted_st_support_tokens(
                         sample_tokens,
                         sample_point_mask,
-                        st_weights_c,
+                        transport_stats["st_transport"][class_idx],
                     ).unsqueeze(0)
                 )
-                if frame_match:
-                    sample_prototypes_frame.append(
-                        self._aggregate_weighted_st_support_tokens(
-                            sample_tokens,
-                            sample_point_mask,
-                            st_weights_c,
-                        ).unsqueeze(0)
-                    )
             query_prototypes.append(torch.cat(sample_prototypes, dim=0).unsqueeze(0))
-            if frame_match:
-                query_prototypes_frame.append(
-                    torch.cat(sample_prototypes_frame, dim=0).unsqueeze(0)
-                )
             query_masses.append(transport_stats["transport_mass"].unsqueeze(0))
 
         if not query_prototypes:
@@ -4583,20 +3615,11 @@ class Pointformer(nn.Module):
 
         query_prototypes = torch.cat(query_prototypes, dim=0)
         query_masses = torch.cat(query_masses, dim=0)
-        if frame_match:
-            query_prototypes_frame = torch.cat(query_prototypes_frame, dim=0)
-            q2s_logits, diag_similarity = self._compute_query_partial_frame_logits(
-                query_prototypes_frame,
-                support_prototypes_frame,
-                query_masses,
-            )
-        else:
-            q2s_logits, sim_matrix = self._compute_query_partial_diag_logits(
-                query_prototypes,
-                support_prototypes,
-                query_masses,
-            )
-            diag_similarity = sim_matrix.diagonal(dim1=1, dim2=2)
+        q2s_logits, diag_similarity = self._compute_query_partial_frame_logits(
+            query_prototypes,
+            support_prototypes,
+            query_masses,
+        )
         alpha = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_ALPHA", 10.0))
         beta = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BETA", 1.0))
         bias = float(getattr(self.pot_route_cfg, "QUERY_PARTIAL_LOGIT_BIAS", -2.0))
