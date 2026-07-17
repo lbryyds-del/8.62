@@ -24,6 +24,7 @@ from few_shot_multilabel import (
     merge_ap_storage,
     multilabel_classification_loss,
     multilabel_top1_accuracy,
+    q2s_cos_sim_fp32,
     support_query_split_multilabel,
     support_query_split_multilabel_conditioned,
     update_ap_storage,
@@ -173,12 +174,7 @@ def process_patch_tokens(cfg, support_tokens, query_tokens):
 def cos_sim(x, y, epsilon=0.01):
     """Calculates the cosine similarity between the last dimension of two tensors.
     """
-    numerator = torch.matmul(x, y.transpose(-1,-2))
-    xnorm = torch.norm(x, dim=-1).unsqueeze(-1)
-    ynorm = torch.norm(y, dim=-1).unsqueeze(-1)
-    denominator = torch.matmul(xnorm, ynorm.transpose(-1,-2)) + epsilon
-    dists = torch.div(numerator, denominator)
-    return dists
+    return q2s_cos_sim_fp32(x, y, epsilon=epsilon)
 
 
 def support_query_split(preds, labels, metadata):

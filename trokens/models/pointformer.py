@@ -24,6 +24,37 @@ from .build import MODEL_REGISTRY
 
 # pylint: disable=unused-argument,redefined-builtin
 
+class LGASpatialFineAttention(nn.Module):
+    """Shared label-guided spatial attention block."""
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4.0,
+                 attn_dropout=0.1, ffn_dropout=0.1):
+        super().__init__()
+        hidden_dim = int(dim * mlp_ratio)
+        self.q_norm = nn.LayerNorm(dim)
+        self.k_norm = nn.LayerNorm(dim)
+        self.v_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=attn_dropout, batch_first=True
+        )
+        self.ffn_norm = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(ffn_dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(ffn_dropout),
+        )
+
+    def forward(self, q, k, v, key_padding_mask=None):
+        attn_out, _ = self.attn(
+            self.q_norm(q), self.k_norm(k), self.v_norm(v),
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
+        x = q + attn_out
+        return x + self.ffn(self.ffn_norm(x))
+
 class LabelAwareCMWCostNet(nn.Module):
     """Token-only CMW-style private reliability estimator (no label context)."""
 
@@ -127,6 +158,7 @@ class Pointformer(nn.Module):
         self.cfg = cfg
         self.pot_route_cfg = cfg.FEW_SHOT.POT_ROUTE
         self.text_align_cfg = cfg.FEW_SHOT.TEXT_ALIGN
+        self.lga_spatial_cfg = cfg.FEW_SHOT.LGA_SPATIAL
         self._pot_debug_call_count = 0
         self._pot_debug_record_count = 0
         self._pot_debug_io_failed = False
@@ -149,6 +181,33 @@ class Pointformer(nn.Module):
             and self.feat_extractor_type == "dinotxt_vitl14_reg4"
             and self.text_align_cfg.ENABLE
         )
+        self.use_lga_spatial = bool(self.lga_spatial_cfg.ENABLE)
+        if self.use_lga_spatial:
+            requirements = {
+                "TASK == 'few_shot'": cfg.TASK == 'few_shot',
+                "DATA.MULTI_LABEL == True": bool(cfg.DATA.MULTI_LABEL),
+                "MODEL.FEAT_EXTRACTOR == 'dinotxt_vitl14_reg4'": (
+                    self.feat_extractor_type == "dinotxt_vitl14_reg4"
+                ),
+                "POINT_INFO.ENABLE == True": bool(cfg.POINT_INFO.ENABLE),
+                "FEW_SHOT.PATCH_TOKENS_AGG == 'spatial'": (
+                    cfg.FEW_SHOT.PATCH_TOKENS_AGG == "spatial"
+                ),
+                "FEW_SHOT.Q2S_LOSS_LAMBDA > 0": (
+                    float(cfg.FEW_SHOT.Q2S_LOSS_LAMBDA) > 0.0
+                ),
+            }
+            failed = [name for name, valid in requirements.items() if not valid]
+            if failed:
+                raise NotImplementedError(
+                    "LGA_SPATIAL first version requires: " + ", ".join(failed)
+                )
+            if self.pot_route_cfg.ENABLE or self.text_align_cfg.ENABLE:
+                raise ValueError(
+                    "LGA_SPATIAL cannot be combined with POT_ROUTE or TEXT_ALIGN."
+                )
+            if self.lga_spatial_cfg.INJECTION_MODE not in {"global", "cluster"}:
+                raise ValueError("LGA_SPATIAL.INJECTION_MODE must be global or cluster.")
         if (
             self.is_multilabel_few_shot
             and self.pot_route_cfg.ENABLE
@@ -174,7 +233,7 @@ class Pointformer(nn.Module):
                 "TEXT_ALIGN currently requires the dinotxt_vitl14_reg4 backbone."
             )
         self.use_label_text_features = (
-            self.use_pot_support_route or self.use_text_alignment
+            self.use_pot_support_route or self.use_text_alignment or self.use_lga_spatial
         )
         self.num_patches = (224 // self.patch_size) ** 2
         if cfg.POINT_INFO.ENABLE:
@@ -291,8 +350,20 @@ class Pointformer(nn.Module):
                 self.text_to_model_proj = nn.Identity()
             else:
                 self.text_to_model_proj = nn.Linear(self.text_feature_dim, self.embed_dim)
-            if self.use_pot_support_route or self.use_text_alignment:
+            if self.use_pot_support_route or self.use_text_alignment or self.use_lga_spatial:
                 self.atomic_label_names = self._load_atomic_label_names()
+
+        if self.use_lga_spatial:
+            self.lga_text_scale = nn.Parameter(torch.tensor(
+                float(self.lga_spatial_cfg.TEXT_SCALE_INIT)
+            ))
+            self.lga_spatial_fine_attn = LGASpatialFineAttention(
+                dim=self.embed_dim,
+                num_heads=int(self.lga_spatial_cfg.NUM_HEADS),
+                mlp_ratio=float(self.lga_spatial_cfg.MLP_RATIO),
+                attn_dropout=float(self.lga_spatial_cfg.ATTN_DROPOUT),
+                ffn_dropout=float(self.lga_spatial_cfg.FFN_DROPOUT),
+            )
 
         self.use_cmw_cost = self.use_pot_support_route
         if self.use_cmw_cost:
@@ -301,7 +372,7 @@ class Pointformer(nn.Module):
                 hidden_dim=int(getattr(self.pot_route_cfg, "CMW_COST_HIDDEN_DIM", 128)),
             )
 
-        # Initialize weights
+        # Initialize weights
         self.init_weights()
         self.apply(self._init_weights)
         if self.feat_extractor_type == "dino":
@@ -477,53 +548,85 @@ class Pointformer(nn.Module):
         return label_names
 
     def _get_sav_label_prompts(self, label_name):
-        """Return prompt variants for SAV labels that need finer visual grounding."""
-        base_prompt = label_name.replace("_", " ")
+        """Return concise, body-region-focused prompts for SAV atomic labels."""
         prompt_bank = {
+            "sit": [
+                "hips lowered with both knees bent",
+                "torso resting above bent legs",
+                "body held in a seated posture",
+            ],
+            "stand": [
+                "body held in an upright posture",
+                "hips raised with both legs straight",
+                "torso and legs aligned vertically",
+            ],
+            "look_forward": [
+                "head raised and facing forward",
+                "eyes looking straight ahead",
+                "face aligned with the torso",
+            ],
+            "look_sideways": [
+                "head turned toward one side",
+                "eyes looking left or right",
+                "side view of the face",
+            ],
             "read": [
-                "read",
-                "a student reads a book or paper",
-                "eyes looking down at reading material",
-                "holding or looking at a book on a desk",
-                "reading pages without writing",
+                "eyes looking down at an open book",
+                "head lowered toward printed pages",
+                "both hands holding reading material",
             ],
             "flip_books": [
-                "flip books",
-                "a student turns pages of a book",
-                "hand flipping book pages on a desk",
-                "fingers moving along page edges",
-                "a book page changes position over time",
+                "fingers holding the edge of a page",
+                "one hand lifting a book page",
+                "a raised page above an open book",
+            ],
+            "touch_sth": [
+                "fingers touching a nearby object",
+                "one hand placed on an object",
+                "an arm reaching toward an object",
+            ],
+            "raise_hand": [
+                "one hand raised above the shoulder",
+                "one arm extending upward",
+                "raised elbow beside the head",
+            ],
+            "hands_down": [
+                "both hands held below the chest",
+                "arms lowered beside the torso",
+                "hands resting near the waist or lap",
             ],
             "take_notes": [
-                "take notes",
-                "a student writes notes on paper",
-                "hand holding a pen and writing",
-                "small repetitive hand motion on notebook",
-                "writing on a desk with paper",
+                "fingers holding a pen above paper",
+                "one hand writing on a page",
+                "head lowered toward written notes",
+            ],
+            "applaud": [
+                "both hands meeting in front of the chest",
+                "palms facing each other",
+                "two hands moving together for clapping",
+            ],
+            "bend": [
+                "torso leaning forward and downward",
+                "head lowered below the shoulders",
+                "waist bent with the back inclined",
             ],
             "turn_around": [
-                "turn around",
-                "a person turns the head or body around",
-                "torso orientation changes over time",
-                "head rotates from front to side or back",
-                "shoulder direction changes across frames",
+                "head and shoulders turning backward",
+                "upper body rotated toward the rear",
+                "neck and torso turning together",
             ],
             "talk_with_others": [
-                "talk with others",
-                "a student talks with another person",
-                "face turned toward a nearby person while speaking",
-                "mouth movement during conversation",
-                "two people interacting or conversing",
+                "head turned toward a nearby face",
+                "mouth moving while facing sideways",
+                "face oriented toward another person",
             ],
             "answer_questions": [
-                "answer questions",
-                "a student answers a question in class",
-                "a student speaks while looking toward the teacher",
-                "a student responds in the classroom",
-                "head and mouth movement while answering",
+                "head raised while speaking forward",
+                "mouth moving with the face forward",
+                "upright torso and forward-facing gaze",
             ],
         }
-        return prompt_bank.get(label_name, [base_prompt])
+        return prompt_bank.get(label_name, [label_name.replace("_", " ")])
 
     def _get_pot_label_text_features(self, global_class_indices, dtype):
         """Encode episode label prompts with DinoTxt text encoder for POT routing."""
@@ -4141,6 +4244,172 @@ class Pointformer(nn.Module):
             patch_tokens.shape[-1],
         )
 
+    def _lga_safe_attention(self, q, k, v, valid_mask):
+        """Run attention without all-masked rows producing softmax NaNs."""
+        valid_mask = valid_mask.to(device=q.device).bool()
+        safe_mask = valid_mask.clone()
+        empty_rows = ~safe_mask.any(dim=1)
+        if empty_rows.any():
+            safe_mask[empty_rows, 0] = True
+            # Clones are only needed for the exceptional empty-frame rows.
+            k = k.clone()
+            v = v.clone()
+            k[empty_rows, 0] = 0
+            v[empty_rows, 0] = 0
+        output = self.lga_spatial_fine_attn(
+            q, k, v, key_padding_mask=~safe_mask
+        )
+        return torch.nan_to_num(output, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _compute_lga_track_weights(
+        self, align_tokens, obj_ids, point_mask, target_text
+    ):
+        """Map target-label/visual-cluster similarities back to tracks."""
+        num_targets = target_text.shape[0]
+        num_tracks = align_tokens.shape[1]
+        weights = align_tokens.new_zeros(num_targets, num_tracks)
+        valid_tracks = point_mask.any(dim=0)
+        cluster_ids = torch.unique(obj_ids[valid_tracks])
+        if cluster_ids.numel() == 0:
+            return weights, cluster_ids, align_tokens.new_zeros(num_targets, 0)
+        if self.lga_spatial_cfg.INJECTION_MODE == "global":
+            weights[:, valid_tracks] = 1.0
+            return weights, cluster_ids, weights.new_ones(num_targets, cluster_ids.numel())
+
+        cluster_features = []
+        for cluster_id in cluster_ids:
+            cluster_mask = (
+                (obj_ids.unsqueeze(0) == cluster_id) & point_mask
+            )
+            denom = cluster_mask.sum().clamp_min(1).to(align_tokens.dtype)
+            cluster_features.append(
+                (align_tokens * cluster_mask.unsqueeze(-1)).sum(dim=(0, 1)) / denom
+            )
+        cluster_features = F.normalize(torch.stack(cluster_features), dim=-1)
+        normalized_text = F.normalize(target_text.float(), dim=-1)
+        similarity = normalized_text @ cluster_features.float().transpose(0, 1)
+        tau = max(float(self.lga_spatial_cfg.CLUSTER_TAU), 1e-6)
+        cluster_weights = torch.softmax(similarity / tau, dim=-1)
+        if bool(self.lga_spatial_cfg.RESCALE_CLUSTER_SOFTMAX):
+            cluster_weights = cluster_weights * cluster_ids.numel()
+        cluster_weights = cluster_weights.to(dtype=align_tokens.dtype)
+        for cluster_idx, cluster_id in enumerate(cluster_ids):
+            track_mask = (obj_ids == cluster_id) & valid_tracks
+            weights[:, track_mask] = cluster_weights[:, cluster_idx].unsqueeze(1)
+        return weights, cluster_ids, cluster_weights
+
+    def _build_lga_spatial_episode_features(
+        self, align_app_tokens, visual_tokens, metadata
+    ):
+        """Build support label branches and label-free query features."""
+        device = visual_tokens.device
+        support_mask = metadata["support_mask"].to(device=device).bool()
+        episode_labels = metadata["episode_positive_labels"].to(device=device).float()
+        # Explicit masking prevents query labels from entering any support computation.
+        labels_for_model = episode_labels * support_mask.unsqueeze(1)
+        episode_class_ids = metadata["episode_class_ids"].to(device=device).long()
+        if episode_class_ids.ndim == 2:
+            episode_class_ids = episode_class_ids[0]
+
+        raw_labels = metadata.get("raw_positive_labels")
+        if raw_labels is None:
+            num_global = max(
+                int(self.num_classes),
+                int(episode_class_ids.max().item()) + 1 if episode_class_ids.numel() else 0,
+            )
+            raw_labels = visual_tokens.new_zeros(visual_tokens.shape[0], num_global)
+            raw_labels[:, episode_class_ids] = labels_for_model
+        raw_labels = raw_labels.to(device=device).float().reshape(visual_tokens.shape[0], -1)
+        support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
+        support_raw = raw_labels.index_select(0, support_indices)
+        raw_union = torch.nonzero(support_raw.any(dim=0), as_tuple=False).flatten()
+        text_class_ids = torch.unique(torch.cat((episode_class_ids, raw_union)))
+        all_text = self._get_pot_label_text_features(text_class_ids, visual_tokens.dtype)
+        lookup_size = max(
+            raw_labels.shape[1],
+            int(text_class_ids.max().item()) + 1 if text_class_ids.numel() else 0,
+        )
+        global_to_text = torch.full((lookup_size,), -1, device=device, dtype=torch.long)
+        global_to_text[text_class_ids] = torch.arange(text_class_ids.numel(), device=device)
+        episode_text = all_text.index_select(0, global_to_text[episode_class_ids])
+
+        point_mask = (
+            metadata["pred_query_mask"]
+            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
+            else metadata["pred_visibility"]
+        ).to(device=device).bool()
+        obj_ids = metadata["obj_ids"].to(device=device)
+        if obj_ids.ndim > 2:
+            obj_ids = obj_ids.reshape(obj_ids.shape[0], -1)
+
+        branch_q, branch_k, branch_masks = [], [], []
+        branch_classes, branch_samples = [], []
+        for sample_idx in support_indices.tolist():
+            positive_classes = torch.nonzero(
+                labels_for_model[sample_idx] > 0.5, as_tuple=False
+            ).flatten()
+            if positive_classes.numel() == 0:
+                continue
+            target_text = episode_text.index_select(0, positive_classes)
+            track_weights, _, _ = self._compute_lga_track_weights(
+                align_app_tokens[sample_idx], obj_ids[sample_idx],
+                point_mask[sample_idx], target_text,
+            )
+            sample_visual = visual_tokens[sample_idx]
+            valid = point_mask[sample_idx]
+            q = sample_visual.unsqueeze(0).expand(positive_classes.numel(), -1, -1, -1)
+            injection = (
+                self.lga_text_scale
+                * valid.unsqueeze(0).unsqueeze(-1).to(sample_visual.dtype)
+                * track_weights[:, None, :, None]
+                * episode_text.index_select(0, positive_classes)[:, None, None, :]
+            )
+            branch_q.append(q + injection)
+            branch_k.append(q)
+            branch_masks.append(valid.unsqueeze(0).expand(positive_classes.numel(), -1, -1))
+            branch_classes.append(positive_classes)
+            branch_samples.append(torch.full_like(positive_classes, sample_idx))
+
+        result = {"lga_text_class_ids": text_class_ids}
+        if branch_q:
+            q = torch.cat(branch_q)
+            k = torch.cat(branch_k)
+            masks = torch.cat(branch_masks)
+            m, temporal, tracks, dim = q.shape
+            output = self._lga_safe_attention(
+                q.reshape(m * temporal, tracks, dim),
+                k.reshape(m * temporal, tracks, dim),
+                k.reshape(m * temporal, tracks, dim),
+                masks.reshape(m * temporal, tracks),
+            ).reshape(m, temporal, tracks, dim)
+            mask_weights = masks.unsqueeze(-1).to(output.dtype)
+            pooled = (output * mask_weights).sum(dim=2) / mask_weights.sum(dim=2).clamp_min(1)
+            result.update({
+                "support_conditioned_patch_tokens": pooled.unsqueeze(2),
+                "support_branch_class_indices": torch.cat(branch_classes),
+                "support_branch_sample_indices": torch.cat(branch_samples),
+            })
+
+        if bool(self.lga_spatial_cfg.QUERY_SELF_ATTN):
+            query_indices = torch.nonzero(~support_mask, as_tuple=False).flatten()
+            query = visual_tokens.index_select(0, query_indices)
+            query_valid = point_mask.index_select(0, query_indices)
+            if query.numel() > 0:
+                bq, temporal, tracks, dim = query.shape
+                output = self._lga_safe_attention(
+                    query.reshape(bq * temporal, tracks, dim),
+                    query.reshape(bq * temporal, tracks, dim),
+                    query.reshape(bq * temporal, tracks, dim),
+                    query_valid.reshape(bq * temporal, tracks),
+                ).reshape(bq, temporal, tracks, dim)
+                weights = query_valid.unsqueeze(-1).to(output.dtype)
+                pooled = (output * weights).sum(dim=2) / weights.sum(dim=2).clamp_min(1)
+                result.update({
+                    "query_conditioned_patch_tokens": pooled.unsqueeze(2),
+                    "query_conditioned_sample_indices": query_indices,
+                })
+        return result
+
 
     def pt_forward(self, x, metadata):
         """ Forward pass for point tracking based transformer model.
@@ -4240,6 +4509,7 @@ class Pointformer(nn.Module):
         else:
             skip_feat_extractor = False
         if not self.cfg.MODEL.APPEARANCE_MODULE_DISABLE:
+            align_feat_to_use = None
             if skip_feat_extractor:
                 embed_dim = self.embed_dim
                 batch_size, num_frames = x.shape[:2]
@@ -4247,6 +4517,7 @@ class Pointformer(nn.Module):
                                             int(self.num_patches**0.5),
                                             int(self.num_patches**0.5),
                                             embed_dim).to(x.device)
+                align_feat_to_use = feat_to_use
             else:
                 if self.feat_extractor_type == "dino":
                     feat_to_use = self.get_dino_features(x)
@@ -4261,6 +4532,7 @@ class Pointformer(nn.Module):
                         metadata.update(new_metadata)
                 elif self.feat_extractor_type == "dinotxt_vitl14_reg4":
                     feat_to_use = self.get_dinotxt_features(x)
+                    align_feat_to_use = feat_to_use
                     if self.cfg.POINT_INFO.USE_CORRELATION:
                         new_metadata = get_points_using_correlation(self.cfg, feat_to_use)
                         metadata.update(new_metadata)
@@ -4273,6 +4545,13 @@ class Pointformer(nn.Module):
 
             if self.cfg.POINT_INFO.ENABLE:
                 pred_tracks = metadata['pred_tracks']
+                align_app_feat = None
+                if self.use_lga_spatial:
+                    align_app_feat = self._sample_point_features(
+                        align_feat_to_use,
+                        pred_tracks,
+                        add_pt_pos_embed=False,
+                    )
                 sampled_feat = self._sample_point_features(
                     feat_to_use,
                     pred_tracks,
@@ -4313,6 +4592,22 @@ class Pointformer(nn.Module):
         cls_x, patch_x = self.pt_forward(fused_feat, metadata)
         if 'support_mask' in metadata and 'episode_positive_labels' in metadata:
             route_aux = None
+            if self.use_lga_spatial:
+                required_metadata = {
+                    "support_mask", "episode_positive_labels", "episode_class_ids",
+                    "obj_ids",
+                    "pred_query_mask" if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
+                    else "pred_visibility",
+                }
+                missing = sorted(required_metadata.difference(metadata))
+                if missing:
+                    raise ValueError(
+                        "LGA_SPATIAL requires metadata keys: " + ", ".join(missing)
+                    )
+                lga_aux = self._build_lga_spatial_episode_features(
+                    align_app_feat, patch_x, metadata
+                )
+                few_shot_aux.update(lga_aux)
             if self.use_text_alignment:
                 text_align_aux = self._build_support_text_alignment(
                     patch_x,

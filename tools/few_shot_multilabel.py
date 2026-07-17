@@ -1,10 +1,38 @@
 """Utilities for SAV multi-label few-shot episodes."""
 
+from contextlib import nullcontext
+
 import numpy as np
 import torch
 from sklearn.metrics import average_precision_score
 
 import trokens.utils.distributed as du
+
+
+def q2s_cos_sim_fp32(x, y, epsilon=0.01):
+    """Compute q2s cosine in FP32 even inside an AMP autocast region."""
+    device_type = x.device.type
+    if hasattr(torch, "autocast") and device_type in {"cpu", "cuda"}:
+        autocast_disabled = torch.autocast(device_type=device_type, enabled=False)
+    elif x.is_cuda:
+        autocast_disabled = torch.cuda.amp.autocast(enabled=False)
+    else:
+        autocast_disabled = nullcontext()
+
+    with autocast_disabled:
+        x_float = x.float()
+        y_float = y.float()
+        numerator = torch.matmul(x_float, y_float.transpose(-1, -2))
+        xnorm = torch.norm(x_float, dim=-1).unsqueeze(-1)
+        ynorm = torch.norm(y_float, dim=-1).unsqueeze(-1)
+        denominator = torch.matmul(xnorm, ynorm.transpose(-1, -2)) + float(epsilon)
+        similarity = torch.div(numerator, denominator)
+
+    if not torch.isfinite(similarity).all():
+        raise FloatingPointError(
+            "Non-finite q2s cosine similarity after the FP32 stability path."
+        )
+    return similarity
 
 
 def is_multilabel_episode(cfg, labels, metadata):
@@ -98,11 +126,29 @@ def support_query_split_multilabel_conditioned(base_split, few_shot_aux):
             class_tokens = branch_tokens[class_mask]
             conditioned_support.append(class_tokens.mean(dim=0, keepdim=True))
         else:
-            conditioned_support.append(support_preds[class_idx:class_idx + 1])
+            conditioned_support.append(
+                support_preds[class_idx:class_idx + 1].mean(dim=2, keepdim=True)
+            )
+
+    query_preds = base_split["query_preds"]
+    if (
+        "query_conditioned_patch_tokens" in few_shot_aux
+        and "query_conditioned_sample_indices" in few_shot_aux
+    ):
+        expected_indices = torch.nonzero(
+            base_split["query_condition"], as_tuple=False
+        ).flatten().to(few_shot_aux["query_conditioned_sample_indices"].device)
+        actual_indices = few_shot_aux["query_conditioned_sample_indices"].long()
+        if not torch.equal(expected_indices, actual_indices):
+            raise ValueError(
+                "LGA query sample indices do not match the episode query ordering."
+            )
+        query_preds = few_shot_aux["query_conditioned_patch_tokens"]
 
     return {
         **base_split,
         "support_preds": torch.cat(conditioned_support, dim=0),
+        "query_preds": query_preds,
     }
 
 
