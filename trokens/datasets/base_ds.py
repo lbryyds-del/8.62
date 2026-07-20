@@ -23,6 +23,29 @@ from .hod import get_orientation_hist, compute_temporal_pyramid
 logger = logging.get_logger(__name__)
 
 
+def _load_point_queries(pt_dict, num_points):
+    """Load trajectory seed frames from current or legacy feature dumps.
+
+    The value is only the frame where a trajectory was seeded.  For tracks
+    generated with ``backward_tracking=True``, frames before that seed may
+    still contain valid backward-tracked positions.
+    """
+    if 'per_point_queries' in pt_dict:
+        point_queries = pt_dict['per_point_queries']
+    elif 'point_queries' in pt_dict:
+        point_queries = pt_dict['point_queries']
+    else:
+        point_queries = torch.zeros(num_points, dtype=torch.int64)
+
+    point_queries = torch.as_tensor(point_queries, dtype=torch.int64).flatten()
+    if point_queries.numel() != num_points:
+        raise ValueError(
+            "Point-query count does not match pred_tracks: "
+            f"got {point_queries.numel()} query frames for {num_points} tracks."
+        )
+    return point_queries
+
+
 @DATASET_REGISTRY.register()
 class BaseDataset(torch.utils.data.Dataset):
     """

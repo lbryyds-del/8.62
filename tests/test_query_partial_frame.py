@@ -1,22 +1,23 @@
-"""Unit tests for the B' query-partial frame-matching path (QUERY_PARTIAL_FRAME_MATCH).
-
-Mirrors tests/test_psr_3d_uot.py: exercises the new helpers in isolation via
-Pointformer.__new__ + a minimal pot_route_cfg, so no weights/data are needed.
-"""
+"""Unit tests for frame-level query-to-support matching and direct text routing."""
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from trokens.models.pointformer import Pointformer
 
 
-def _stub_model():
+def _stub_model(frame_softmax_tau=1.0):
     model = Pointformer.__new__(Pointformer)
     model.pot_route_cfg = SimpleNamespace(
+        FRAME_SOFTMAX_TAU=frame_softmax_tau,
         QUERY_PARTIAL_LOGIT_ALPHA=10.0,
         QUERY_PARTIAL_LOGIT_BETA=1.0,
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
+    )
+    model.cfg = SimpleNamespace(
+        POINT_INFO=SimpleNamespace(USE_PT_QUERY_MASK=True),
     )
     return model
 
@@ -52,9 +53,24 @@ def test_frame_logits_diagonal_self_match_is_one():
     )
 
     assert torch.allclose(bidir[0], torch.ones(num_class), atol=1e-4)
-    # Identical prototypes => bidir cosine ~1 => logit = alpha*1 + beta*0 + bias.
     expected = 10.0 * 1.0 + 1.0 * 0.0 + (-2.0)
     assert torch.allclose(logits[0], torch.full((num_class,), expected), atol=1e-3)
+
+
+def test_pot_frame_logits_keep_mass_term_after_similarity_refactor():
+    model = _stub_model()
+    query_frame = torch.randn(2, 3, 4, 6)
+    support_frame = torch.randn(3, 4, 6)
+    mass = torch.tensor([[0.2, 0.4, 0.6], [0.1, 0.3, 0.5]])
+
+    logits, similarity = model._compute_query_partial_frame_logits(
+        query_frame,
+        support_frame,
+        mass,
+    )
+
+    expected = 10.0 * similarity + mass - 2.0
+    assert torch.allclose(logits, expected, atol=1e-6)
 
 
 def test_support_prototypes_frame_keeps_time_and_handles_missing_class():
@@ -65,15 +81,195 @@ def test_support_prototypes_frame_keeps_time_and_handles_missing_class():
     support_mask = torch.tensor([True, True, False, False])
     num_class = 5
     episode_positive_labels = torch.zeros(num_support, num_class)
-    episode_positive_labels[0, 1] = 1.0  # support sample 0 -> class 1
-    episode_positive_labels[1, 3] = 1.0  # support sample 1 -> class 3
+    episode_positive_labels[0, 1] = 1.0
+    episode_positive_labels[1, 3] = 1.0
 
     proto = model._build_query_partial_support_prototypes_frame(
         value_tokens, point_mask, support_mask, episode_positive_labels, route_aux=None
     )
 
-    assert proto.shape == (num_class, temporal, dim)   # time dimension preserved
+    assert proto.shape == (num_class, temporal, dim)
     assert torch.isfinite(proto).all()
-    assert proto[1].abs().sum() > 0                    # class 1 has a support sample
-    assert proto[3].abs().sum() > 0                    # class 3 has a support sample
-    assert proto[0].abs().sum() == 0                   # class 0 has none -> zero proto
+    assert proto[1].abs().sum() > 0
+    assert proto[3].abs().sum() > 0
+    assert proto[0].abs().sum() == 0
+
+
+def test_frame_softmax_is_per_text_per_frame_and_respects_mask():
+    model = _stub_model(frame_softmax_tau=1.0)
+    patch_tokens = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+        ]
+    )
+    point_mask = torch.tensor(
+        [[True, True, False], [False, False, False]]
+    )
+    text_features = torch.eye(2)
+
+    prototypes, weights = model._compute_frame_softmax_text_prototypes(
+        patch_tokens,
+        point_mask,
+        text_features,
+    )
+
+    assert prototypes.shape == (2, 2, 2)
+    assert weights.shape == (2, 2, 3)
+    assert torch.allclose(weights[:, 0].sum(dim=-1), torch.ones(2))
+    assert torch.equal(weights[:, 0, 2], torch.zeros(2))
+    assert torch.equal(weights[:, 1], torch.zeros(2, 3))
+    assert torch.equal(prototypes[:, 1], torch.zeros(2, 2))
+
+    expected_first = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)
+    expected_second = torch.softmax(torch.tensor([0.0, 1.0]), dim=0)
+    assert torch.allclose(weights[0, 0, :2], expected_first)
+    assert torch.allclose(weights[1, 0, :2], expected_second)
+
+    similarity = model._compute_bidirectional_frame_similarity(
+        prototypes.unsqueeze(0),
+        prototypes,
+    )
+    assert torch.isfinite(similarity).all()
+
+
+def test_frame_softmax_support_uses_independent_true_labels_and_averages():
+    model = _stub_model(frame_softmax_tau=0.5)
+    value_tokens = torch.tensor(
+        [
+            [[[1.0, 0.0], [0.0, 1.0]]],
+            [[[0.0, 1.0], [1.0, 0.0]]],
+            [[[1.0, 1.0], [1.0, -1.0]]],
+        ]
+    )
+    point_mask = torch.ones(3, 1, 2, dtype=torch.bool)
+    support_mask = torch.tensor([True, True, False])
+    episode_positive_labels = torch.tensor(
+        [[1, 1, 0], [1, 0, 0], [0, 0, 1]],
+        dtype=torch.bool,
+    )
+    episode_text = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
+    )
+
+    support_prototypes = model._build_frame_softmax_support_prototypes(
+        value_tokens,
+        point_mask,
+        support_mask,
+        episode_positive_labels,
+        episode_text,
+    )
+    sample0, _ = model._compute_frame_softmax_text_prototypes(
+        value_tokens[0], point_mask[0], episode_text[[0, 1]]
+    )
+    sample1, _ = model._compute_frame_softmax_text_prototypes(
+        value_tokens[1], point_mask[1], episode_text[[0]]
+    )
+
+    assert support_prototypes.shape == (3, 1, 2)
+    assert torch.allclose(
+        support_prototypes[0],
+        torch.stack([sample0[0], sample1[0]], dim=0).mean(dim=0),
+    )
+    assert torch.allclose(support_prototypes[1], sample0[1])
+    assert torch.equal(support_prototypes[2], torch.zeros(1, 2))
+    assert not torch.allclose(sample0[0], sample0[1])
+
+
+def test_frame_softmax_q2s_uses_episode_axis_without_mass_or_query_labels():
+    model = _stub_model(frame_softmax_tau=0.5)
+    value_tokens = torch.tensor(
+        [
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[1.0, 0.0], [0.0, 1.0]],
+            ],
+            [
+                [[1.0, 0.0], [0.0, 1.0]],
+                [[0.9, 0.1], [0.1, 0.9]],
+            ],
+            [
+                [[0.0, 1.0], [1.0, 0.0]],
+                [[0.1, 0.9], [0.9, 0.1]],
+            ],
+        ]
+    )
+    point_mask = torch.ones(3, 2, 2, dtype=torch.bool)
+    episode_class_ids = torch.tensor([4, 7])
+    text_by_class = {
+        4: torch.tensor([1.0, 0.0]),
+        7: torch.tensor([0.0, 1.0]),
+    }
+    encoded_ids = []
+
+    def encode_text(class_ids, dtype):
+        encoded_ids.append(class_ids.detach().cpu().tolist())
+        return torch.stack(
+            [text_by_class[int(class_id)] for class_id in class_ids.tolist()]
+        ).to(dtype=dtype)
+
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("legacy POT/CMW path should not be called")
+
+    model._get_pot_label_text_features = encode_text
+    model._compute_query_partial_3d_transport = fail_if_called
+    model._compute_avg_3d_uot_transport = fail_if_called
+    model._solve_query_partial_3d_uot = fail_if_called
+    model.cmw_cost_net = fail_if_called
+    metadata = {
+        "support_mask": torch.tensor([True, False, False]),
+        "pred_query_mask": point_mask,
+        "pred_visibility": point_mask,
+        "episode_class_ids": episode_class_ids,
+        "episode_positive_labels": torch.tensor(
+            [[1, 0], [1, 0], [0, 1]], dtype=torch.bool
+        ),
+        "raw_positive_labels": torch.tensor(
+            [[1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=torch.bool
+        ),
+    }
+
+    first = model._build_frame_softmax_q2s_aux(value_tokens, metadata)
+    changed_metadata = dict(metadata)
+    changed_metadata["episode_positive_labels"] = metadata[
+        "episode_positive_labels"
+    ].clone()
+    changed_metadata["episode_positive_labels"][1:] = torch.tensor(
+        [[0, 1], [1, 0]], dtype=torch.bool
+    )
+    changed_metadata["raw_positive_labels"] = ~metadata["raw_positive_labels"]
+    model.pot_route_cfg.QUERY_PARTIAL_LOGIT_BETA = 1000.0
+    second = model._build_frame_softmax_q2s_aux(value_tokens, changed_metadata)
+
+    assert encoded_ids == [[4, 7], [4, 7]]
+    assert first["query_partial_query_prototypes"].shape == (2, 2, 2, 2)
+    assert first["query_partial_support_prototypes"].shape == (2, 2, 2)
+    assert first["query_partial_q2s_logits"].shape == (2, 2)
+    assert first["query_partial_query_sample_indices"].tolist() == [1, 2]
+    assert first["query_partial_label_axis_global_labels"].tolist() == [4, 7]
+    assert "query_partial_transport_mass" not in first
+    assert "query_partial_beta_mass_term" not in first
+    assert torch.allclose(
+        first["query_partial_q2s_logits"],
+        10.0 * first["query_partial_diag_similarity"] - 2.0,
+    )
+    assert torch.allclose(
+        first["query_partial_query_prototypes"],
+        second["query_partial_query_prototypes"],
+    )
+    assert torch.allclose(
+        first["query_partial_q2s_logits"],
+        second["query_partial_q2s_logits"],
+    )
+
+
+def test_route_mode_defaults_to_pot_and_rejects_unknown_values():
+    assert Pointformer._resolve_pot_route_mode(SimpleNamespace()) == "pot"
+    assert Pointformer._resolve_pot_route_mode(SimpleNamespace(MODE=" POT ")) == "pot"
+    assert (
+        Pointformer._resolve_pot_route_mode(SimpleNamespace(MODE="FRAME_SOFTMAX"))
+        == "frame_softmax"
+    )
+    with pytest.raises(ValueError, match="Unsupported POT_ROUTE.MODE"):
+        Pointformer._resolve_pot_route_mode(SimpleNamespace(MODE="unknown"))
