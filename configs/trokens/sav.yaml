@@ -22,6 +22,15 @@ FEW_SHOT:
     MLP_RATIO: 4.0
     ATTN_DROPOUT: 0.0
     PROJ_DROPOUT: 0.0
+    CLASS_AGG:
+      ENABLE: True
+      GUIDANCE_DIM: 32
+      NUM_HEADS: 4
+      ATTENTION_TYPE: full
+      POOLING_SIZE: 1
+      PAD_LEN: 0
+      MLP_RATIO: 4.0
+      GATE_INIT: 0.0
   POT_ROUTE:
     ENABLE: True
     MODE: frame_softmax

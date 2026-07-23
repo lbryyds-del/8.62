@@ -23,13 +23,14 @@
 # Original implementation by Seokju Cho and Heeseong Shin:
 # https://github.com/cvlab-kaist/CAT-Seg
 #
-# This file contains a project-local adaptation of CAT-Seg's spatial
-# aggregation blocks.  It intentionally omits CAT-Seg's class transformer
-# and decoder so frames and classes remain independent batch branches.
+# This file contains a project-local adaptation of CAT-Seg's spatial and
+# class aggregation blocks.  The segmentation decoder remains intentionally
+# omitted because this project consumes refined trajectory costs directly.
 # --------------------------------------------------------
 
-"""Frame- and class-independent CAT-Seg spatial cost aggregation."""
+"""Frame-independent CAT-Seg spatial and class cost aggregation."""
 
+import math
 from typing import Sequence, Tuple, Union
 
 import torch
@@ -430,8 +431,395 @@ class _SpatialAggregationPair(nn.Module):
         )
 
 
+class _LinearClassAttention(nn.Module):
+    """CAT-Seg's ELU-feature-map linear attention over class tokens."""
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = float(eps)
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        queries = F.elu(queries) + 1.0
+        keys = F.elu(keys) + 1.0
+
+        value_length = values.shape[1]
+        scaled_values = values / max(value_length, 1)
+        key_values = torch.einsum(
+            "nshd,nshv->nhdv",
+            keys,
+            scaled_values,
+        )
+        normalizer = 1.0 / (
+            torch.einsum(
+                "nlhd,nhd->nlh",
+                queries,
+                keys.sum(dim=1),
+            )
+            + self.eps
+        )
+        return (
+            torch.einsum(
+                "nlhd,nhdv,nlh->nlhv",
+                queries,
+                key_values,
+                normalizer,
+            )
+            * value_length
+        ).contiguous()
+
+
+class _FullClassAttention(nn.Module):
+    """Exact scaled dot-product attention over the episode class axis."""
+
+    def __init__(self, attention_dropout: float = 0.0) -> None:
+        super().__init__()
+        self.attention_dropout = nn.Dropout(attention_dropout)
+
+    def forward(
+        self,
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        scale = queries.shape[-1] ** -0.5
+        attention = torch.einsum("nlhd,nshd->nlsh", queries, keys)
+        attention = F.softmax(attention * scale, dim=2)
+        attention = self.attention_dropout(attention)
+        return torch.einsum(
+            "nlsh,nshd->nlhd",
+            attention,
+            values,
+        ).contiguous()
+
+
+class _GuidedClassAttention(nn.Module):
+    """Class self-attention with text guidance in Q/K and costs in V."""
+
+    def __init__(
+        self,
+        cost_dim: int,
+        text_guidance_dim: int,
+        num_heads: int,
+        attention_type: str,
+        attention_dropout: float,
+    ) -> None:
+        super().__init__()
+        self.cost_dim = cost_dim
+        self.text_guidance_dim = text_guidance_dim
+        self.num_heads = num_heads
+        self.head_dim = cost_dim // num_heads
+
+        query_key_dim = cost_dim + text_guidance_dim
+        self.q = nn.Linear(query_key_dim, cost_dim)
+        self.k = nn.Linear(query_key_dim, cost_dim)
+        self.v = nn.Linear(cost_dim, cost_dim)
+
+        attention_type = str(attention_type).lower()
+        if attention_type == "linear":
+            self.attention = _LinearClassAttention()
+        elif attention_type == "full":
+            self.attention = _FullClassAttention(attention_dropout)
+        else:
+            raise ValueError(
+                "class attention type must be 'full' or 'linear', got "
+                f"{attention_type!r}"
+            )
+
+    def forward(
+        self,
+        cost_tokens: torch.Tensor,
+        text_guidance: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if self.text_guidance_dim > 0:
+            if text_guidance is None:
+                raise ValueError(
+                    "text_guidance is required when class guidance is enabled"
+                )
+            if cost_tokens.shape[:2] != text_guidance.shape[:2]:
+                raise ValueError(
+                    "class cost/text token axes differ: got "
+                    f"{tuple(cost_tokens.shape[:2])} and "
+                    f"{tuple(text_guidance.shape[:2])}"
+                )
+            query_key_input = torch.cat(
+                (cost_tokens, text_guidance),
+                dim=-1,
+            )
+        else:
+            query_key_input = cost_tokens
+
+        batch, classes, _ = cost_tokens.shape
+        queries = self.q(query_key_input).reshape(
+            batch, classes, self.num_heads, self.head_dim
+        )
+        keys = self.k(query_key_input).reshape(
+            batch, classes, self.num_heads, self.head_dim
+        )
+        values = self.v(cost_tokens).reshape(
+            batch, classes, self.num_heads, self.head_dim
+        )
+        attended = self.attention(queries, keys, values)
+        return attended.reshape(batch, classes, self.cost_dim)
+
+
+class _ClassAggregationBlock(nn.Module):
+    """CAT-Seg class aggregation adapted to ``[B,T,K,H,W,C]`` costs.
+
+    CAT-Seg calls the class dimension ``T``.  This project already uses ``T``
+    for video time, so class attention is applied independently at every
+    ``(video, frame, spatial cell)`` over the ``K`` episode classes.
+    """
+
+    def __init__(
+        self,
+        cost_dim: int,
+        text_guidance_dim: int,
+        input_resolution: Tuple[int, int],
+        num_heads: int,
+        attention_type: str,
+        pooling_size: Tuple[int, int],
+        pad_len: int,
+        mlp_ratio: float,
+        attention_dropout: float,
+        gate_init: float,
+    ) -> None:
+        super().__init__()
+        self.cost_dim = cost_dim
+        self.text_guidance_dim = text_guidance_dim
+        self.input_resolution = input_resolution
+        self.pooling_size = pooling_size
+        self.pad_len = pad_len
+
+        self.attention = _GuidedClassAttention(
+            cost_dim=cost_dim,
+            text_guidance_dim=text_guidance_dim,
+            num_heads=num_heads,
+            attention_type=attention_type,
+            attention_dropout=attention_dropout,
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(cost_dim, int(cost_dim * mlp_ratio)),
+            nn.ReLU(),
+            nn.Linear(int(cost_dim * mlp_ratio), cost_dim),
+        )
+        self.attention_norm = nn.LayerNorm(cost_dim)
+        self.mlp_norm = nn.LayerNorm(cost_dim)
+
+        self.padding_tokens = (
+            nn.Parameter(torch.zeros(1, 1, cost_dim))
+            if pad_len > 0
+            else None
+        )
+        self.padding_guidance = (
+            nn.Parameter(torch.zeros(1, 1, text_guidance_dim))
+            if pad_len > 0 and text_guidance_dim > 0
+            else None
+        )
+        # A zero-initialized ReZero-style gate preserves an existing spatial
+        # checkpoint exactly while still allowing the class branch to turn on
+        # during fine-tuning.  Setting it to 1 reproduces CAT-Seg's outer
+        # residual ``x = x + x_pool``.
+        self.residual_gate = nn.Parameter(torch.tensor(float(gate_init)))
+
+    def _masked_pool(
+        self,
+        cost: torch.Tensor,
+        occupancy_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        batch, frames, classes, height, width, channels = cost.shape
+        pool_h, pool_w = self.pooling_size
+        if pool_h == 1 and pool_w == 1:
+            return cost, occupancy_mask
+
+        branch_cost = cost.permute(0, 1, 2, 5, 3, 4).reshape(
+            batch * frames * classes,
+            channels,
+            height,
+            width,
+        )
+        branch_mask = (
+            occupancy_mask.unsqueeze(2)
+            .expand(-1, -1, classes, -1, -1)
+            .reshape(batch * frames * classes, 1, height, width)
+            .to(branch_cost.dtype)
+        )
+        pooled_numerator = F.avg_pool2d(
+            branch_cost * branch_mask,
+            kernel_size=self.pooling_size,
+            stride=self.pooling_size,
+        )
+        pooled_denominator = F.avg_pool2d(
+            branch_mask,
+            kernel_size=self.pooling_size,
+            stride=self.pooling_size,
+        )
+        pooled_cost = pooled_numerator / pooled_denominator.clamp_min(1e-6)
+        pooled_cost = pooled_cost * (pooled_denominator > 0).to(
+            pooled_cost.dtype
+        )
+
+        pooled_height, pooled_width = pooled_cost.shape[-2:]
+        pooled_cost = pooled_cost.reshape(
+            batch,
+            frames,
+            classes,
+            channels,
+            pooled_height,
+            pooled_width,
+        ).permute(0, 1, 2, 4, 5, 3)
+        pooled_mask = F.max_pool2d(
+            occupancy_mask.reshape(batch * frames, 1, height, width).float(),
+            kernel_size=self.pooling_size,
+            stride=self.pooling_size,
+        ).reshape(batch, frames, pooled_height, pooled_width).bool()
+        return pooled_cost, pooled_mask
+
+    def forward(
+        self,
+        cost: torch.Tensor,
+        text_guidance: torch.Tensor = None,
+        occupancy_mask: torch.Tensor = None,
+    ) -> torch.Tensor:
+        if cost.ndim != 6:
+            raise ValueError(
+                "class aggregation cost must have shape [B,T,K,H,W,C], got "
+                f"{tuple(cost.shape)}"
+            )
+        batch, frames, classes, height, width, channels = cost.shape
+        if (height, width) != self.input_resolution or channels != self.cost_dim:
+            raise ValueError(
+                "class aggregation cost resolution/dimension mismatch: got "
+                f"{tuple(cost.shape)}, expected H/W/C="
+                f"{self.input_resolution + (self.cost_dim,)}"
+            )
+        if occupancy_mask is None:
+            occupancy_mask = torch.ones(
+                batch,
+                frames,
+                height,
+                width,
+                device=cost.device,
+                dtype=torch.bool,
+            )
+        elif tuple(occupancy_mask.shape) != (batch, frames, height, width):
+            raise ValueError(
+                "class occupancy mask must have shape [B,T,H,W], got "
+                f"{tuple(occupancy_mask.shape)}"
+            )
+        occupancy_mask = occupancy_mask.to(device=cost.device).bool()
+
+        if self.text_guidance_dim > 0:
+            if text_guidance is None or tuple(text_guidance.shape) != (
+                classes,
+                self.text_guidance_dim,
+            ):
+                actual = None if text_guidance is None else tuple(text_guidance.shape)
+                raise ValueError(
+                    "projected class text guidance must have shape "
+                    f"{(classes, self.text_guidance_dim)}, got {actual}"
+                )
+
+        original_classes = classes
+        pooled_cost, pooled_mask = self._masked_pool(cost, occupancy_mask)
+        pooled_height, pooled_width = pooled_cost.shape[3:5]
+
+        if self.pad_len > 0:
+            if classes > self.pad_len:
+                raise ValueError(
+                    f"class count {classes} exceeds CLASS_AGG.PAD_LEN="
+                    f"{self.pad_len}; use PAD_LEN=0 for variable episode axes"
+                )
+            if classes < self.pad_len:
+                padding_count = self.pad_len - classes
+                padding = self.padding_tokens.expand(
+                    batch * frames * pooled_height * pooled_width,
+                    padding_count,
+                    -1,
+                )
+            else:
+                padding = None
+        else:
+            padding = None
+
+        class_tokens = pooled_cost.permute(0, 1, 3, 4, 2, 5).reshape(
+            batch * frames * pooled_height * pooled_width,
+            classes,
+            channels,
+        )
+        if padding is not None:
+            class_tokens = torch.cat((class_tokens, padding), dim=1)
+
+        expanded_guidance = None
+        if self.text_guidance_dim > 0:
+            guidance = text_guidance
+            if padding is not None:
+                padding_guidance = self.padding_guidance.expand(
+                    1,
+                    self.pad_len - classes,
+                    -1,
+                ).squeeze(0)
+                guidance = torch.cat((guidance, padding_guidance), dim=0)
+            expanded_guidance = guidance.unsqueeze(0).expand(
+                class_tokens.shape[0],
+                -1,
+                -1,
+            )
+
+        position_mask = pooled_mask.reshape(-1, 1, 1).to(class_tokens.dtype)
+        class_tokens = class_tokens * position_mask
+        class_tokens = class_tokens + self.attention(
+            self.attention_norm(class_tokens),
+            expanded_guidance,
+        )
+        class_tokens = class_tokens + self.mlp(
+            self.mlp_norm(class_tokens)
+        )
+        class_tokens = class_tokens * position_mask
+        class_tokens = class_tokens[:, :original_classes]
+
+        class_cost = class_tokens.reshape(
+            batch,
+            frames,
+            pooled_height,
+            pooled_width,
+            original_classes,
+            channels,
+        ).permute(0, 1, 4, 2, 3, 5)
+        if (pooled_height, pooled_width) != (height, width):
+            class_cost = class_cost.permute(0, 1, 2, 5, 3, 4).reshape(
+                batch * frames * original_classes,
+                channels,
+                pooled_height,
+                pooled_width,
+            )
+            class_cost = F.interpolate(
+                class_cost,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=True,
+            )
+            class_cost = class_cost.reshape(
+                batch,
+                frames,
+                original_classes,
+                channels,
+                height,
+                width,
+            ).permute(0, 1, 2, 4, 5, 3)
+
+        class_cost = class_cost * occupancy_mask.unsqueeze(2).unsqueeze(-1).to(
+            class_cost.dtype
+        )
+        return cost + self.residual_gate.to(cost.dtype) * class_cost
+
+
 class CATSpatialCostAggregator(nn.Module):
-    """Refine dense text/patch costs independently per frame and class.
+    """Refine dense text/patch costs with alternating spatial/class blocks.
 
     Args:
         appearance_dim: Channel dimension ``D`` of the dense patch features.
@@ -441,7 +829,19 @@ class CATSpatialCostAggregator(nn.Module):
         num_heads: Attention heads. ``cost_dim`` must be divisible by it.
         window_size: Fixed window shape. Both spatial dimensions must be
             divisible by it.
-        num_layers: Number of W-MSA -> SW-MSA pairs.
+        num_layers: Number of Spatial -> Class aggregator layers.  When class
+            aggregation is disabled it remains the number of spatial pairs.
+        class_attention_enabled: Whether episode classes interact at a fixed
+            frame and spatial cell.
+        class_guidance_dim: Projected text-guidance dimension for class Q/K.
+        class_num_heads: Class-attention heads; defaults to ``num_heads``.
+        class_attention_type: ``"full"`` or CAT-Seg's ``"linear"`` attention.
+        class_pooling_size: Optional spatial pooling used only inside class
+            aggregation.  ``1`` disables pooling.
+        class_pad_len: Optional fixed class sequence length.  ``0`` keeps the
+            native episode axis and is recommended for few-shot ``K=5``.
+        class_gate_init: Initial outer residual gate.  ``0`` preserves an
+            existing spatial-only checkpoint exactly.
 
     Forward inputs:
         dense_patch: ``[B, T, H, W, D]`` dense, ordered patch grid.
@@ -458,9 +858,10 @@ class CATSpatialCostAggregator(nn.Module):
         this dense output at trajectory coordinates and use it directly in
         place of the original point/text cosine.
 
-    ``B * T * K`` is folded into the batch axis before every convolution and
-    attention operation, so branches share parameters but never exchange
-    content.  There is deliberately no temporal or class attention here.
+    Spatial blocks fold ``B * T * K`` into the batch axis.  Each optional class
+    block restores ``[B,T,K,H,W,C]`` and folds it as
+    ``[B*T*H*W,K,C]`` so only classes at the same frame/patch interact.  Video
+    frames always remain independent.
     """
 
     def __init__(
@@ -477,10 +878,23 @@ class CATSpatialCostAggregator(nn.Module):
         proj_dropout: float = 0.0,
         attn_dropout: float = 0.0,
         drop_path: float = 0.0,
+        class_attention_enabled: bool = False,
+        class_guidance_dim: int = 32,
+        class_num_heads: int = None,
+        class_attention_type: str = "full",
+        class_pooling_size: Resolution = 1,
+        class_pad_len: int = 0,
+        class_mlp_ratio: float = 4.0,
+        class_gate_init: float = 0.0,
     ) -> None:
         super().__init__()
         self.input_resolution = _to_2tuple(input_resolution, "input_resolution")
         self.window_size = _to_2tuple(window_size, "window_size")
+        self.class_pooling_size = _to_2tuple(
+            class_pooling_size,
+            "class_pooling_size",
+        )
+        class_num_heads = num_heads if class_num_heads is None else class_num_heads
 
         if not isinstance(appearance_dim, int) or appearance_dim <= 0:
             raise ValueError("appearance_dim must be a positive integer")
@@ -498,6 +912,23 @@ class CATSpatialCostAggregator(nn.Module):
             raise ValueError("num_layers must be a positive integer")
         if mlp_ratio <= 0:
             raise ValueError("mlp_ratio must be positive")
+        if not isinstance(class_attention_enabled, bool):
+            raise ValueError("class_attention_enabled must be a bool")
+        if not isinstance(class_guidance_dim, int) or class_guidance_dim < 0:
+            raise ValueError("class_guidance_dim must be a non-negative integer")
+        if not isinstance(class_num_heads, int) or class_num_heads <= 0:
+            raise ValueError("class_num_heads must be a positive integer")
+        if cost_dim % class_num_heads != 0:
+            raise ValueError(
+                f"cost_dim ({cost_dim}) must be divisible by class_num_heads "
+                f"({class_num_heads})"
+            )
+        if not isinstance(class_pad_len, int) or class_pad_len < 0:
+            raise ValueError("class_pad_len must be a non-negative integer")
+        if class_mlp_ratio <= 0:
+            raise ValueError("class_mlp_ratio must be positive")
+        if not math.isfinite(float(class_gate_init)):
+            raise ValueError("class_gate_init must be finite")
         for name, value in (
             ("proj_dropout", proj_dropout),
             ("attn_dropout", attn_dropout),
@@ -518,12 +949,28 @@ class CATSpatialCostAggregator(nn.Module):
                 f"input_resolution {self.input_resolution} must be divisible by "
                 f"window_size {self.window_size}"
             )
+        pool_h, pool_w = self.class_pooling_size
+        if pool_h > height or pool_w > width:
+            raise ValueError(
+                f"class_pooling_size {self.class_pooling_size} cannot exceed "
+                f"input_resolution {self.input_resolution}"
+            )
+        if height % pool_h != 0 or width % pool_w != 0:
+            raise ValueError(
+                f"input_resolution {self.input_resolution} must be divisible by "
+                f"class_pooling_size {self.class_pooling_size}"
+            )
 
         self.appearance_dim = appearance_dim
         self.cost_dim = cost_dim
         self.guidance_dim = guidance_dim
         self.num_heads = num_heads
         self.num_layers = num_layers
+        self.class_attention_enabled = class_attention_enabled
+        self.class_guidance_dim = class_guidance_dim
+        self.class_num_heads = class_num_heads
+        self.class_attention_type = str(class_attention_type).lower()
+        self.class_pad_len = class_pad_len
 
         # CAT-Seg's cost embedding and appearance-guidance projection.
         self.cost_embedding = nn.Conv2d(
@@ -555,6 +1002,33 @@ class CATSpatialCostAggregator(nn.Module):
                 )
                 for _ in range(num_layers)
             ]
+        )
+        self.text_guidance_projection = (
+            nn.Sequential(
+                nn.Linear(appearance_dim, class_guidance_dim),
+                nn.ReLU(),
+            )
+            if class_attention_enabled and class_guidance_dim > 0
+            else None
+        )
+        self.class_layers = nn.ModuleList(
+            [
+                _ClassAggregationBlock(
+                    cost_dim=cost_dim,
+                    text_guidance_dim=class_guidance_dim,
+                    input_resolution=self.input_resolution,
+                    num_heads=class_num_heads,
+                    attention_type=self.class_attention_type,
+                    pooling_size=self.class_pooling_size,
+                    pad_len=class_pad_len,
+                    mlp_ratio=class_mlp_ratio,
+                    attention_dropout=attn_dropout,
+                    gate_init=class_gate_init,
+                )
+                for _ in range(num_layers)
+            ]
+            if class_attention_enabled
+            else []
         )
         self.cost_head = nn.Conv2d(
             cost_dim, 1, kernel_size=3, stride=1, padding=1
@@ -629,6 +1103,7 @@ class CATSpatialCostAggregator(nn.Module):
             correlation,
             dense_patch,
             occupancy_mask,
+            text_features=text_features,
         )
 
     def forward_precomputed(
@@ -636,6 +1111,7 @@ class CATSpatialCostAggregator(nn.Module):
         correlation: torch.Tensor,
         dense_guidance: torch.Tensor,
         occupancy_mask: torch.Tensor,
+        text_features: torch.Tensor = None,
     ) -> torch.Tensor:
         """Aggregate a masked dense cost reconstructed from trajectory tokens.
 
@@ -645,6 +1121,8 @@ class CATSpatialCostAggregator(nn.Module):
                 ``[B,T,H,W,D]``.
             occupancy_mask: ``[B,T,H,W]`` boolean mask.  False cells are true
                 holes rather than valid zero-valued costs.
+            text_features: Shared episode label features ``[K,D]``.  Required
+                only when text-guided class aggregation is enabled.
         """
         if correlation.ndim != 5:
             raise ValueError(
@@ -683,6 +1161,27 @@ class CATSpatialCostAggregator(nn.Module):
             )
         if classes == 0:
             raise ValueError("correlation must contain at least one class")
+        projected_text_guidance = None
+        if self.class_attention_enabled and self.class_guidance_dim > 0:
+            expected_text_shape = (classes, self.appearance_dim)
+            if text_features is None or tuple(text_features.shape) != expected_text_shape:
+                actual = None if text_features is None else tuple(text_features.shape)
+                raise ValueError(
+                    "class aggregation text_features must have shape "
+                    f"{expected_text_shape}, got {actual}"
+                )
+            normalized_text = F.normalize(
+                torch.nan_to_num(
+                    text_features.float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ),
+                dim=-1,
+            )
+            projected_text_guidance = self.text_guidance_projection(
+                normalized_text
+            )
 
         correlation = torch.nan_to_num(
             correlation.float(),
@@ -736,12 +1235,31 @@ class CATSpatialCostAggregator(nn.Module):
         )
         token_mask = branch_mask.reshape(branches, height * width)
 
-        for spatial_layer in self.spatial_layers:
+        for layer_index, spatial_layer in enumerate(self.spatial_layers):
             cost_tokens = spatial_layer(
                 cost_tokens,
                 guidance,
                 spatial_mask=token_mask,
             )
+            if self.class_attention_enabled:
+                structured_cost = cost_tokens.reshape(
+                    batch,
+                    frames,
+                    classes,
+                    height,
+                    width,
+                    self.cost_dim,
+                )
+                structured_cost = self.class_layers[layer_index](
+                    structured_cost,
+                    projected_text_guidance,
+                    occupancy_mask,
+                )
+                cost_tokens = structured_cost.reshape(
+                    branches,
+                    height * width,
+                    self.cost_dim,
+                )
 
         cost = cost_tokens.reshape(
             branches, height, width, self.cost_dim

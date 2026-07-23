@@ -4,7 +4,14 @@ import torch
 from trokens.models.cat_spatial_aggregation import CATSpatialCostAggregator
 
 
-def _make_module(num_layers=1):
+def _make_module(
+    num_layers=1,
+    class_attention_enabled=False,
+    class_attention_type="full",
+    class_pooling_size=1,
+    class_pad_len=0,
+    class_gate_init=0.0,
+):
     return CATSpatialCostAggregator(
         appearance_dim=8,
         input_resolution=(8, 8),
@@ -17,6 +24,14 @@ def _make_module(num_layers=1):
         proj_dropout=0.0,
         attn_dropout=0.0,
         drop_path=0.0,
+        class_attention_enabled=class_attention_enabled,
+        class_guidance_dim=4,
+        class_num_heads=2,
+        class_attention_type=class_attention_type,
+        class_pooling_size=class_pooling_size,
+        class_pad_len=class_pad_len,
+        class_mlp_ratio=2.0,
+        class_gate_init=class_gate_init,
     )
 
 
@@ -148,3 +163,151 @@ def test_resolution_and_window_contract_is_validated():
     module = _make_module()
     with pytest.raises(ValueError, match="does not match"):
         module(torch.randn(1, 2, 4, 8, 8), torch.randn(3, 8))
+
+
+def test_zero_gated_class_branch_matches_spatial_only_checkpoint():
+    torch.manual_seed(10)
+    spatial_only = _make_module().eval()
+    spatial_class = _make_module(
+        class_attention_enabled=True,
+        class_gate_init=0.0,
+    ).eval()
+    incompatible = spatial_class.load_state_dict(
+        spatial_only.state_dict(),
+        strict=False,
+    )
+
+    assert not incompatible.unexpected_keys
+    assert incompatible.missing_keys
+    assert all(
+        key.startswith(("class_layers.", "text_guidance_projection."))
+        for key in incompatible.missing_keys
+    )
+
+    dense_patch = torch.randn(2, 2, 8, 8, 8)
+    text_features = torch.randn(5, 8)
+    reference = spatial_only(dense_patch, text_features)
+    adapted = spatial_class(dense_patch, text_features)
+
+    assert torch.allclose(adapted, reference, atol=1e-7, rtol=0.0)
+    assert spatial_class.class_layers[0].residual_gate.item() == 0.0
+
+
+def test_class_attention_is_equivariant_to_episode_class_permutation():
+    torch.manual_seed(11)
+    module = _make_module(
+        class_attention_enabled=True,
+        class_gate_init=1.0,
+    ).eval()
+    correlation = torch.randn(1, 2, 5, 8, 8)
+    guidance = torch.randn(1, 2, 8, 8, 8)
+    occupancy = torch.ones(1, 2, 8, 8, dtype=torch.bool)
+    text_features = torch.randn(5, 8)
+    permutation = torch.tensor([3, 0, 4, 1, 2])
+
+    reference = module.forward_precomputed(
+        correlation,
+        guidance,
+        occupancy,
+        text_features=text_features,
+    )
+    permuted = module.forward_precomputed(
+        correlation[:, :, permutation],
+        guidance,
+        occupancy,
+        text_features=text_features[permutation],
+    )
+
+    assert torch.allclose(
+        permuted,
+        reference[:, :, permutation],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+def test_class_attention_connects_classes_but_not_frames():
+    torch.manual_seed(12)
+    module = _make_module(
+        class_attention_enabled=True,
+        class_gate_init=1.0,
+    ).eval()
+    correlation = torch.randn(1, 3, 4, 8, 8)
+    guidance = torch.randn(1, 3, 8, 8, 8)
+    occupancy = torch.ones(1, 3, 8, 8, dtype=torch.bool)
+    text_features = torch.randn(4, 8)
+    reference = module.forward_precomputed(
+        correlation,
+        guidance,
+        occupancy,
+        text_features=text_features,
+    )
+
+    changed = correlation.clone()
+    changed[:, 1, 2, 3, 3] += 20.0
+    changed_output = module.forward_precomputed(
+        changed,
+        guidance,
+        occupancy,
+        text_features=text_features,
+    )
+
+    assert torch.allclose(
+        changed_output[:, 0],
+        reference[:, 0],
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert torch.allclose(
+        changed_output[:, 2],
+        reference[:, 2],
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert not torch.allclose(
+        changed_output[:, 1, 0],
+        reference[:, 1, 0],
+    )
+
+
+@pytest.mark.parametrize("attention_type", ["full", "linear"])
+def test_class_pooling_padding_and_sparse_occupancy(attention_type):
+    torch.manual_seed(13)
+    module = _make_module(
+        class_attention_enabled=True,
+        class_attention_type=attention_type,
+        class_pooling_size=2,
+        class_pad_len=6,
+        class_gate_init=1.0,
+    ).eval()
+    correlation = torch.randn(1, 2, 3, 8, 8)
+    guidance = torch.randn(1, 2, 8, 8, 8)
+    occupancy = torch.zeros(1, 2, 8, 8, dtype=torch.bool)
+    occupancy[:, :, 1:5, 2:6] = True
+    text_features = torch.randn(3, 8)
+
+    output = module.forward_precomputed(
+        correlation,
+        guidance,
+        occupancy,
+        text_features=text_features,
+    )
+
+    assert output.shape == correlation.shape
+    assert torch.isfinite(output).all()
+    expanded_mask = occupancy.unsqueeze(2).expand_as(output)
+    assert torch.count_nonzero(output.masked_select(~expanded_mask)) == 0
+    class_attention = module.class_layers[0].attention
+    assert class_attention.q.in_features == module.cost_dim + 4
+    assert class_attention.k.in_features == module.cost_dim + 4
+    assert class_attention.v.in_features == module.cost_dim
+
+
+def test_text_guidance_is_required_for_enabled_class_aggregation():
+    module = _make_module(class_attention_enabled=True)
+    with pytest.raises(ValueError, match="text_features must have shape"):
+        module.forward_precomputed(
+            torch.randn(1, 1, 3, 8, 8),
+            torch.randn(1, 1, 8, 8, 8),
+            torch.ones(1, 1, 8, 8, dtype=torch.bool),
+        )

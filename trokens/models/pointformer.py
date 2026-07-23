@@ -343,6 +343,7 @@ class Pointformer(nn.Module):
             window_size = int(getattr(self.cost_agg_cfg, "WINDOW_SIZE", 4))
             num_layers = int(getattr(self.cost_agg_cfg, "NUM_LAYERS", 1))
             mlp_ratio = float(getattr(self.cost_agg_cfg, "MLP_RATIO", 4.0))
+            class_agg_cfg = getattr(self.cost_agg_cfg, "CLASS_AGG", None)
             self.cat_spatial_cost_aggregator = CATSpatialCostAggregator(
                 appearance_dim=self.embed_dim,
                 cost_dim=cost_dim,
@@ -357,6 +358,32 @@ class Pointformer(nn.Module):
                 ),
                 proj_dropout=float(
                     getattr(self.cost_agg_cfg, "PROJ_DROPOUT", 0.0)
+                ),
+                class_attention_enabled=bool(
+                    getattr(class_agg_cfg, "ENABLE", False)
+                ),
+                class_guidance_dim=int(
+                    getattr(class_agg_cfg, "GUIDANCE_DIM", 32)
+                ),
+                class_num_heads=int(
+                    getattr(class_agg_cfg, "NUM_HEADS", num_heads)
+                ),
+                class_attention_type=str(
+                    getattr(class_agg_cfg, "ATTENTION_TYPE", "full")
+                ),
+                class_pooling_size=getattr(
+                    class_agg_cfg,
+                    "POOLING_SIZE",
+                    1,
+                ),
+                class_pad_len=int(
+                    getattr(class_agg_cfg, "PAD_LEN", 0)
+                ),
+                class_mlp_ratio=float(
+                    getattr(class_agg_cfg, "MLP_RATIO", 4.0)
+                ),
+                class_gate_init=float(
+                    getattr(class_agg_cfg, "GATE_INIT", 0.0)
                 ),
             )
 
@@ -3278,6 +3305,7 @@ class Pointformer(nn.Module):
                 dense_cost,
                 dense_guidance,
                 occupancy,
+                text_features=label_text_features,
             )
         )
         refined_point_cost = self._sample_dense_cost_at_tracks(
@@ -3286,6 +3314,177 @@ class Pointformer(nn.Module):
         )
         return torch.nan_to_num(
             refined_point_cost,
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        )
+
+    def _compute_split_cat_refined_point_similarity(
+        self,
+        patch_tokens,
+        point_mask,
+        pred_tracks,
+        support_mask,
+        episode_positive_labels,
+        episode_class_ids,
+        episode_label_text,
+        raw_positive_labels=None,
+    ):
+        """Apply CAT with separate support/query label information.
+
+        Query samples are refined jointly against every candidate on the
+        episode label axis.  A support sample is instead refined against only
+        its known *global* ground-truth labels.  The refined support costs that
+        overlap the episode axis are then mapped back to their episode slots.
+
+        Importantly, query rows from ``raw_positive_labels`` are never read.
+        They are evaluation targets, not model inputs.  If global labels are
+        unavailable, support samples fall back to their known positive labels
+        on the episode axis.
+        """
+        device = patch_tokens.device
+        batch = patch_tokens.shape[0]
+        support_mask = support_mask.to(device=device).bool().flatten()
+        if support_mask.numel() != batch:
+            raise ValueError(
+                "support_mask must have one entry per sample; got "
+                f"{tuple(support_mask.shape)} for batch size {batch}."
+            )
+
+        episode_class_ids = episode_class_ids.to(
+            device=device,
+            dtype=torch.long,
+        ).flatten()
+        episode_positive_labels = episode_positive_labels.to(
+            device=device,
+        ).bool()
+        expected_positive_shape = (batch, episode_class_ids.numel())
+        if tuple(episode_positive_labels.shape) != expected_positive_shape:
+            raise ValueError(
+                "episode_positive_labels must have shape [B,K]; got "
+                f"{tuple(episode_positive_labels.shape)}, expected "
+                f"{expected_positive_shape}."
+            )
+        if tuple(episode_label_text.shape[:1]) != (
+            episode_class_ids.numel(),
+        ):
+            raise ValueError(
+                "episode label ids/text length mismatch: got "
+                f"{episode_class_ids.numel()} ids and "
+                f"{episode_label_text.shape[0]} text features."
+            )
+
+        support_raw_labels = None
+        if raw_positive_labels is not None:
+            raw_positive_labels = raw_positive_labels.to(device=device).bool()
+            raw_positive_labels = raw_positive_labels.reshape(batch, -1)
+            # Slice only support rows.  Query ground truth must not influence
+            # either its label axis or any class-attention computation.
+            support_indices = torch.nonzero(
+                support_mask,
+                as_tuple=False,
+            ).flatten()
+            support_raw_labels = raw_positive_labels.index_select(
+                0,
+                support_indices,
+            )
+        else:
+            support_indices = torch.nonzero(
+                support_mask,
+                as_tuple=False,
+            ).flatten()
+
+        # Non-positive support/episode slots remain zero and are never consumed
+        # downstream.  In particular, support samples do not even compute a
+        # cost against non-ground-truth episode labels.
+        refined_similarity = torch.zeros(
+            batch,
+            episode_class_ids.numel(),
+            patch_tokens.shape[1],
+            patch_tokens.shape[2],
+            device=device,
+            dtype=torch.float32,
+        )
+
+        query_indices = torch.nonzero(
+            ~support_mask,
+            as_tuple=False,
+        ).flatten()
+        if query_indices.numel() > 0:
+            query_similarity = self._compute_cat_refined_point_similarity(
+                patch_tokens.index_select(0, query_indices),
+                point_mask.index_select(0, query_indices),
+                pred_tracks.index_select(0, query_indices),
+                episode_label_text,
+            )
+            refined_similarity = refined_similarity.index_copy(
+                0,
+                query_indices,
+                query_similarity,
+            )
+
+        for local_support_idx, sample_idx_tensor in enumerate(support_indices):
+            sample_idx = int(sample_idx_tensor.item())
+            positive_episode_indices = torch.nonzero(
+                episode_positive_labels[sample_idx],
+                as_tuple=False,
+            ).flatten()
+            fallback_global_labels = episode_class_ids.index_select(
+                0,
+                positive_episode_indices,
+            )
+
+            if support_raw_labels is None:
+                true_global_labels = fallback_global_labels
+            else:
+                true_global_labels = torch.nonzero(
+                    support_raw_labels[local_support_idx],
+                    as_tuple=False,
+                ).flatten().to(dtype=torch.long)
+                # Metadata should agree, but keep all known episode positives
+                # if a partially populated raw-label vector is supplied.
+                if fallback_global_labels.numel() > 0:
+                    true_global_labels = torch.unique(
+                        torch.cat(
+                            (true_global_labels, fallback_global_labels),
+                            dim=0,
+                        ),
+                        sorted=True,
+                    )
+
+            if true_global_labels.numel() == 0:
+                continue
+
+            true_label_text = self._get_pot_label_text_features(
+                true_global_labels,
+                patch_tokens.dtype,
+            )
+            true_label_similarity = self._compute_cat_refined_point_similarity(
+                patch_tokens[sample_idx : sample_idx + 1],
+                point_mask[sample_idx : sample_idx + 1],
+                pred_tracks[sample_idx : sample_idx + 1],
+                true_label_text,
+            )[0]
+
+            true_axis_indices, episode_axis_indices = torch.nonzero(
+                true_global_labels[:, None] == episode_class_ids[None, :],
+                as_tuple=True,
+            )
+            if episode_axis_indices.numel() == 0:
+                continue
+            sample_similarity = refined_similarity[sample_idx].index_copy(
+                0,
+                episode_axis_indices,
+                true_label_similarity.index_select(0, true_axis_indices),
+            )
+            refined_similarity = refined_similarity.index_copy(
+                0,
+                sample_idx_tensor.reshape(1),
+                sample_similarity.unsqueeze(0),
+            )
+
+        return torch.nan_to_num(
+            refined_similarity,
             nan=0.0,
             posinf=1e4,
             neginf=-1e4,
@@ -4065,11 +4264,15 @@ class Pointformer(nn.Module):
         )
         refined_similarity = None
         if bool(getattr(self, "use_cat_cost_aggregation", False)):
-            refined_similarity = self._compute_cat_refined_point_similarity(
+            refined_similarity = self._compute_split_cat_refined_point_similarity(
                 value_tokens,
                 point_mask,
                 pred_tracks,
+                support_mask,
+                episode_positive_labels,
+                episode_class_ids,
                 episode_label_text,
+                raw_positive_labels=metadata.get("raw_positive_labels"),
             )
         support_prototypes = self._build_frame_softmax_support_prototypes(
             value_tokens,
