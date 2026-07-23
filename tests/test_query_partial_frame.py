@@ -8,7 +8,11 @@ import torch
 from trokens.models.pointformer import Pointformer
 
 
-def _stub_model(frame_softmax_tau=1.0):
+def _stub_model(
+    frame_softmax_tau=1.0,
+    use_support_text_fusion=False,
+    visual_detach=True,
+):
     model = Pointformer.__new__(Pointformer)
     model.pot_route_cfg = SimpleNamespace(
         FRAME_SOFTMAX_TAU=frame_softmax_tau,
@@ -18,6 +22,12 @@ def _stub_model(frame_softmax_tau=1.0):
     )
     model.cfg = SimpleNamespace(
         POINT_INFO=SimpleNamespace(USE_PT_QUERY_MASK=True),
+    )
+    model.use_support_text_fusion = use_support_text_fusion
+    model.support_text_fusion_cfg = SimpleNamespace(
+        TEXT_WEIGHT=1.0,
+        VISUAL_WEIGHT=1.0,
+        VISUAL_DETACH=visual_detach,
     )
     return model
 
@@ -174,6 +184,140 @@ def test_frame_softmax_support_uses_independent_true_labels_and_averages():
     assert torch.allclose(support_prototypes[1], sample0[1])
     assert torch.equal(support_prototypes[2], torch.zeros(1, 2))
     assert not torch.allclose(sample0[0], sample0[1])
+
+
+def test_support_text_fusion_is_fixed_one_to_one_with_missing_class_fallback():
+    model = _stub_model(use_support_text_fusion=True)
+    episode_text = torch.tensor(
+        [[1.0, 0.0], [0.0, 1.0]],
+    )
+    support_prototypes = torch.tensor(
+        [
+            [[1.0, 0.0], [0.0, 3.0], [0.0, 0.0]],
+            [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+        ]
+    )
+
+    fused, support_visual, valid_classes = (
+        model._fuse_episode_text_with_support_visual(
+            episode_text,
+            support_prototypes,
+        )
+    )
+
+    expected_visual = torch.nn.functional.normalize(
+        torch.tensor([1.0, 3.0]),
+        dim=0,
+    )
+    expected_fused = torch.nn.functional.normalize(
+        episode_text[0] + expected_visual,
+        dim=0,
+    )
+    assert torch.equal(valid_classes, torch.tensor([True, False]))
+    assert torch.allclose(support_visual[0], expected_visual)
+    assert torch.equal(support_visual[1], torch.zeros(2))
+    assert torch.allclose(fused[0], expected_fused)
+    assert torch.equal(fused[1], episode_text[1])
+
+
+def test_support_text_fusion_detaches_support_conditioning_branch():
+    model = _stub_model(
+        use_support_text_fusion=True,
+        visual_detach=True,
+    )
+    episode_text = torch.tensor(
+        [[1.0, 0.0]],
+        requires_grad=True,
+    )
+    support_prototypes = torch.tensor(
+        [[[0.0, 1.0], [0.0, 2.0]]],
+        requires_grad=True,
+    )
+
+    fused, _, _ = model._fuse_episode_text_with_support_visual(
+        episode_text,
+        support_prototypes,
+    )
+    fused[0, 1].backward()
+
+    assert episode_text.grad is not None
+    assert torch.isfinite(episode_text.grad).all()
+    assert support_prototypes.grad is None
+
+
+def test_frame_softmax_fusion_conditions_query_only_and_ignores_query_targets():
+    model = _stub_model(
+        frame_softmax_tau=0.5,
+        use_support_text_fusion=True,
+    )
+    value_tokens = torch.tensor(
+        [
+            [[[0.0, 1.0], [0.0, 1.0]]],
+            [[[1.0, 0.0], [1.0, 0.0]]],
+            [[[1.0, 0.0], [0.0, 1.0]]],
+        ]
+    )
+    point_mask = torch.ones(3, 1, 2, dtype=torch.bool)
+    episode_text = torch.eye(2)
+    model._get_pot_label_text_features = lambda class_ids, dtype: (
+        episode_text.index_select(0, class_ids - 4).to(dtype=dtype)
+    )
+    metadata = {
+        "support_mask": torch.tensor([True, True, False]),
+        "pred_query_mask": point_mask,
+        "pred_visibility": point_mask,
+        "episode_class_ids": torch.tensor([4, 5]),
+        "episode_positive_labels": torch.tensor(
+            [[1, 0], [0, 1], [1, 0]],
+            dtype=torch.bool,
+        ),
+    }
+
+    routed_text = []
+    original_compute = model._compute_frame_softmax_text_prototypes
+
+    def record_routed_text(patch_tokens, sample_mask, label_text_features):
+        routed_text.append(label_text_features.detach().clone())
+        return original_compute(patch_tokens, sample_mask, label_text_features)
+
+    model._compute_frame_softmax_text_prototypes = record_routed_text
+    first = model._build_frame_softmax_q2s_aux(value_tokens, metadata)
+
+    assert len(routed_text) == 3
+    assert torch.equal(routed_text[0], episode_text[[0]])
+    assert torch.equal(routed_text[1], episode_text[[1]])
+    assert torch.allclose(
+        routed_text[2],
+        first["support_text_fusion_query_features"],
+    )
+    expected_fused = torch.full((2, 2), 2 ** -0.5)
+    assert torch.allclose(
+        first["support_text_fusion_query_features"],
+        expected_fused,
+    )
+    assert torch.equal(
+        first["support_text_fusion_valid_classes"],
+        torch.tensor([True, True]),
+    )
+
+    changed_metadata = dict(metadata)
+    changed_metadata["episode_positive_labels"] = metadata[
+        "episode_positive_labels"
+    ].clone()
+    changed_metadata["episode_positive_labels"][2] = torch.tensor([0, 1])
+    routed_text.clear()
+    second = model._build_frame_softmax_q2s_aux(
+        value_tokens,
+        changed_metadata,
+    )
+    assert torch.allclose(
+        first["support_text_fusion_query_features"],
+        second["support_text_fusion_query_features"],
+    )
+    assert torch.allclose(
+        first["query_partial_query_prototypes"],
+        second["query_partial_query_prototypes"],
+    )
 
 
 def test_frame_softmax_q2s_uses_episode_axis_without_mass_or_query_labels():

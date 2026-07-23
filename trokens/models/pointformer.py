@@ -141,6 +141,11 @@ class Pointformer(nn.Module):
         self.pot_route_cfg = cfg.FEW_SHOT.POT_ROUTE
         self.text_align_cfg = cfg.FEW_SHOT.TEXT_ALIGN
         self.cost_agg_cfg = getattr(cfg.FEW_SHOT, "COST_AGG", None)
+        self.support_text_fusion_cfg = getattr(
+            cfg.FEW_SHOT,
+            "SUPPORT_TEXT_FUSION",
+            None,
+        )
         self._pot_debug_call_count = 0
         self._pot_debug_record_count = 0
         self._pot_debug_io_failed = False
@@ -160,6 +165,12 @@ class Pointformer(nn.Module):
         )
         self.use_frame_softmax_route = (
             text_route_enabled and self.pot_route_mode == "frame_softmax"
+        )
+        support_text_fusion_requested = bool(
+            getattr(self.support_text_fusion_cfg, "ENABLE", False)
+        )
+        self.use_support_text_fusion = (
+            support_text_fusion_requested and self.use_frame_softmax_route
         )
         cost_agg_requested = bool(
             getattr(self.cost_agg_cfg, "ENABLE", False)
@@ -203,6 +214,17 @@ class Pointformer(nn.Module):
         if cost_agg_requested and not self.use_frame_softmax_route:
             raise NotImplementedError(
                 "COST_AGG currently requires the enabled frame_softmax text route."
+            )
+        if support_text_fusion_requested and not self.use_frame_softmax_route:
+            raise NotImplementedError(
+                "SUPPORT_TEXT_FUSION currently requires the enabled "
+                "frame_softmax text route."
+            )
+        if self.use_support_text_fusion and self.use_cat_cost_aggregation:
+            raise NotImplementedError(
+                "SUPPORT_TEXT_FUSION and COST_AGG cannot be enabled together: "
+                "CAT supplies precomputed query costs and would bypass the fused "
+                "query features."
             )
         if self.use_cat_cost_aggregation and not cfg.POINT_INFO.ENABLE:
             raise NotImplementedError(
@@ -3063,6 +3085,87 @@ class Pointformer(nn.Module):
             neginf=0.0,
         )
 
+    def _fuse_episode_text_with_support_visual(
+        self,
+        episode_label_text,
+        support_prototypes,
+    ):
+        """Fuse episode text with masked temporal support prototypes for Query."""
+        if episode_label_text.ndim != 2:
+            raise ValueError(
+                "episode_label_text must have shape [K,D]; got "
+                f"{tuple(episode_label_text.shape)}."
+            )
+        if support_prototypes.ndim != 3:
+            raise ValueError(
+                "support_prototypes must have shape [K,T,D]; got "
+                f"{tuple(support_prototypes.shape)}."
+            )
+        expected_shape = (
+            episode_label_text.shape[0],
+            episode_label_text.shape[1],
+        )
+        if (
+            support_prototypes.shape[0] != expected_shape[0]
+            or support_prototypes.shape[2] != expected_shape[1]
+        ):
+            raise ValueError(
+                "Support/text class or feature dimensions differ: text is "
+                f"{tuple(episode_label_text.shape)}, support is "
+                f"{tuple(support_prototypes.shape)}."
+            )
+
+        output_dtype = episode_label_text.dtype
+        output_device = episode_label_text.device
+        support_frames = torch.nan_to_num(
+            support_prototypes.to(device=output_device).float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid_frames = support_frames.norm(dim=-1) > 1e-12
+        valid_classes = valid_frames.any(dim=1)
+        frame_count = valid_frames.sum(dim=1, keepdim=True).to(
+            dtype=support_frames.dtype,
+        )
+        support_visual = (
+            support_frames * valid_frames.unsqueeze(-1).to(support_frames.dtype)
+        ).sum(dim=1) / frame_count.clamp_min(1.0)
+
+        fusion_cfg = getattr(self, "support_text_fusion_cfg", None)
+        if bool(getattr(fusion_cfg, "VISUAL_DETACH", True)):
+            support_visual = support_visual.detach()
+        text_weight = float(getattr(fusion_cfg, "TEXT_WEIGHT", 1.0))
+        visual_weight = float(getattr(fusion_cfg, "VISUAL_WEIGHT", 1.0))
+        if (
+            not np.isfinite(text_weight)
+            or not np.isfinite(visual_weight)
+            or text_weight < 0.0
+            or visual_weight < 0.0
+            or text_weight + visual_weight <= 0.0
+        ):
+            raise ValueError(
+                "SUPPORT_TEXT_FUSION weights must be finite, non-negative, "
+                "and not both zero."
+            )
+
+        text_norm = self._safe_l2_normalize(
+            episode_label_text.to(device=output_device),
+            dim=-1,
+        )
+        visual_norm = self._safe_l2_normalize(support_visual, dim=-1)
+        combined = text_weight * text_norm + visual_weight * visual_norm
+        combined_valid = combined.norm(dim=-1) > 1e-12
+        fused = self._safe_l2_normalize(combined, dim=-1)
+        use_fused = valid_classes & combined_valid
+        fused = torch.where(use_fused.unsqueeze(-1), fused, text_norm)
+
+        return (
+            fused.to(device=output_device, dtype=output_dtype),
+            visual_norm.to(device=output_device, dtype=output_dtype),
+            valid_classes.to(device=output_device),
+        )
+
     def _sample_dense_cost_at_tracks(self, dense_cost, pred_tracks):
         """Sample [B,T,K,H,W] dense costs at [B,T,N,2] track coordinates."""
         if dense_cost.ndim != 5:
@@ -4282,6 +4385,22 @@ class Pointformer(nn.Module):
             episode_label_text,
             precomputed_similarity=refined_similarity,
         )
+        query_label_features = episode_label_text
+        support_visual = None
+        support_visual_valid = None
+        if bool(getattr(self, "use_support_text_fusion", False)):
+            if refined_similarity is not None:
+                raise RuntimeError(
+                    "SUPPORT_TEXT_FUSION cannot consume CAT precomputed query costs."
+                )
+            (
+                query_label_features,
+                support_visual,
+                support_visual_valid,
+            ) = self._fuse_episode_text_with_support_visual(
+                episode_label_text,
+                support_prototypes,
+            )
 
         query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
         query_prototypes = []
@@ -4290,7 +4409,7 @@ class Pointformer(nn.Module):
                 sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
                     value_tokens[sample_idx],
                     point_mask[sample_idx],
-                    episode_label_text,
+                    query_label_features,
                 )
             else:
                 sample_prototypes, _ = (
@@ -4323,7 +4442,7 @@ class Pointformer(nn.Module):
             device=value_tokens.device,
             dtype=torch.long,
         )
-        return {
+        result = {
             "query_partial_q2s_logits": q2s_logits.to(
                 device=value_tokens.device,
                 dtype=value_tokens.dtype,
@@ -4360,6 +4479,22 @@ class Pointformer(nn.Module):
             ),
             "query_partial_target_label_indices": target_label_indices,
         }
+        if support_visual is not None:
+            result.update({
+                "support_text_fusion_query_features": query_label_features.to(
+                    device=value_tokens.device,
+                    dtype=value_tokens.dtype,
+                ),
+                "support_text_fusion_visual_prototypes": support_visual.to(
+                    device=value_tokens.device,
+                    dtype=value_tokens.dtype,
+                ),
+                "support_text_fusion_valid_classes": support_visual_valid.to(
+                    device=value_tokens.device,
+                    dtype=torch.bool,
+                ),
+            })
+        return result
 
     def _build_query_partial_q2s_aux(
         self,
