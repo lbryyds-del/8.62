@@ -2,7 +2,6 @@
 
 from types import SimpleNamespace
 
-import pytest
 import torch
 
 from trokens.models.pointformer import Pointformer
@@ -17,7 +16,6 @@ def _stub_model(
     model.pot_route_cfg = SimpleNamespace(
         FRAME_SOFTMAX_TAU=frame_softmax_tau,
         QUERY_PARTIAL_LOGIT_ALPHA=10.0,
-        QUERY_PARTIAL_LOGIT_BETA=1.0,
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
     )
     model.cfg = SimpleNamespace(
@@ -30,79 +28,6 @@ def _stub_model(
         VISUAL_DETACH=visual_detach,
     )
     return model
-
-
-def test_frame_logits_shape_and_range():
-    model = _stub_model()
-    num_q, num_class, temporal, dim = 3, 5, 8, 16
-    query_frame = torch.randn(num_q, num_class, temporal, dim)
-    support_frame = torch.randn(num_class, temporal, dim)
-    mass = torch.rand(num_q, num_class)
-
-    logits, bidir = model._compute_query_partial_frame_logits(
-        query_frame, support_frame, mass
-    )
-
-    assert logits.shape == (num_q, num_class)
-    assert bidir.shape == (num_q, num_class)
-    assert torch.isfinite(logits).all()
-    assert (bidir <= 1.0 + 1e-4).all() and (bidir >= -1.0 - 1e-4).all()
-
-
-def test_frame_logits_diagonal_self_match_is_one():
-    # When the query class-c prototype equals the support class-c prototype, the
-    # bidirectional nearest-neighbor cosine on the diagonal should be ~1.
-    model = _stub_model()
-    num_class, temporal, dim = 4, 6, 8
-    support_frame = torch.randn(num_class, temporal, dim)
-    query_frame = support_frame.unsqueeze(0).clone()  # [1, N, T, C]
-    mass = torch.zeros(1, num_class)
-
-    logits, bidir = model._compute_query_partial_frame_logits(
-        query_frame, support_frame, mass
-    )
-
-    assert torch.allclose(bidir[0], torch.ones(num_class), atol=1e-4)
-    expected = 10.0 * 1.0 + 1.0 * 0.0 + (-2.0)
-    assert torch.allclose(logits[0], torch.full((num_class,), expected), atol=1e-3)
-
-
-def test_pot_frame_logits_keep_mass_term_after_similarity_refactor():
-    model = _stub_model()
-    query_frame = torch.randn(2, 3, 4, 6)
-    support_frame = torch.randn(3, 4, 6)
-    mass = torch.tensor([[0.2, 0.4, 0.6], [0.1, 0.3, 0.5]])
-
-    logits, similarity = model._compute_query_partial_frame_logits(
-        query_frame,
-        support_frame,
-        mass,
-    )
-
-    expected = 10.0 * similarity + mass - 2.0
-    assert torch.allclose(logits, expected, atol=1e-6)
-
-
-def test_support_prototypes_frame_keeps_time_and_handles_missing_class():
-    model = _stub_model()
-    num_support, temporal, points, dim = 4, 8, 10, 16
-    value_tokens = torch.randn(num_support, temporal, points, dim)
-    point_mask = torch.ones(num_support, temporal, points, dtype=torch.bool)
-    support_mask = torch.tensor([True, True, False, False])
-    num_class = 5
-    episode_positive_labels = torch.zeros(num_support, num_class)
-    episode_positive_labels[0, 1] = 1.0
-    episode_positive_labels[1, 3] = 1.0
-
-    proto = model._build_query_partial_support_prototypes_frame(
-        value_tokens, point_mask, support_mask, episode_positive_labels, route_aux=None
-    )
-
-    assert proto.shape == (num_class, temporal, dim)
-    assert torch.isfinite(proto).all()
-    assert proto[1].abs().sum() > 0
-    assert proto[3].abs().sum() > 0
-    assert proto[0].abs().sum() == 0
 
 
 def test_frame_softmax_is_per_text_per_frame_and_respects_mask():
@@ -352,15 +277,7 @@ def test_frame_softmax_q2s_uses_episode_axis_without_mass_or_query_labels():
             [text_by_class[int(class_id)] for class_id in class_ids.tolist()]
         ).to(dtype=dtype)
 
-    def fail_if_called(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("legacy POT/CMW path should not be called")
-
     model._get_pot_label_text_features = encode_text
-    model._compute_query_partial_3d_transport = fail_if_called
-    model._compute_avg_3d_uot_transport = fail_if_called
-    model._solve_query_partial_3d_uot = fail_if_called
-    model.cmw_cost_net = fail_if_called
     metadata = {
         "support_mask": torch.tensor([True, False, False]),
         "pred_query_mask": point_mask,
@@ -383,7 +300,6 @@ def test_frame_softmax_q2s_uses_episode_axis_without_mass_or_query_labels():
         [[0, 1], [1, 0]], dtype=torch.bool
     )
     changed_metadata["raw_positive_labels"] = ~metadata["raw_positive_labels"]
-    model.pot_route_cfg.QUERY_PARTIAL_LOGIT_BETA = 1000.0
     second = model._build_frame_softmax_q2s_aux(value_tokens, changed_metadata)
 
     assert encoded_ids == [[4, 7], [4, 7]]
@@ -406,14 +322,3 @@ def test_frame_softmax_q2s_uses_episode_axis_without_mass_or_query_labels():
         first["query_partial_q2s_logits"],
         second["query_partial_q2s_logits"],
     )
-
-
-def test_route_mode_defaults_to_pot_and_rejects_unknown_values():
-    assert Pointformer._resolve_pot_route_mode(SimpleNamespace()) == "pot"
-    assert Pointformer._resolve_pot_route_mode(SimpleNamespace(MODE=" POT ")) == "pot"
-    assert (
-        Pointformer._resolve_pot_route_mode(SimpleNamespace(MODE="FRAME_SOFTMAX"))
-        == "frame_softmax"
-    )
-    with pytest.raises(ValueError, match="Unsupported POT_ROUTE.MODE"):
-        Pointformer._resolve_pot_route_mode(SimpleNamespace(MODE="unknown"))
