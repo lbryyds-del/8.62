@@ -512,9 +512,37 @@ class Pointformer(nn.Module):
         return label_names
 
     def _get_sav_label_prompts(self, label_name):
-        """Return prompt variants for SAV labels that need finer visual grounding."""
+        """Return visually grounded prompt variants for every SAV atomic label."""
         base_prompt = label_name.replace("_", " ")
         prompt_bank = {
+            "sit": [
+                "sit",
+                "a student sits on a chair",
+                "the person's hips rest on a seat",
+                "the upper body remains in a seated posture",
+                "a student is seated at a classroom desk",
+            ],
+            "stand": [
+                "stand",
+                "a student stands upright",
+                "the person's body is supported by both feet",
+                "the torso rises above the chair",
+                "an upright person stands beside a classroom desk",
+            ],
+            "look_forward": [
+                "look forward",
+                "a student looks toward the front of the classroom",
+                "the head and face point straight ahead",
+                "eyes are directed toward the teacher or board",
+                "the head remains centered without turning sideways",
+            ],
+            "look_sideways": [
+                "look sideways",
+                "a student looks to the left or right",
+                "the head turns toward one side",
+                "the face is oriented away from the front",
+                "the eyes and head point toward something nearby",
+            ],
             "read": [
                 "read",
                 "a student reads a book or paper",
@@ -529,12 +557,47 @@ class Pointformer(nn.Module):
                 "fingers moving along page edges",
                 "a book page changes position over time",
             ],
+            "touch_sth": [
+                "touch something",
+                "a student touches a nearby object",
+                "a hand reaches toward an object on the desk",
+                "fingers make contact with an item",
+                "the arm extends and the hand contacts something",
+            ],
+            "raise_hand": [
+                "raise hand",
+                "a student raises one hand in class",
+                "an arm moves upward above shoulder level",
+                "a hand is held up to get the teacher's attention",
+                "the raised arm extends upward away from the desk",
+            ],
+            "hands_down": [
+                "hands down",
+                "a student lowers one or both hands",
+                "hands move downward from a raised position",
+                "the arms descend toward the desk or the body",
+                "both hands finish below shoulder level",
+            ],
             "take_notes": [
                 "take notes",
                 "a student writes notes on paper",
                 "hand holding a pen and writing",
                 "small repetitive hand motion on notebook",
                 "writing on a desk with paper",
+            ],
+            "applaud": [
+                "applaud",
+                "a student claps their hands",
+                "both hands repeatedly move together and apart",
+                "the palms meet in front of the body",
+                "repeated hand clapping in the classroom",
+            ],
+            "bend": [
+                "bend",
+                "a student bends the upper body",
+                "the torso leans forward or downward",
+                "the head and shoulders move toward the desk",
+                "the body changes from upright to a bent posture",
             ],
             "turn_around": [
                 "turn around",
