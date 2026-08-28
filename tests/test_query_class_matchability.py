@@ -149,9 +149,8 @@ def test_support_statistics_can_be_detached_without_blocking_query_gradient():
             [[[[0.8]]]],
             [[[[0.2]]]],
             [[[[0.5]]]],
-        ],
-        requires_grad=True,
-    ).reshape(3, 1, 1, 1)
+        ]
+    ).reshape(3, 1, 1, 1).clone().detach().requires_grad_(True)
     point_mask = torch.ones(3, 1, 1, dtype=torch.bool)
     support_mask = torch.tensor([True, True, False])
     labels = torch.tensor([[1], [0], [0]], dtype=torch.bool)
