@@ -274,7 +274,8 @@ def _build_frame_softmax_q2s_with_matchability(
     pred_tracks: Optional[torch.Tensor] = None,
 ) -> Optional[Dict[str, torch.Tensor]]:
     """Build normal routed prototypes and add Query-class matchability."""
-    cfg = getattr(self.cfg.FEW_SHOT, "QUERY_CLASS_MATCHABILITY", None)
+    few_shot_cfg = getattr(getattr(self, "cfg", None), "FEW_SHOT", None)
+    cfg = getattr(few_shot_cfg, "QUERY_CLASS_MATCHABILITY", None)
     if not bool(_cfg_value(cfg, "ENABLE", False)):
         original = getattr(self.__class__, _PATCH_MARKER)
         return original(self, value_tokens, metadata, pred_tracks=pred_tracks)
