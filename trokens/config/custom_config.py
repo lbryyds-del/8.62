@@ -64,10 +64,10 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_ENABLE = False
     cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_LOGIT_ALPHA = 10.0
     cfg.FEW_SHOT.POT_ROUTE.QUERY_PARTIAL_LOGIT_BIAS = -2.0
+
+    # Legacy 8.63 learned Null-token route, retained for ablation only.
     cfg.FEW_SHOT.QUERY_NULL_ROUTE = CfgNode()
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.ENABLE = False
-    # Calibrated for cardinality correction at tau=0.04. A 0.25 start
-    # saturates the Null mass on positive Query candidates.
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.SCORE_INIT = 0.07
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.SCORE_MIN = -0.20
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.SCORE_MAX = 0.80
@@ -77,6 +77,18 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.DETACH_FRAME_SCALE = True
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.ORTHO_WEIGHT = 0.01
     cfg.FEW_SHOT.QUERY_NULL_ROUTE.ORTHO_DETACH_SUPPORT = True
+
+    # Query-class matchability: pure text evidence estimates whether a Query
+    # candidate should be trusted; text+Support routing still determines where.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY = CfgNode()
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ENABLE = False
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.TOPK_PATCHES = 8
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.TOPK_FRAMES = 3
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.CALIBRATION_BETA = 0.25
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOG_PENALTY_WEIGHT = 0.25
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOG_EPS = 0.05
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DETACH_SUPPORT_STATS = True
 
     # point info config
     cfg.POINT_INFO = CfgNode()
