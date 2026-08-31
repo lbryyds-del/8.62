@@ -350,6 +350,7 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
             scores = patch_q2s_logits.detach().float().cpu().numpy()
             targets = q2s_labels.detach().float().cpu().numpy()
             query_null_rows = None
+            query_matchability_rows = None
             if (
                 isinstance(few_shot_aux, dict)
                 and "query_null_weights" in few_shot_aux
@@ -409,6 +410,96 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                         "evidence_lme_min": frame_evidence_lme.min(axis=-1),
                         "evidence_lme_max": frame_evidence_lme.max(axis=-1),
                     })
+            if (
+                isinstance(few_shot_aux, dict)
+                and "query_class_matchability" in few_shot_aux
+            ):
+                def _aux_numpy(key, dtype=torch.float32):
+                    value = few_shot_aux.get(key)
+                    if value is None:
+                        return None
+                    value = value.detach().cpu()
+                    if dtype is torch.bool:
+                        return value.bool().numpy()
+                    return value.float().numpy()
+
+                query_matchability_rows = {
+                    "base_score": _aux_numpy(
+                        "query_partial_q2s_base_logits"
+                    ),
+                    "matchability": _aux_numpy(
+                        "query_class_matchability"
+                    ),
+                    "evidence": _aux_numpy("query_class_evidence"),
+                    "threshold": _aux_numpy("query_class_threshold"),
+                    "log_penalty": _aux_numpy("query_class_log_penalty"),
+                    "support_positive": _aux_numpy(
+                        "support_positive_evidence_mean"
+                    ),
+                    "support_negative": _aux_numpy(
+                        "support_negative_evidence_mean"
+                    ),
+                    "support_gap": _aux_numpy("support_evidence_gap"),
+                    "support_reliable": _aux_numpy(
+                        "support_calibration_reliable", dtype=torch.bool
+                    ),
+                    "confuser_available": _aux_numpy(
+                        "query_class_confuser_available", dtype=torch.bool
+                    ),
+                    "positive_similarity": _aux_numpy(
+                        "query_class_positive_similarity"
+                    ),
+                    "hardest_confuser_similarity": _aux_numpy(
+                        "query_class_hardest_confuser_similarity"
+                    ),
+                    "relative_margin": _aux_numpy(
+                        "query_class_relative_margin"
+                    ),
+                    "hardest_confuser_index": _aux_numpy(
+                        "query_class_hardest_confuser_support_index",
+                        dtype=torch.long,
+                    ),
+                    "confuser_valid_count": _aux_numpy(
+                        "query_class_confuser_valid_count",
+                        dtype=torch.long,
+                    ),
+                }
+                for name in (
+                    "base_score",
+                    "matchability",
+                    "evidence",
+                    "log_penalty",
+                    "positive_similarity",
+                    "hardest_confuser_similarity",
+                    "relative_margin",
+                    "hardest_confuser_index",
+                ):
+                    if query_matchability_rows[name] is None:
+                        continue
+                    if query_matchability_rows[name].shape != targets.shape:
+                        raise ValueError(
+                            f"{name} must align with q2s labels; got "
+                            f"{query_matchability_rows[name].shape}, expected "
+                            f"{targets.shape}."
+                        )
+                for name in (
+                    "threshold",
+                    "support_positive",
+                    "support_negative",
+                    "support_gap",
+                    "support_reliable",
+                    "confuser_available",
+                    "confuser_valid_count",
+                ):
+                    if query_matchability_rows[name] is not None and (
+                        query_matchability_rows[name].shape[-1:]
+                        != targets.shape[-1:]
+                    ):
+                        raise ValueError(
+                            f"{name} must align with the episode class axis; got "
+                            f"{query_matchability_rows[name].shape}, expected "
+                            f"[..., {targets.shape[-1]}]."
+                        )
             for query_idx, video_name in enumerate(video_names):
                 for episode_idx, class_id in enumerate(episode_class_ids):
                     row = {
@@ -464,6 +555,70 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                                     ][query_idx, episode_idx]
                                 ),
                             })
+                    if (
+                        query_matchability_rows is not None
+                        and query_matchability_rows["matchability"].shape
+                        == targets.shape
+                    ):
+                        row.update({
+                            "query_class_base_score": float(
+                                query_matchability_rows["base_score"][
+                                    query_idx, episode_idx
+                                ]
+                            ),
+                            "query_class_matchability": float(
+                                query_matchability_rows["matchability"][
+                                    query_idx, episode_idx
+                                ]
+                            ),
+                            "query_class_evidence": float(
+                                query_matchability_rows["evidence"][
+                                    query_idx, episode_idx
+                                ]
+                            ),
+                            "query_class_log_penalty": float(
+                                query_matchability_rows["log_penalty"][
+                                    query_idx, episode_idx
+                                ]
+                            ),
+                        })
+                        optional_pair_fields = {
+                            "query_class_positive_similarity": (
+                                "positive_similarity"
+                            ),
+                            "query_class_hardest_confuser_similarity": (
+                                "hardest_confuser_similarity"
+                            ),
+                            "query_class_relative_margin": "relative_margin",
+                            "query_class_hardest_confuser_support_index": (
+                                "hardest_confuser_index"
+                            ),
+                        }
+                        for output_name, source_name in optional_pair_fields.items():
+                            values = query_matchability_rows[source_name]
+                            if values is not None:
+                                row[output_name] = float(
+                                    values[query_idx, episode_idx]
+                                )
+                        optional_class_fields = {
+                            "query_class_threshold": "threshold",
+                            "support_positive_evidence_mean": "support_positive",
+                            "support_negative_evidence_mean": "support_negative",
+                            "support_evidence_gap": "support_gap",
+                            "support_calibration_reliable": "support_reliable",
+                            "query_class_confuser_available": "confuser_available",
+                            "query_class_confuser_valid_count": "confuser_valid_count",
+                        }
+                        for output_name, source_name in optional_class_fields.items():
+                            values = query_matchability_rows[source_name]
+                            if values is None:
+                                continue
+                            value = values[episode_idx]
+                            row[output_name] = (
+                                bool(value)
+                                if source_name == "support_reliable"
+                                else float(value)
+                            )
                     all_df.append(row)
         if cfg['wandb']:
             cfg['wandb'].log({

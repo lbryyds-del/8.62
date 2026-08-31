@@ -18,6 +18,7 @@ from few_shot_multilabel import (
     few_shot_aux_has_query_partial_logits,
     few_shot_aux_has_support_tokens,
     get_query_null_orthogonal_loss,
+    get_query_matchability_metrics,
     get_query_null_route_metrics,
     get_text_align_loss,
     get_episode_class_ids,
@@ -384,6 +385,12 @@ def train_epoch(
                     few_shot_aux,
                     q2s_labels,
                 )
+                query_null_metrics.update(
+                    get_query_matchability_metrics(
+                        few_shot_aux,
+                        q2s_labels,
+                    )
+                )
             else:
                 q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
             loss_dict['q2s_loss'] = q2s_loss
@@ -737,6 +744,12 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
                 query_null_metrics = get_query_null_route_metrics(
                     few_shot_aux,
                     q2s_labels,
+                )
+                query_null_metrics.update(
+                    get_query_matchability_metrics(
+                        few_shot_aux,
+                        q2s_labels,
+                    )
                 )
             else:
                 q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)

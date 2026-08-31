@@ -82,13 +82,33 @@ def add_custom_config(cfg):
     # candidate should be trusted; text+Support routing still determines where.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY = CfgNode()
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ENABLE = False
+    # ``threshold`` preserves the 8.64 scalar Support-calibration route;
+    # SAV's experiment config selects ``positive_confuser_margin``.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.MODE = "threshold"
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.TOPK_PATCHES = 8
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.TOPK_FRAMES = 3
+    # Evidence can come from the task-adapted Pointformer output ("post") or
+    # from sampled DinoTxt tokens before positional/motion/Pointformer fusion.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_SOURCE = "post"
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.CALIBRATION_BETA = 0.25
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.TEMPERATURE = 0.10
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOG_PENALTY_WEIGHT = 0.25
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOG_EPS = 0.05
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DETACH_SUPPORT_STATS = True
+    # Keep raw rho for diagnostics but neutralize its penalty when labeled
+    # Support evidence is inverted for an episode class.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.RELIABILITY_FALLBACK = False
+    # Relative positive/confuser mode controls.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.MARGIN_TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.MARGIN_BIAS = 0.0
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_AGGREGATION = "max"
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_TOPK = 2
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DETACH_CONFUSER_SUPPORT = False
+    # The SAV experiment explicitly enables the new penalty during training;
+    # the generic default remains conservative for callers that only want the
+    # diagnostic branch.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.APPLY_DURING_TRAIN = False
 
     # point info config
     cfg.POINT_INFO = CfgNode()

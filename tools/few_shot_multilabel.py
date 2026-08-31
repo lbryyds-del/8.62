@@ -305,6 +305,127 @@ def get_query_null_route_metrics(few_shot_aux, q2s_labels):
     return {key: value.detach() for key, value in metrics.items()}
 
 
+def get_query_matchability_metrics(few_shot_aux, q2s_labels):
+    """Return label-stratified diagnostics for the Query-class matcher.
+
+    These metrics are computed after the forward pass using the evaluation
+    labels only for reporting.  The model-side route receives Support labels
+    only; changing Query labels must not change its logits.
+    """
+    if (
+        not isinstance(few_shot_aux, dict)
+        or "query_class_matchability" not in few_shot_aux
+    ):
+        return {}
+
+    matchability = few_shot_aux["query_class_matchability"]
+    if not isinstance(matchability, torch.Tensor) or matchability.ndim != 2:
+        shape = (
+            tuple(matchability.shape)
+            if isinstance(matchability, torch.Tensor)
+            else type(matchability).__name__
+        )
+        raise ValueError(
+            "query_class_matchability must have shape [Q,K]; got "
+            f"{shape}."
+        )
+    labels = q2s_labels.to(device=matchability.device).float()
+    if tuple(labels.shape) != tuple(matchability.shape):
+        raise ValueError(
+            "q2s_labels must match Query matchability [Q,K]; got "
+            f"{tuple(labels.shape)} versus {tuple(matchability.shape)}."
+        )
+
+    def _pair_tensor(key, default=None):
+        value = few_shot_aux.get(key, default)
+        if value is None:
+            return None
+        if not isinstance(value, torch.Tensor) or tuple(value.shape) != tuple(
+            matchability.shape
+        ):
+            raise ValueError(
+                f"{key} must match [Q,K]; got "
+                f"{tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__}."
+            )
+        return torch.nan_to_num(
+            value.to(device=matchability.device).float(),
+            nan=0.0,
+            posinf=1.0,
+            neginf=-1.0,
+        )
+
+    positive_similarity = _pair_tensor(
+        "query_class_positive_similarity",
+        few_shot_aux.get(
+            "query_partial_diag_similarity",
+            torch.zeros_like(matchability),
+        ),
+    )
+    negative_similarity = _pair_tensor(
+        "query_class_hardest_confuser_similarity",
+        torch.zeros_like(matchability),
+    )
+    relative_margin = _pair_tensor(
+        "query_class_relative_margin",
+        few_shot_aux.get("query_class_evidence", torch.zeros_like(matchability)),
+    )
+    penalty = _pair_tensor(
+        "query_class_log_penalty",
+        torch.zeros_like(matchability),
+    )
+
+    positive_mask = labels > 0.5
+    negative_mask = ~positive_mask
+
+    def masked_mean(value, mask):
+        selected = value[mask]
+        if selected.numel() == 0:
+            return value.new_zeros(())
+        return selected.mean()
+
+    metrics = {
+        "matchability_positive_similarity": masked_mean(
+            positive_similarity,
+            positive_mask,
+        ),
+        "matchability_negative_similarity": masked_mean(
+            positive_similarity,
+            negative_mask,
+        ),
+        "matchability_positive_confuser_similarity": masked_mean(
+            negative_similarity,
+            positive_mask,
+        ),
+        "matchability_negative_confuser_similarity": masked_mean(
+            negative_similarity,
+            negative_mask,
+        ),
+        "matchability_positive_margin": masked_mean(
+            relative_margin,
+            positive_mask,
+        ),
+        "matchability_negative_margin": masked_mean(
+            relative_margin,
+            negative_mask,
+        ),
+        "matchability_positive_rho": masked_mean(
+            matchability.float(),
+            positive_mask,
+        ),
+        "matchability_negative_rho": masked_mean(
+            matchability.float(),
+            negative_mask,
+        ),
+        "matchability_penalty_mean": penalty.mean(),
+    }
+    valid_count = few_shot_aux.get("query_class_confuser_valid_count")
+    if isinstance(valid_count, torch.Tensor):
+        metrics["matchability_confuser_valid_count"] = (
+            torch.nan_to_num(valid_count.float(), nan=0.0).mean()
+        )
+    return {key: value.detach() for key, value in metrics.items()}
+
+
 def multilabel_top1_accuracy(logits, labels):
     """Top-1 is correct if the highest scoring class is one of the positive labels."""
     pred_idx = logits.argmax(dim=1, keepdim=True)

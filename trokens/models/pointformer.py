@@ -2039,6 +2039,7 @@ class Pointformer(nn.Module):
         value_tokens,
         metadata,
         pred_tracks=None,
+        matchability_evidence_tokens=None,
     ):
         """Build direct text-routed frame prototypes and q2s logits."""
         support_mask = metadata["support_mask"].to(device=value_tokens.device).bool()
@@ -2453,6 +2454,7 @@ class Pointformer(nn.Module):
         x = input_to_use['video']
         metadata = input_to_use['metadata']
         few_shot_aux = {}
+        matchability_evidence_tokens = None
 
         if 'skip_feat_extractor' in input_to_use:
             skip_feat_extractor = input_to_use['skip_feat_extractor']
@@ -2485,6 +2487,35 @@ class Pointformer(nn.Module):
                         metadata.update(new_metadata)
                 else:
                     raise NotImplementedError('Feature extractor not implemented')
+
+            few_shot_cfg = getattr(self.cfg, "FEW_SHOT", None)
+            match_cfg = getattr(
+                few_shot_cfg,
+                "QUERY_CLASS_MATCHABILITY",
+                None,
+            )
+            matchability_source = str(
+                getattr(match_cfg, "EVIDENCE_SOURCE", "post")
+            ).lower()
+            if (
+                bool(getattr(match_cfg, "ENABLE", False))
+                and matchability_source == "raw"
+            ):
+                if self.feat_extractor_type != "dinotxt_vitl14_reg4":
+                    raise ValueError(
+                        "Raw matchability evidence requires dinotxt_vitl14_reg4."
+                    )
+                if self.cfg.POINT_INFO.ENABLE:
+                    matchability_evidence_tokens = self._sample_point_features(
+                        feat_to_use,
+                        metadata['pred_tracks'],
+                        add_pt_pos_embed=False,
+                    )
+                else:
+                    matchability_evidence_tokens = rearrange(
+                        feat_to_use,
+                        'b t p q d -> b t (p q) d',
+                    )
 
             if self.cfg.MF.USE_BASE_POS_EMBED:
                 feat_to_use = self.add_st_pos_embeddings(feat_to_use)
@@ -2543,6 +2574,7 @@ class Pointformer(nn.Module):
                     patch_x,
                     metadata,
                     pred_tracks=metadata.get('pred_tracks'),
+                    matchability_evidence_tokens=matchability_evidence_tokens,
                 )
                 if frame_softmax_aux is not None:
                     few_shot_aux.update(frame_softmax_aux)

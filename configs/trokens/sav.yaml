@@ -56,16 +56,29 @@ FEW_SHOT:
     ORTHO_DETACH_SUPPORT: True
   QUERY_CLASS_MATCHABILITY:
     ENABLE: True
-    # Pure text evidence: strongest local trajectories and strongest frames.
+    MODE: "positive_confuser_margin"
+    # Legacy threshold-mode evidence (kept for R1 rollback/comparison).
     TOPK_PATCHES: 8
     TOPK_FRAMES: 3
-    # Threshold = negative Support evidence + beta * positive/negative gap.
+    # "post": post-Pointformer tokens; "raw": pre-Pointformer DinoTxt tokens.
+    EVIDENCE_SOURCE: "post"
+    # Legacy threshold = negative Support evidence + beta * positive/negative gap.
     CALIBRATION_BETA: 0.25
     TEMPERATURE: 0.10
     # Final q2s = original q2s + weight * log(matchability).
     LOG_PENALTY_WEIGHT: 0.25
     LOG_EPS: 0.05
     DETACH_SUPPORT_STATS: True
+    RELIABILITY_FALLBACK: False
+    MARGIN_TEMPERATURE: 0.10
+    MARGIN_BIAS: 0.0
+    NEGATIVE_AGGREGATION: "max"
+    NEGATIVE_TOPK: 2
+    NEGATIVE_TEMPERATURE: 0.10
+    DETACH_CONFUSER_SUPPORT: False
+    # User-requested first training run: include the relative penalty in q2s
+    # BCE during training as well as in evaluation.
+    APPLY_DURING_TRAIN: True
   TEXT_ALIGN:
     ENABLE: False
     LOSS_WEIGHT: 0.1
