@@ -1139,8 +1139,15 @@ class Pointformer(nn.Module):
         patch_tokens,
         point_mask,
         similarity,
+        softmax_tau=None,
     ):
-        """Build per-frame prototypes from a precomputed [K,T,N] cost."""
+        """Build per-frame prototypes from a precomputed [K,T,N] cost.
+
+        ``softmax_tau`` is optional for backwards compatibility.  The local
+        confuser-aware route uses it to convert a bounded logit residual back
+        into the same similarity units while reusing this canonical masked
+        softmax/aggregation implementation.
+        """
         patch_tokens = torch.nan_to_num(
             patch_tokens,
             nan=0.0,
@@ -1171,10 +1178,13 @@ class Pointformer(nn.Module):
             posinf=1e4,
             neginf=-1e4,
         )
-        tau = max(
-            float(getattr(self.pot_route_cfg, "FRAME_SOFTMAX_TAU", 0.07)),
-            1e-6,
-        )
+        if softmax_tau is None:
+            softmax_tau = getattr(
+                self.pot_route_cfg,
+                "FRAME_SOFTMAX_TAU",
+                0.07,
+            )
+        tau = max(float(softmax_tau), 1e-6)
         patch_weights = self._masked_softmax_1d(
             similarity,
             point_mask.unsqueeze(0),

@@ -75,7 +75,21 @@ FEW_SHOT:
     NEGATIVE_AGGREGATION: "max"
     NEGATIVE_TOPK: 2
     NEGATIVE_TEMPERATURE: 0.10
-    DETACH_CONFUSER_SUPPORT: False
+    DETACH_CONFUSER_SUPPORT: True
+    # Local confuser-aware patch routing refinement.
+    LOCAL_REFINEMENT_ENABLE: True
+    LOCAL_MARGIN_TEMPERATURE: 0.10
+    LOCAL_LOGIT_STRENGTH: 0.50
+    LOCAL_POSITIVE_AGGREGATION: "topk_mean"
+    LOCAL_POSITIVE_TOPK: 2
+    LOCAL_NEGATIVE_AGGREGATION: "topk_mean"
+    LOCAL_NEGATIVE_TOPK: 2
+    LOCAL_NEGATIVE_TEMPERATURE: 0.10
+    LOCAL_DETACH_REFERENCES: True
+    # Train both the refined base matcher and the globally verified matcher.
+    DUAL_LOGIT_LOSS_ENABLE: True
+    BASE_LOGIT_LOSS_WEIGHT: 0.50
+    VERIFIED_LOGIT_LOSS_WEIGHT: 0.50
     # User-requested first training run: include the relative penalty in q2s
     # BCE during training as well as in evaluation.
     APPLY_DURING_TRAIN: True

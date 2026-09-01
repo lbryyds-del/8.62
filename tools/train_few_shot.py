@@ -13,6 +13,7 @@ from einops import rearrange
 from fvcore.common.config import CfgNode
 from few_shot_multilabel import (
     compute_base_novel_hm,
+    compute_query_partial_q2s_loss,
     empty_ap_storage,
     episode_labels_from_global,
     few_shot_aux_has_query_partial_logits,
@@ -371,16 +372,17 @@ def train_epoch(
                                             cfg,
                                             patch_support_query_dict['support_preds'],
                                             patch_support_query_dict['query_preds'])
-            patch_q2s_logits = patch_q2s_logits / cfg.SOLVER.TEMPRATURE
-            patch_q2s_logits = torch.nan_to_num(
-                patch_q2s_logits,
-                nan=0.0,
-                posinf=30.0,
-                neginf=-30.0,
-            )
             if multilabel_episode:
-                q2s_loss = F.binary_cross_entropy_with_logits(
-                    patch_q2s_logits, q2s_labels.float())
+                (
+                    q2s_loss,
+                    patch_q2s_logits,
+                    q2s_objective_metrics,
+                ) = compute_query_partial_q2s_loss(
+                    patch_q2s_logits,
+                    q2s_labels,
+                    few_shot_aux,
+                    cfg,
+                )
                 query_null_metrics = get_query_null_route_metrics(
                     few_shot_aux,
                     q2s_labels,
@@ -391,7 +393,15 @@ def train_epoch(
                         q2s_labels,
                     )
                 )
+                query_null_metrics.update(q2s_objective_metrics)
             else:
+                patch_q2s_logits = patch_q2s_logits / cfg.SOLVER.TEMPRATURE
+                patch_q2s_logits = torch.nan_to_num(
+                    patch_q2s_logits,
+                    nan=0.0,
+                    posinf=30.0,
+                    neginf=-30.0,
+                )
                 q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
             loss_dict['q2s_loss'] = q2s_loss
             loss_dict['align_loss'] = align_loss

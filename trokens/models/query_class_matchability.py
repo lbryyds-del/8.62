@@ -3,9 +3,10 @@
 This extension separates two questions that were coupled by the previous
 Query Null token:
 
-1. ``where``: the existing text/support-routed Softmax constructs the
-   class-conditioned Query frame prototype;
-2. ``whether``: either the legacy Support-calibrated text evidence or the
+1. ``where``: the text/support-routed Softmax constructs the class-conditioned
+   Query frame prototype, optionally refined by a bounded per-patch
+   positive-versus-confuser Support margin;
+2. ``whether``: either the legacy Support-calibrated text evidence or a global
    positive-versus-confuser Support margin estimates whether the Query-class
    hypothesis is matchable at all.
 
@@ -128,6 +129,27 @@ def pairwise_bimhm(
             "Query and Support feature dimensions must agree; got "
             f"{query_prototypes.shape[-1]} and {support_prototypes.shape[-1]}."
         )
+
+    # ``torch.max`` is undefined over an empty Support axis.  An episode may
+    # legitimately contain no confuser for a class (for example when every
+    # sampled Support carries that label), in which case the caller's masked
+    # reducer should receive an empty/neutral score tensor instead.
+    if support_prototypes.shape[0] == 0:
+        empty = query_prototypes.new_zeros(
+            query_prototypes.shape[0],
+            query_prototypes.shape[1],
+            0,
+            dtype=torch.float32,
+        )
+        return empty[:, 0] if squeeze_class else empty
+    if query_prototypes.shape[2] == 0 or support_prototypes.shape[2] == 0:
+        empty = query_prototypes.new_zeros(
+            query_prototypes.shape[0],
+            query_prototypes.shape[1],
+            support_prototypes.shape[0],
+            dtype=torch.float32,
+        )
+        return empty[:, 0] if squeeze_class else empty
 
     query_norm = _safe_unit(query_prototypes)
     support_norm = _safe_unit(support_prototypes)
@@ -429,6 +451,462 @@ def build_class_confuser_prototypes(
         torch.stack(valid_rows, dim=0).bool(),
         support_indices,
     )
+
+
+def build_class_local_support_references(
+    pointformer: Any,
+    value_tokens: torch.Tensor,
+    route_point_mask: torch.Tensor,
+    support_frame_mask: torch.Tensor,
+    support_mask: torch.Tensor,
+    episode_positive_labels: torch.Tensor,
+    query_label_features: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build one routed reference for every Support/class pair.
+
+    The local refinement compares positive and confuser Supports in exactly
+    the same feature/routing space.  ``route_point_mask`` controls the text
+    Softmax, while ``support_frame_mask`` is retained separately so invalid
+    Support frames cannot win a later temporal max merely because their zero
+    prototype is larger than a negative cosine.
+
+    Returns ``(references, frame_valid, positive_valid, confuser_valid,
+    support_indices)`` where references are ``[S,K,T,D]``, frame validity is
+    ``[S,K,T]`` and the two class masks are ``[S,K]``.
+    """
+    if value_tokens.ndim != 4:
+        raise ValueError(
+            "value_tokens must have shape [B,T,N,D]; got "
+            f"{tuple(value_tokens.shape)}."
+        )
+    batch, temporal_dim, _, feat_dim = value_tokens.shape
+    expected_point_shape = (batch, temporal_dim, value_tokens.shape[2])
+    if tuple(route_point_mask.shape) != expected_point_shape:
+        raise ValueError(
+            "route_point_mask must match value_tokens B,T,N; got "
+            f"{tuple(route_point_mask.shape)} and {expected_point_shape}."
+        )
+    if tuple(support_frame_mask.shape) != expected_point_shape:
+        raise ValueError(
+            "support_frame_mask must match value_tokens B,T,N; got "
+            f"{tuple(support_frame_mask.shape)} and {expected_point_shape}."
+        )
+    support_mask = support_mask.to(device=value_tokens.device).bool().flatten()
+    if tuple(support_mask.shape) != (batch,):
+        raise ValueError(
+            "support_mask must have shape [B]; got "
+            f"{tuple(support_mask.shape)}."
+        )
+    labels = episode_positive_labels.to(device=value_tokens.device).bool()
+    num_classes = query_label_features.shape[0]
+    if tuple(labels.shape) != (batch, num_classes):
+        raise ValueError(
+            "episode_positive_labels must have shape [B,K]; got "
+            f"{tuple(labels.shape)}, expected {(batch, num_classes)}."
+        )
+    if query_label_features.ndim != 2 or query_label_features.shape[-1] != feat_dim:
+        raise ValueError(
+            "query_label_features must have shape [K,D] matching values; got "
+            f"{tuple(query_label_features.shape)} and D={feat_dim}."
+        )
+
+    route_point_mask = route_point_mask.to(device=value_tokens.device).bool()
+    support_frame_mask = support_frame_mask.to(device=value_tokens.device).bool()
+    support_indices = torch.nonzero(support_mask, as_tuple=False).flatten()
+    if support_indices.numel() == 0:
+        return (
+            value_tokens.new_zeros(0, num_classes, temporal_dim, feat_dim),
+            torch.zeros(
+                0,
+                num_classes,
+                temporal_dim,
+                device=value_tokens.device,
+                dtype=torch.bool,
+            ),
+            torch.zeros(
+                0,
+                num_classes,
+                device=value_tokens.device,
+                dtype=torch.bool,
+            ),
+            torch.zeros(
+                0,
+                num_classes,
+                device=value_tokens.device,
+                dtype=torch.bool,
+            ),
+            support_indices,
+        )
+
+    references = []
+    frame_valid_rows = []
+    positive_rows = []
+    confuser_rows = []
+    for sample_idx in support_indices.tolist():
+        sample_proto, _ = pointformer._compute_frame_softmax_text_prototypes(
+            value_tokens[sample_idx],
+            route_point_mask[sample_idx],
+            query_label_features,
+        )
+        sample_proto = torch.nan_to_num(
+            sample_proto,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        # A frame must have both a valid Support observation and a finite,
+        # non-zero routed prototype to participate in the local temporal max.
+        present = support_frame_mask[sample_idx].any(dim=-1)
+        frame_valid = present.unsqueeze(0) & sample_proto.float().norm(
+            dim=-1,
+        ).gt(1e-12)
+        class_valid = frame_valid.any(dim=-1)
+        sample_labels = labels[sample_idx]
+        references.append(sample_proto)
+        frame_valid_rows.append(frame_valid)
+        positive_rows.append(sample_labels & class_valid)
+        confuser_rows.append((~sample_labels) & class_valid)
+
+    return (
+        torch.stack(references, dim=0),
+        torch.stack(frame_valid_rows, dim=0).bool(),
+        torch.stack(positive_rows, dim=0).bool(),
+        torch.stack(confuser_rows, dim=0).bool(),
+        support_indices,
+    )
+
+
+def compute_local_positive_confuser_margin(
+    query_tokens: torch.Tensor,
+    support_references: torch.Tensor,
+    support_frame_valid: torch.Tensor,
+    positive_valid: torch.Tensor,
+    confuser_valid: torch.Tensor,
+    point_mask: torch.Tensor,
+    positive_aggregation: str = "topk_mean",
+    positive_topk: int = 2,
+    negative_aggregation: str = "topk_mean",
+    negative_topk: int = 2,
+    positive_temperature: float = 0.10,
+    negative_temperature: float = 0.10,
+    detach_references: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute a per-patch positive-minus-confuser Support margin.
+
+    ``query_tokens`` is ``[Q,T,N,D]`` and ``support_references`` is
+    ``[S,K,T_s,D]``.  Positive and confuser Supports are aggregated with the
+    same masked reducer, which avoids treating an averaged positive prototype
+    and an individual hard negative as if they had identical statistics.
+    The function never consumes Query labels.
+    """
+    if query_tokens.ndim != 4:
+        raise ValueError(
+            "query_tokens must have shape [Q,T,N,D]; got "
+            f"{tuple(query_tokens.shape)}."
+        )
+    if support_references.ndim != 4:
+        raise ValueError(
+            "support_references must have shape [S,K,T,D]; got "
+            f"{tuple(support_references.shape)}."
+        )
+    q, query_time, num_points, feat_dim = query_tokens.shape
+    support_count, num_classes, support_time, support_dim = support_references.shape
+    if feat_dim != support_dim:
+        raise ValueError(
+            "Query and Support feature dimensions differ: "
+            f"{feat_dim} versus {support_dim}."
+        )
+    if tuple(support_frame_valid.shape) != (
+        support_count,
+        num_classes,
+        support_time,
+    ):
+        raise ValueError(
+            "support_frame_valid must have shape [S,K,T_s]; got "
+            f"{tuple(support_frame_valid.shape)}."
+        )
+    if tuple(positive_valid.shape) != (support_count, num_classes):
+        raise ValueError(
+            "positive_valid must have shape [S,K]; got "
+            f"{tuple(positive_valid.shape)}."
+        )
+    if tuple(confuser_valid.shape) != (support_count, num_classes):
+        raise ValueError(
+            "confuser_valid must have shape [S,K]; got "
+            f"{tuple(confuser_valid.shape)}."
+        )
+    if tuple(point_mask.shape) != (q, query_time, num_points):
+        raise ValueError(
+            "point_mask must match query_tokens B,T,N; got "
+            f"{tuple(point_mask.shape)}."
+        )
+    temperatures_finite = bool(torch.isfinite(torch.tensor([
+        float(positive_temperature),
+        float(negative_temperature),
+    ])).all())
+    if (
+        not temperatures_finite
+        or positive_temperature <= 0.0
+        or negative_temperature <= 0.0
+    ):
+        raise ValueError("Local Support aggregation temperatures must be positive.")
+
+    output_shape = (q, num_classes, query_time, num_points)
+    if support_count == 0 or q == 0 or num_classes == 0:
+        zero = query_tokens.new_zeros(output_shape, dtype=torch.float32)
+        counts = torch.zeros(
+            num_classes,
+            device=query_tokens.device,
+            dtype=torch.long,
+        )
+        return zero, zero.clone(), zero.clone(), counts, counts.clone()
+
+    query_unit = _safe_unit(query_tokens)
+    support_unit = _safe_unit(support_references)
+    if detach_references:
+        support_unit = support_unit.detach()
+    support_frame_valid = support_frame_valid.to(
+        device=query_tokens.device,
+        dtype=torch.bool,
+    )
+
+    # Reduce Support time immediately for each Support sample.  This keeps
+    # the peak tensor at [Q,K,T_query,N,T_support] instead of materializing a
+    # [Q,K,T_query,N,S,T_support] tensor.
+    per_support_scores = []
+    for support_idx in range(support_count):
+        similarity = torch.einsum(
+            "qtnd,kud->qktnu",
+            query_unit,
+            support_unit[support_idx],
+        )
+        frame_mask = support_frame_valid[support_idx].view(
+            1,
+            num_classes,
+            1,
+            1,
+            support_time,
+        )
+        masked_similarity = similarity.masked_fill(
+            ~frame_mask,
+            float("-inf"),
+        )
+        score = masked_similarity.max(dim=-1).values
+        has_frame = frame_mask.any(dim=-1)
+        score = torch.where(has_frame, score, torch.zeros_like(score))
+        per_support_scores.append(
+            torch.nan_to_num(
+                score,
+                nan=0.0,
+                posinf=1.0,
+                neginf=0.0,
+            ).clamp(-1.0, 1.0)
+        )
+    support_scores = torch.stack(per_support_scores, dim=-1)
+    # [Q,K,T,N,S] -> [Q*T*N,K,S], matching the global reducer's API.
+    flat_scores = support_scores.permute(0, 2, 3, 1, 4).reshape(
+        q * query_time * num_points,
+        num_classes,
+        support_count,
+    )
+    positive_scores, _, positive_counts = _aggregate_negative_similarity(
+        flat_scores,
+        positive_valid.to(device=query_tokens.device).bool().transpose(0, 1),
+        aggregation=positive_aggregation,
+        topk=positive_topk,
+        temperature=positive_temperature,
+    )
+    negative_scores, _, negative_counts = _aggregate_negative_similarity(
+        flat_scores,
+        confuser_valid.to(device=query_tokens.device).bool().transpose(0, 1),
+        aggregation=negative_aggregation,
+        topk=negative_topk,
+        temperature=negative_temperature,
+    )
+
+    def _restore(values):
+        return values.reshape(q, query_time, num_points, num_classes).permute(
+            0,
+            3,
+            1,
+            2,
+        )
+
+    positive_score = _restore(positive_scores)
+    negative_score = _restore(negative_scores)
+    has_both = (positive_counts > 0) & (negative_counts > 0)
+    margin = positive_score - negative_score
+    margin = torch.where(
+        has_both.view(1, num_classes, 1, 1),
+        margin,
+        torch.zeros_like(margin),
+    )
+    query_valid = point_mask.to(
+        device=query_tokens.device,
+        dtype=margin.dtype,
+    ).unsqueeze(1)
+    margin = margin * query_valid
+    positive_score = positive_score * query_valid
+    negative_score = negative_score * query_valid
+    margin = torch.nan_to_num(margin, nan=0.0, posinf=0.0, neginf=0.0)
+    return (
+        margin,
+        torch.nan_to_num(positive_score, nan=0.0, posinf=1.0, neginf=-1.0),
+        torch.nan_to_num(negative_score, nan=0.0, posinf=1.0, neginf=-1.0),
+        positive_counts,
+        negative_counts,
+    )
+
+
+def build_confuser_refined_query_prototypes(
+    pointformer: Any,
+    query_tokens: torch.Tensor,
+    point_mask: torch.Tensor,
+    query_label_features: torch.Tensor,
+    local_margin: torch.Tensor,
+    patch_tau: Optional[float] = None,
+    local_tau: float = 0.10,
+    local_strength: float = 0.50,
+) -> Dict[str, torch.Tensor]:
+    """Re-route Query patches with a bounded local margin residual.
+
+    The residual is expressed in Softmax-logit units, then converted to cosine
+    units before calling Pointformer's canonical masked Softmax builder.  This
+    makes ``local_strength=0`` use exactly the same route implementation as
+    the pre-refinement path.
+    """
+    if query_tokens.ndim != 4:
+        raise ValueError(
+            "query_tokens must have shape [Q,T,N,D]; got "
+            f"{tuple(query_tokens.shape)}."
+        )
+    q, temporal_dim, num_points, feat_dim = query_tokens.shape
+    if point_mask.shape != (q, temporal_dim, num_points):
+        raise ValueError(
+            "point_mask must match query_tokens B,T,N; got "
+            f"{tuple(point_mask.shape)}."
+        )
+    if query_label_features.ndim != 2 or query_label_features.shape[-1] != feat_dim:
+        raise ValueError(
+            "query_label_features must have shape [K,D] matching query tokens; got "
+            f"{tuple(query_label_features.shape)} and D={feat_dim}."
+        )
+    if local_margin.shape != (
+        q,
+        query_label_features.shape[0],
+        temporal_dim,
+        num_points,
+    ):
+        raise ValueError(
+            "local_margin must have shape [Q,K,T,N]; got "
+            f"{tuple(local_margin.shape)}."
+        )
+    if patch_tau is None:
+        patch_tau = getattr(
+            getattr(pointformer, "pot_route_cfg", None),
+            "FRAME_SOFTMAX_TAU",
+            0.07,
+        )
+    patch_tau = float(patch_tau)
+    local_tau = float(local_tau)
+    local_strength = float(local_strength)
+    route_values_finite = bool(torch.isfinite(torch.tensor([
+        patch_tau,
+        local_tau,
+        local_strength,
+    ])).all())
+    if not route_values_finite:
+        raise ValueError("patch_tau, local_tau and local_strength must be finite.")
+    if patch_tau <= 0.0 or local_tau <= 0.0:
+        raise ValueError("patch_tau and local_tau must be positive.")
+    if local_strength < 0.0:
+        raise ValueError("local_strength must be non-negative.")
+
+    query_unit = _safe_unit(query_tokens)
+    text_unit = _safe_unit(query_label_features.to(device=query_tokens.device))
+    base_similarity = torch.einsum(
+        "kd,qtnd->qktn",
+        text_unit,
+        query_unit,
+    )
+    base_similarity = torch.nan_to_num(
+        base_similarity,
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    ).clamp(-1.0, 1.0)
+    local_residual = local_strength * torch.tanh(
+        local_margin.float() / local_tau,
+    )
+    valid = point_mask.to(device=query_tokens.device).bool().unsqueeze(1)
+    local_residual = local_residual * valid.to(local_residual.dtype)
+    # The canonical builder divides by patch_tau internally, so adding this
+    # amount in cosine units is equivalent to adding local_residual logits.
+    refined_similarity = base_similarity + patch_tau * local_residual
+
+    base_prototypes = []
+    refined_prototypes = []
+    base_weights = []
+    refined_weights = []
+    for query_idx in range(q):
+        base_proto, base_weight = (
+            pointformer._compute_frame_softmax_prototypes_from_similarity(
+                query_tokens[query_idx],
+                point_mask[query_idx],
+                base_similarity[query_idx],
+                softmax_tau=patch_tau,
+            )
+        )
+        refined_proto, refined_weight = (
+            pointformer._compute_frame_softmax_prototypes_from_similarity(
+                query_tokens[query_idx],
+                point_mask[query_idx],
+                refined_similarity[query_idx],
+                softmax_tau=patch_tau,
+            )
+        )
+        base_prototypes.append(base_proto)
+        refined_prototypes.append(refined_proto)
+        base_weights.append(base_weight)
+        refined_weights.append(refined_weight)
+
+    if q:
+        base_prototypes = torch.stack(base_prototypes, dim=0)
+        refined_prototypes = torch.stack(refined_prototypes, dim=0)
+        base_weights = torch.stack(base_weights, dim=0)
+        refined_weights = torch.stack(refined_weights, dim=0)
+    else:
+        num_classes = query_label_features.shape[0]
+        base_prototypes = query_tokens.new_zeros(
+            0,
+            num_classes,
+            temporal_dim,
+            feat_dim,
+        )
+        refined_prototypes = base_prototypes.clone()
+        base_weights = query_tokens.new_zeros(
+            0,
+            num_classes,
+            temporal_dim,
+            num_points,
+        )
+        refined_weights = base_weights.clone()
+
+    shift = (refined_weights.float() - base_weights.float()).abs()
+    valid_float = valid.to(shift.dtype)
+    valid_count = valid_float.sum(dim=(-2, -1)).clamp_min(1.0)
+    shift_mean = (shift * valid_float).sum(dim=(-2, -1)) / valid_count
+    return {
+        "base_prototypes": torch.nan_to_num(base_prototypes, nan=0.0),
+        "refined_prototypes": torch.nan_to_num(refined_prototypes, nan=0.0),
+        "base_weights": torch.nan_to_num(base_weights, nan=0.0),
+        "refined_weights": torch.nan_to_num(refined_weights, nan=0.0),
+        "base_similarity": base_similarity,
+        "refined_similarity": torch.nan_to_num(refined_similarity, nan=0.0),
+        "local_logit_residual": torch.nan_to_num(local_residual, nan=0.0),
+        "weight_shift": torch.nan_to_num(shift, nan=0.0),
+        "weight_shift_mean": torch.nan_to_num(shift_mean, nan=0.0),
+    }
 
 
 def _classwise_masked_mean(
@@ -765,44 +1243,6 @@ def _build_frame_softmax_q2s_with_matchability(
             support_prototypes,
         )
 
-    query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
-    query_prototypes = []
-    for sample_idx in query_indices.tolist():
-        if refined_similarity is None:
-            sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
-                value_tokens[sample_idx],
-                point_mask[sample_idx],
-                query_label_features,
-            )
-        else:
-            sample_prototypes, _ = (
-                self._compute_frame_softmax_prototypes_from_similarity(
-                    value_tokens[sample_idx],
-                    point_mask[sample_idx],
-                    refined_similarity[sample_idx],
-                )
-            )
-        query_prototypes.append(sample_prototypes.unsqueeze(0))
-    if not query_prototypes:
-        return None
-    query_prototypes = torch.cat(query_prototypes, dim=0)
-
-    diag_similarity = self._compute_bidirectional_frame_similarity(
-        query_prototypes,
-        support_prototypes,
-    )
-    alpha = float(getattr(
-        self.pot_route_cfg,
-        "QUERY_PARTIAL_LOGIT_ALPHA",
-        10.0,
-    ))
-    bias = float(getattr(
-        self.pot_route_cfg,
-        "QUERY_PARTIAL_LOGIT_BIAS",
-        -2.0,
-    ))
-    base_logits = alpha * diag_similarity + bias
-
     matchability_mode = str(
         _cfg_value(cfg, "MODE", "threshold")
     ).lower()
@@ -820,6 +1260,166 @@ def _build_frame_softmax_q2s_with_matchability(
             "QUERY_CLASS_MATCHABILITY.MODE must be 'threshold' or "
             f"'positive_confuser_margin'; got {matchability_mode!r}."
         )
+
+    query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
+    local_refinement = None
+    local_margin = None
+    local_positive_similarity = None
+    local_confuser_similarity = None
+    local_positive_counts = None
+    local_confuser_counts = None
+    routed_support_references = None
+    routed_support_frame_valid = None
+    routed_positive_valid = None
+    routed_confuser_valid = None
+    routed_support_indices = None
+
+    local_refinement_enable = bool(
+        _cfg_value(cfg, "LOCAL_REFINEMENT_ENABLE", False)
+    )
+    if local_refinement_enable:
+        if matchability_mode not in relative_modes:
+            raise ValueError(
+                "LOCAL_REFINEMENT_ENABLE requires MODE='positive_confuser_margin'."
+            )
+        if evidence_source != "post":
+            raise ValueError(
+                "LOCAL_REFINEMENT_ENABLE currently requires EVIDENCE_SOURCE='post'."
+            )
+        if refined_similarity is not None:
+            raise RuntimeError(
+                "LOCAL_REFINEMENT_ENABLE currently requires COST_AGG.ENABLE=False."
+            )
+        support_frame_mask = metadata.get("pred_visibility", point_mask).to(
+            device=value_tokens.device,
+        ).bool()
+        (
+            routed_support_references,
+            routed_support_frame_valid,
+            routed_positive_valid,
+            routed_confuser_valid,
+            routed_support_indices,
+        ) = build_class_local_support_references(
+            self,
+            value_tokens,
+            point_mask,
+            support_frame_mask,
+            support_mask,
+            episode_positive_labels,
+            query_label_features,
+        )
+        query_tokens = value_tokens.index_select(0, query_indices)
+        query_point_mask = point_mask.index_select(0, query_indices)
+        (
+            local_margin,
+            local_positive_similarity,
+            local_confuser_similarity,
+            local_positive_counts,
+            local_confuser_counts,
+        ) = compute_local_positive_confuser_margin(
+            query_tokens,
+            routed_support_references,
+            routed_support_frame_valid,
+            routed_positive_valid,
+            routed_confuser_valid,
+            query_point_mask,
+            positive_aggregation=str(
+                _cfg_value(cfg, "LOCAL_POSITIVE_AGGREGATION", "topk_mean")
+            ),
+            positive_topk=int(_cfg_value(cfg, "LOCAL_POSITIVE_TOPK", 2)),
+            negative_aggregation=str(
+                _cfg_value(cfg, "LOCAL_NEGATIVE_AGGREGATION", "topk_mean")
+            ),
+            negative_topk=int(_cfg_value(cfg, "LOCAL_NEGATIVE_TOPK", 2)),
+            positive_temperature=float(
+                _cfg_value(
+                    cfg,
+                    "LOCAL_MARGIN_TEMPERATURE",
+                    0.10,
+                )
+            ),
+            negative_temperature=float(
+                _cfg_value(
+                    cfg,
+                    "LOCAL_NEGATIVE_TEMPERATURE",
+                    _cfg_value(cfg, "LOCAL_MARGIN_TEMPERATURE", 0.10),
+                )
+            ),
+            detach_references=bool(
+                _cfg_value(cfg, "LOCAL_DETACH_REFERENCES", True)
+            ),
+        )
+        patch_tau = float(
+            getattr(self.pot_route_cfg, "FRAME_SOFTMAX_TAU", 0.07)
+        )
+        local_refinement = build_confuser_refined_query_prototypes(
+            self,
+            query_tokens,
+            query_point_mask,
+            query_label_features,
+            local_margin,
+            patch_tau=patch_tau,
+            local_tau=float(
+                _cfg_value(cfg, "LOCAL_MARGIN_TEMPERATURE", 0.10)
+            ),
+            local_strength=float(
+                _cfg_value(cfg, "LOCAL_LOGIT_STRENGTH", 0.50)
+            ),
+        )
+        # The refined prototypes are the Query values used by both the base
+        # q2s score and the optional global matchability penalty.
+        query_prototypes = local_refinement["refined_prototypes"]
+        base_query_prototypes = local_refinement["base_prototypes"]
+    else:
+        query_prototypes = []
+        for sample_idx in query_indices.tolist():
+            if refined_similarity is None:
+                sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
+                    value_tokens[sample_idx],
+                    point_mask[sample_idx],
+                    query_label_features,
+                )
+            else:
+                sample_prototypes, _ = (
+                    self._compute_frame_softmax_prototypes_from_similarity(
+                        value_tokens[sample_idx],
+                        point_mask[sample_idx],
+                        refined_similarity[sample_idx],
+                    )
+                )
+            query_prototypes.append(sample_prototypes.unsqueeze(0))
+        if not query_prototypes:
+            return None
+        query_prototypes = torch.cat(query_prototypes, dim=0)
+        base_query_prototypes = query_prototypes
+
+    diag_similarity = self._compute_bidirectional_frame_similarity(
+        query_prototypes,
+        support_prototypes,
+    )
+    alpha = float(getattr(
+        self.pot_route_cfg,
+        "QUERY_PARTIAL_LOGIT_ALPHA",
+        10.0,
+    ))
+    bias = float(getattr(
+        self.pot_route_cfg,
+        "QUERY_PARTIAL_LOGIT_BIAS",
+        -2.0,
+    ))
+    base_logits = alpha * diag_similarity + bias
+    if local_refinement is None:
+        pre_refinement_diag_similarity = diag_similarity
+        pre_refinement_logits = base_logits
+    else:
+        pre_refinement_diag_similarity = (
+            self._compute_bidirectional_frame_similarity(
+                base_query_prototypes,
+                support_prototypes,
+            )
+        )
+        pre_refinement_logits = alpha * pre_refinement_diag_similarity + bias
+
     if matchability_mode in relative_modes:
         if evidence_source != "post":
             raise ValueError(
@@ -834,19 +1434,29 @@ def _build_frame_softmax_q2s_with_matchability(
             raise RuntimeError(
                 "positive_confuser_margin currently requires COST_AGG.ENABLE=False."
             )
-        confuser_prototypes, confuser_valid, confuser_support_indices = (
-            build_class_confuser_prototypes(
-                self,
-                value_tokens,
-                point_mask,
-                support_mask,
-                episode_positive_labels,
-                query_label_features,
-                detach_support=bool(
-                    _cfg_value(cfg, "DETACH_CONFUSER_SUPPORT", False)
-                ),
+        if routed_support_references is None:
+            confuser_prototypes, confuser_valid, confuser_support_indices = (
+                build_class_confuser_prototypes(
+                    self,
+                    value_tokens,
+                    point_mask,
+                    support_mask,
+                    episode_positive_labels,
+                    query_label_features,
+                    detach_support=bool(
+                        _cfg_value(cfg, "DETACH_CONFUSER_SUPPORT", False)
+                    ),
+                )
             )
-        )
+        else:
+            # The local and global comparisons must use the same class-routed
+            # Support hypotheses.  Reusing them also avoids a second complete
+            # Support routing pass when local refinement is enabled.
+            confuser_prototypes = routed_support_references
+            if bool(_cfg_value(cfg, "DETACH_CONFUSER_SUPPORT", False)):
+                confuser_prototypes = confuser_prototypes.detach()
+            confuser_valid = routed_confuser_valid
+            confuser_support_indices = routed_support_indices
         negative_similarity = pairwise_bimhm(
             query_prototypes,
             confuser_prototypes,
@@ -970,9 +1580,19 @@ def _build_frame_softmax_q2s_with_matchability(
             device=value_tokens.device,
             dtype=value_tokens.dtype,
         ),
+        "query_partial_q2s_pre_refinement_logits": pre_refinement_logits.to(
+            device=value_tokens.device,
+            dtype=value_tokens.dtype,
+        ),
         "query_partial_query_prototypes": query_prototypes.to(
             device=value_tokens.device,
             dtype=value_tokens.dtype,
+        ),
+        "query_partial_query_prototypes_before_refinement": (
+            base_query_prototypes.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            )
         ),
         "query_partial_support_prototypes": support_prototypes.to(
             device=value_tokens.device,
@@ -981,6 +1601,12 @@ def _build_frame_softmax_q2s_with_matchability(
         "query_partial_diag_similarity": diag_similarity.to(
             device=value_tokens.device,
             dtype=value_tokens.dtype,
+        ),
+        "query_partial_diag_similarity_before_refinement": (
+            pre_refinement_diag_similarity.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            )
         ),
         "query_partial_alpha_sim_term": (alpha * diag_similarity).to(
             device=value_tokens.device,
@@ -1020,6 +1646,67 @@ def _build_frame_softmax_q2s_with_matchability(
             "confuser_valid_count"
         ],
     }
+    if local_refinement is not None:
+        local_valid = query_point_mask.to(
+            device=value_tokens.device,
+            dtype=torch.float32,
+        ).unsqueeze(1)
+        local_valid_count = local_valid.sum(dim=(-2, -1)).clamp_min(1.0)
+
+        def _local_pair_mean(value):
+            return (
+                value.float() * local_valid
+            ).sum(dim=(-2, -1)) / local_valid_count
+
+        result.update({
+            "query_local_positive_similarity": local_positive_similarity.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_local_confuser_similarity": local_confuser_similarity.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_local_relative_margin": local_margin.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_local_positive_similarity_mean": _local_pair_mean(
+                local_positive_similarity
+            ),
+            "query_local_confuser_similarity_mean": _local_pair_mean(
+                local_confuser_similarity
+            ),
+            "query_local_relative_margin_mean": _local_pair_mean(local_margin),
+            "query_patch_weights_before_refinement": local_refinement[
+                "base_weights"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_patch_weights_after_refinement": local_refinement[
+                "refined_weights"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_local_logit_residual": local_refinement[
+                "local_logit_residual"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_local_weight_shift": local_refinement["weight_shift"].to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_local_weight_shift_mean": local_refinement[
+                "weight_shift_mean"
+            ].to(device=value_tokens.device, dtype=torch.float32),
+            "query_local_positive_support_count": local_positive_counts.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+            "query_local_confuser_support_count": local_confuser_counts.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+            "query_local_reference_support_indices": routed_support_indices.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+        })
     if "support_positive_evidence_mean" in matchability_aux:
         result.update({
             "support_positive_evidence_mean": matchability_aux[

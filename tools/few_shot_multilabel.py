@@ -4,6 +4,7 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import average_precision_score
 
 import trokens.utils.distributed as du
@@ -168,6 +169,115 @@ def few_shot_aux_has_query_partial_logits(few_shot_aux):
         and "query_partial_q2s_logits" in few_shot_aux
         and isinstance(few_shot_aux["query_partial_q2s_logits"], torch.Tensor)
     )
+
+
+def compute_query_partial_q2s_loss(
+    verified_logits,
+    q2s_labels,
+    few_shot_aux,
+    cfg,
+):
+    """Compute the training BCE for the Query partial matcher.
+
+    The verified logits are the public/final route (including the optional
+    matchability penalty).  When ``DUAL_LOGIT_LOSS_ENABLE`` is set, the
+    unpenalized ``query_partial_q2s_base_logits`` are supervised alongside
+    them.  Both branches receive exactly the same solver-temperature scaling
+    before BCE, so enabling the auxiliary branch does not silently change the
+    logit calibration of the existing objective.
+
+    Returns ``(loss, verified_logits_scaled, diagnostics)``.  Diagnostics are
+    detached scalar tensors suitable for the existing all-reduce/logging path.
+    This helper is intentionally training-only; evaluation should continue to
+    use the verified logits for its metric definition.
+    """
+    if not isinstance(verified_logits, torch.Tensor):
+        raise TypeError("verified_logits must be a Tensor.")
+    if not isinstance(q2s_labels, torch.Tensor):
+        raise TypeError("q2s_labels must be a Tensor.")
+    if tuple(verified_logits.shape) != tuple(q2s_labels.shape):
+        raise ValueError(
+            "verified_logits and q2s_labels must share shape; got "
+            f"{tuple(verified_logits.shape)} and {tuple(q2s_labels.shape)}."
+        )
+
+    solver_temperature = float(getattr(cfg.SOLVER, "TEMPRATURE", 1.0))
+    if not np.isfinite(solver_temperature) or solver_temperature <= 0.0:
+        raise ValueError("SOLVER.TEMPRATURE must be finite and positive.")
+
+    def _sanitize(logits):
+        scaled = logits / solver_temperature
+        return torch.nan_to_num(
+            scaled,
+            nan=0.0,
+            posinf=30.0,
+            neginf=-30.0,
+        )
+
+    labels = q2s_labels.float()
+    verified_scaled = _sanitize(verified_logits)
+    verified_loss = F.binary_cross_entropy_with_logits(
+        verified_scaled.float(),
+        labels,
+    )
+    diagnostics = {
+        "q2s_verified_loss": verified_loss.detach(),
+    }
+
+    match_cfg = getattr(
+        getattr(cfg, "FEW_SHOT", None),
+        "QUERY_CLASS_MATCHABILITY",
+        None,
+    )
+    dual_enabled = bool(
+        getattr(match_cfg, "DUAL_LOGIT_LOSS_ENABLE", False)
+    )
+    if not dual_enabled:
+        return verified_loss, verified_scaled, diagnostics
+
+    if not isinstance(few_shot_aux, dict):
+        raise ValueError(
+            "DUAL_LOGIT_LOSS_ENABLE requires few_shot_aux with base logits."
+        )
+    base_logits = few_shot_aux.get("query_partial_q2s_base_logits")
+    if not isinstance(base_logits, torch.Tensor):
+        raise ValueError(
+            "DUAL_LOGIT_LOSS_ENABLE requires base logits Tensor "
+            "'query_partial_q2s_base_logits'."
+        )
+    if tuple(base_logits.shape) != tuple(q2s_labels.shape):
+        raise ValueError(
+            "query_partial_q2s_base_logits must match q2s_labels; got "
+            f"{tuple(base_logits.shape)} and {tuple(q2s_labels.shape)}."
+        )
+
+    base_weight = float(getattr(match_cfg, "BASE_LOGIT_LOSS_WEIGHT", 0.50))
+    verified_weight = float(
+        getattr(match_cfg, "VERIFIED_LOGIT_LOSS_WEIGHT", 0.50)
+    )
+    if (
+        not np.isfinite(base_weight)
+        or not np.isfinite(verified_weight)
+        or base_weight < 0.0
+        or verified_weight < 0.0
+        or base_weight + verified_weight <= 0.0
+    ):
+        raise ValueError(
+            "BASE_LOGIT_LOSS_WEIGHT and VERIFIED_LOGIT_LOSS_WEIGHT must be "
+            "finite, non-negative, and not both zero."
+        )
+
+    base_scaled = _sanitize(base_logits)
+    base_loss = F.binary_cross_entropy_with_logits(
+        base_scaled.float(),
+        labels,
+    )
+    loss = base_weight * base_loss + verified_weight * verified_loss
+    diagnostics.update({
+        "q2s_base_loss": base_loss.detach(),
+        "q2s_verified_loss": verified_loss.detach(),
+    })
+    return loss, verified_scaled, diagnostics
 
 
 def get_text_align_loss(few_shot_aux, ref_tensor):
@@ -418,6 +528,39 @@ def get_query_matchability_metrics(few_shot_aux, q2s_labels):
         ),
         "matchability_penalty_mean": penalty.mean(),
     }
+    local_positive = _pair_tensor("query_local_positive_similarity_mean")
+    local_confuser = _pair_tensor("query_local_confuser_similarity_mean")
+    local_margin = _pair_tensor("query_local_relative_margin_mean")
+    local_weight_shift = _pair_tensor("query_local_weight_shift_mean")
+    if local_positive is not None:
+        metrics.update({
+            "local_positive_similarity_positive": masked_mean(
+                local_positive,
+                positive_mask,
+            ),
+            "local_positive_similarity_negative": masked_mean(
+                local_positive,
+                negative_mask,
+            ),
+        })
+    if local_confuser is not None:
+        metrics.update({
+            "local_confuser_similarity_positive": masked_mean(
+                local_confuser,
+                positive_mask,
+            ),
+            "local_confuser_similarity_negative": masked_mean(
+                local_confuser,
+                negative_mask,
+            ),
+        })
+    if local_margin is not None:
+        metrics.update({
+            "local_margin_positive": masked_mean(local_margin, positive_mask),
+            "local_margin_negative": masked_mean(local_margin, negative_mask),
+        })
+    if local_weight_shift is not None:
+        metrics["local_weight_shift_mean"] = local_weight_shift.mean()
     valid_count = few_shot_aux.get("query_class_confuser_valid_count")
     if isinstance(valid_count, torch.Tensor):
         metrics["matchability_confuser_valid_count"] = (

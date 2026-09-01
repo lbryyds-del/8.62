@@ -60,6 +60,18 @@ def test_config_enables_matchability_and_disables_learned_null():
         cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.MODE
         == "positive_confuser_margin"
     )
+    assert cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_REFINEMENT_ENABLE is True
+    assert cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_LOGIT_STRENGTH == 0.50
+    assert (
+        cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_NEGATIVE_AGGREGATION
+        == "topk_mean"
+    )
+    assert cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DUAL_LOGIT_LOSS_ENABLE is True
+    assert cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.BASE_LOGIT_LOSS_WEIGHT == 0.50
+    assert (
+        cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.VERIFIED_LOGIT_LOSS_WEIGHT
+        == 0.50
+    )
     assert cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.APPLY_DURING_TRAIN is True
 
 

@@ -1,8 +1,13 @@
 """Tests for multi-label few-shot helpers shared across routing modes."""
 
+from types import SimpleNamespace
+
+import pytest
 import torch
+import torch.nn.functional as F
 
 from tools.few_shot_multilabel import (
+    compute_query_partial_q2s_loss,
     q2s_cos_sim_fp32,
     support_query_split_multilabel_conditioned,
 )
@@ -52,3 +57,70 @@ def test_conditioned_split_replaces_support_and_query():
 
     assert result["support_preds"].shape == (3, 2, 1, 8)
     assert torch.equal(result["query_preds"], query)
+
+
+def _dual_loss_cfg(enabled=True, base_weight=0.5, verified_weight=0.5):
+    return SimpleNamespace(
+        SOLVER=SimpleNamespace(TEMPRATURE=2.0),
+        FEW_SHOT=SimpleNamespace(
+            QUERY_CLASS_MATCHABILITY=SimpleNamespace(
+                DUAL_LOGIT_LOSS_ENABLE=enabled,
+                BASE_LOGIT_LOSS_WEIGHT=base_weight,
+                VERIFIED_LOGIT_LOSS_WEIGHT=verified_weight,
+            )
+        ),
+    )
+
+
+def test_dual_q2s_loss_supervises_base_and_verified_logits_with_same_temperature():
+    verified = torch.tensor([[2.0, -2.0]], requires_grad=True)
+    base = torch.tensor([[0.5, -0.5]], requires_grad=True)
+    labels = torch.tensor([[1.0, 0.0]])
+    cfg = _dual_loss_cfg()
+
+    loss, scaled_verified, diagnostics = compute_query_partial_q2s_loss(
+        verified,
+        labels,
+        {"query_partial_q2s_base_logits": base},
+        cfg,
+    )
+    expected_verified = F.binary_cross_entropy_with_logits(
+        verified / 2.0,
+        labels,
+    )
+    expected_base = F.binary_cross_entropy_with_logits(base / 2.0, labels)
+
+    assert torch.equal(scaled_verified, verified / 2.0)
+    assert torch.allclose(loss, 0.5 * expected_base + 0.5 * expected_verified)
+    assert torch.allclose(diagnostics["q2s_base_loss"], expected_base)
+    assert torch.allclose(diagnostics["q2s_verified_loss"], expected_verified)
+
+    loss.backward()
+    assert verified.grad is not None and verified.grad.abs().sum() > 0
+    assert base.grad is not None and base.grad.abs().sum() > 0
+
+
+def test_dual_q2s_loss_fails_loudly_when_base_logits_are_missing():
+    with pytest.raises(ValueError, match="base logits"):
+        compute_query_partial_q2s_loss(
+            torch.zeros(1, 2),
+            torch.zeros(1, 2),
+            {},
+            _dual_loss_cfg(enabled=True),
+        )
+
+
+def test_single_q2s_loss_keeps_previous_verified_only_behavior():
+    verified = torch.tensor([[2.0, -2.0]], requires_grad=True)
+    labels = torch.tensor([[1.0, 0.0]])
+    loss, scaled, diagnostics = compute_query_partial_q2s_loss(
+        verified,
+        labels,
+        None,
+        _dual_loss_cfg(enabled=False),
+    )
+
+    expected = F.binary_cross_entropy_with_logits(verified / 2.0, labels)
+    assert torch.allclose(loss, expected)
+    assert torch.equal(scaled, verified / 2.0)
+    assert set(diagnostics) == {"q2s_verified_loss"}

@@ -105,6 +105,27 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_TOPK = 2
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_TEMPERATURE = 0.10
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DETACH_CONFUSER_SUPPORT = False
+    # Optional local positive-vs-confuser patch refinement.  The generic
+    # default is disabled so callers that only request the scalar
+    # matchability branch retain the pre-8.65 route.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_REFINEMENT_ENABLE = False
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_MARGIN_TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_LOGIT_STRENGTH = 0.50
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_POSITIVE_AGGREGATION = (
+        "topk_mean"
+    )
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_POSITIVE_TOPK = 2
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_NEGATIVE_AGGREGATION = (
+        "topk_mean"
+    )
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_NEGATIVE_TOPK = 2
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_NEGATIVE_TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_DETACH_REFERENCES = True
+    # Keep the original and verified q2s objectives separately supervised
+    # when local refinement is enabled.  Disabled by default for compatibility.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DUAL_LOGIT_LOSS_ENABLE = False
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.BASE_LOGIT_LOSS_WEIGHT = 0.50
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.VERIFIED_LOGIT_LOSS_WEIGHT = 0.50
     # The SAV experiment explicitly enables the new penalty during training;
     # the generic default remains conservative for callers that only want the
     # diagnostic branch.
