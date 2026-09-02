@@ -171,6 +171,88 @@ def few_shot_aux_has_query_partial_logits(few_shot_aux):
     )
 
 
+def compute_evidence_mil_loss(
+    frame_margins,
+    frame_valid,
+    labels,
+    topk_frames=3,
+    temperature=0.10,
+):
+    """Supervise the strongest valid frame margins with video labels.
+
+    This is deliberately a video-level MIL objective: it never consumes a
+    patch or frame target.  Positive and Confuser responses have already been
+    compared on the same Evidence-map region, and only the strongest valid
+    frame margins are averaged for each Query/class pair.  Pairs without a
+    valid Positive/Confuser comparison are excluded rather than trained toward
+    an arbitrary zero margin.
+    """
+    if not isinstance(frame_margins, torch.Tensor):
+        raise TypeError("frame_margins must be a Tensor.")
+    if not isinstance(frame_valid, torch.Tensor):
+        raise TypeError("frame_valid must be a Tensor.")
+    if not isinstance(labels, torch.Tensor):
+        raise TypeError("labels must be a Tensor.")
+    if frame_margins.ndim != 3:
+        raise ValueError(
+            "frame_margins must have shape [Q,K,T]; got "
+            f"{tuple(frame_margins.shape)}."
+        )
+    if tuple(frame_valid.shape) != tuple(frame_margins.shape):
+        raise ValueError(
+            "frame_valid must match frame_margins; got "
+            f"{tuple(frame_valid.shape)} and {tuple(frame_margins.shape)}."
+        )
+    if tuple(labels.shape) != tuple(frame_margins.shape[:2]):
+        raise ValueError(
+            "labels must match the Query/class axes of frame_margins; got "
+            f"{tuple(labels.shape)} and {tuple(frame_margins.shape[:2])}."
+        )
+    topk_frames = int(topk_frames)
+    temperature = float(temperature)
+    if topk_frames <= 0:
+        raise ValueError("EVIDENCE_VIDEO_TOPK_FRAMES must be positive.")
+    if not np.isfinite(temperature) or temperature <= 0.0:
+        raise ValueError("EVIDENCE_MIL_TEMPERATURE must be finite and positive.")
+
+    margins = torch.nan_to_num(
+        frame_margins.float(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    )
+    valid = frame_valid.to(device=margins.device).bool()
+    topk = min(topk_frames, margins.shape[-1])
+    masked = margins.masked_fill(~valid, float("-inf"))
+    values, indices = torch.topk(masked, k=topk, dim=-1)
+    selected_valid = torch.gather(valid, -1, indices)
+    values = torch.where(selected_valid, values, torch.zeros_like(values))
+    counts = selected_valid.sum(dim=-1)
+    video_margin = values.sum(dim=-1) / counts.clamp_min(1).to(values.dtype)
+    pair_valid = counts.gt(0)
+    mil_logits = torch.nan_to_num(
+        video_margin / temperature,
+        nan=0.0,
+        posinf=30.0,
+        neginf=-30.0,
+    )
+    if pair_valid.any():
+        loss = F.binary_cross_entropy_with_logits(
+            mil_logits[pair_valid],
+            labels.float().to(device=margins.device)[pair_valid],
+        )
+    else:
+        # Preserve a differentiable scalar on the correct device without
+        # manufacturing supervision for an episode that has no Confuser.
+        loss = margins.sum() * 0.0
+    return {
+        "loss": loss,
+        "video_margin": video_margin,
+        "logits": mil_logits,
+        "valid": pair_valid,
+    }
+
+
 def compute_query_partial_q2s_loss(
     verified_logits,
     q2s_labels,
@@ -229,11 +311,56 @@ def compute_query_partial_q2s_loss(
         "QUERY_CLASS_MATCHABILITY",
         None,
     )
-    dual_enabled = bool(
-        getattr(match_cfg, "DUAL_LOGIT_LOSS_ENABLE", False)
+    dual_enabled = bool(getattr(match_cfg, "DUAL_LOGIT_LOSS_ENABLE", False))
+    evidence_mil_weight = float(
+        getattr(match_cfg, "EVIDENCE_MIL_LOSS_WEIGHT", 0.0)
     )
+    if not np.isfinite(evidence_mil_weight) or evidence_mil_weight < 0.0:
+        raise ValueError(
+            "EVIDENCE_MIL_LOSS_WEIGHT must be finite and non-negative."
+        )
+
+    evidence_mil = None
+    if evidence_mil_weight > 0.0:
+        if not isinstance(few_shot_aux, dict):
+            raise ValueError(
+                "EVIDENCE_MIL_LOSS_WEIGHT > 0 requires few_shot_aux."
+            )
+        frame_margins = few_shot_aux.get("query_frame_relative_margin")
+        frame_valid = few_shot_aux.get("query_frame_valid")
+        if not isinstance(frame_margins, torch.Tensor) or not isinstance(
+            frame_valid, torch.Tensor
+        ):
+            raise ValueError(
+                "Evidence-MIL requires query_frame_relative_margin and "
+                "query_frame_valid Tensors."
+            )
+        evidence_mil = compute_evidence_mil_loss(
+            frame_margins,
+            frame_valid,
+            labels,
+            topk_frames=int(
+                getattr(match_cfg, "EVIDENCE_VIDEO_TOPK_FRAMES", 3)
+            ),
+            temperature=float(
+                getattr(match_cfg, "EVIDENCE_MIL_TEMPERATURE", 0.10)
+            ),
+        )
+        diagnostics.update({
+            "q2s_evidence_mil_loss": evidence_mil["loss"].detach(),
+            "q2s_evidence_mil_weighted_loss": (
+                evidence_mil_weight * evidence_mil["loss"]
+            ).detach(),
+            "q2s_evidence_mil_valid_fraction": (
+                evidence_mil["valid"].float().mean().detach()
+            ),
+        })
+
     if not dual_enabled:
-        return verified_loss, verified_scaled, diagnostics
+        loss = verified_loss
+        if evidence_mil is not None:
+            loss = loss + evidence_mil_weight * evidence_mil["loss"]
+        return loss, verified_scaled, diagnostics
 
     if not isinstance(few_shot_aux, dict):
         raise ValueError(
@@ -273,6 +400,8 @@ def compute_query_partial_q2s_loss(
         labels,
     )
     loss = base_weight * base_loss + verified_weight * verified_loss
+    if evidence_mil is not None:
+        loss = loss + evidence_mil_weight * evidence_mil["loss"]
     diagnostics.update({
         "q2s_base_loss": base_loss.detach(),
         "q2s_verified_loss": verified_loss.detach(),
@@ -561,6 +690,34 @@ def get_query_matchability_metrics(few_shot_aux, q2s_labels):
         })
     if local_weight_shift is not None:
         metrics["local_weight_shift_mean"] = local_weight_shift.mean()
+    frame_pairs = {
+        "frame_positive_evidence": _pair_tensor(
+            "query_frame_positive_evidence_mean"
+        ),
+        "frame_confuser_evidence": _pair_tensor(
+            "query_frame_confuser_evidence_mean"
+        ),
+        "frame_margin": _pair_tensor("query_frame_relative_margin_mean"),
+        "frame_rho": _pair_tensor("query_frame_matchability_mean"),
+        "frame_penalty": _pair_tensor("query_frame_log_penalty_mean"),
+        "frame_temporal_delta": _pair_tensor(
+            "query_frame_temporal_logit_delta"
+        ),
+        "frame_max_t_switch": _pair_tensor(
+            "query_frame_max_t_switch_fraction"
+        ),
+        "evidence_effective_patches": _pair_tensor(
+            "query_evidence_effective_patches_mean"
+        ),
+        "evidence_top1_mass": _pair_tensor(
+            "query_evidence_top1_mass_mean"
+        ),
+    }
+    for name, value in frame_pairs.items():
+        if value is None:
+            continue
+        metrics[f"{name}_positive"] = masked_mean(value, positive_mask)
+        metrics[f"{name}_negative"] = masked_mean(value, negative_mask)
     valid_count = few_shot_aux.get("query_class_confuser_valid_count")
     if isinstance(valid_count, torch.Tensor):
         metrics["matchability_confuser_valid_count"] = (

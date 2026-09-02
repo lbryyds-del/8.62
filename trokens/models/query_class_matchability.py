@@ -758,6 +758,331 @@ def compute_local_positive_confuser_margin(
     )
 
 
+def build_query_evidence_map(
+    pointformer: Any,
+    evidence_tokens: torch.Tensor,
+    point_mask: torch.Tensor,
+    episode_label_text: torch.Tensor,
+    temperature: float = 0.02,
+) -> Dict[str, torch.Tensor]:
+    """Build a pure-text evidence map without changing Query construction.
+
+    ``evidence_tokens`` are normally raw DinoTxt samples before positional,
+    motion and Pointformer mixing.  Their ``[T,N]`` slots are aligned with the
+    post-Pointformer values, so the returned weights can select which post
+    responses should be compared while leaving the deployed Query prototype
+    route untouched.
+    """
+    if evidence_tokens.ndim != 4:
+        raise ValueError(
+            "evidence_tokens must have shape [Q,T,N,D]; got "
+            f"{tuple(evidence_tokens.shape)}."
+        )
+    q, temporal_dim, num_points, feat_dim = evidence_tokens.shape
+    if tuple(point_mask.shape) != (q, temporal_dim, num_points):
+        raise ValueError(
+            "point_mask must match evidence_tokens Q,T,N; got "
+            f"{tuple(point_mask.shape)}."
+        )
+    if (
+        episode_label_text.ndim != 2
+        or episode_label_text.shape[-1] != feat_dim
+    ):
+        raise ValueError(
+            "episode_label_text must have shape [K,D] matching evidence "
+            f"tokens; got {tuple(episode_label_text.shape)} and D={feat_dim}."
+        )
+    temperature = float(temperature)
+    if (
+        not bool(torch.isfinite(torch.tensor(temperature)))
+        or temperature <= 0.0
+    ):
+        raise ValueError("Evidence-map temperature must be finite and positive.")
+
+    token_unit = _safe_unit(evidence_tokens)
+    text_unit = _safe_unit(
+        episode_label_text.to(device=evidence_tokens.device)
+    )
+    similarity = torch.einsum("kd,qtnd->qktn", text_unit, token_unit)
+    similarity = torch.nan_to_num(
+        similarity,
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    ).clamp(-1.0, 1.0)
+    valid = point_mask.to(device=evidence_tokens.device).bool().unsqueeze(1)
+    weights = pointformer._masked_softmax_1d(
+        similarity,
+        valid,
+        dim=-1,
+        tau=temperature,
+    ).float()
+    weights = torch.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+    effective_patches = 1.0 / weights.square().sum(dim=-1).clamp_min(1e-12)
+    top1_mass = weights.max(dim=-1).values
+    frame_valid = point_mask.to(device=evidence_tokens.device).bool().any(dim=-1)
+    effective_patches = torch.where(
+        frame_valid.unsqueeze(1),
+        effective_patches,
+        torch.zeros_like(effective_patches),
+    )
+    top1_mass = torch.where(
+        frame_valid.unsqueeze(1),
+        top1_mass,
+        torch.zeros_like(top1_mass),
+    )
+    return {
+        "weights": weights,
+        "similarity": similarity,
+        "frame_valid": frame_valid,
+        "effective_patches": effective_patches,
+        "top1_mass": top1_mass,
+    }
+
+
+def compute_evidence_conditioned_frame_matchability(
+    evidence_weights: torch.Tensor,
+    positive_response: torch.Tensor,
+    confuser_response: torch.Tensor,
+    frame_valid: torch.Tensor,
+    positive_count: torch.Tensor,
+    confuser_count: torch.Tensor,
+    temperature: float = 0.10,
+    bias: float = 0.0,
+) -> Dict[str, torch.Tensor]:
+    """Compare Positive and Confuser explanations on identical raw regions."""
+    if evidence_weights.ndim != 4:
+        raise ValueError(
+            "evidence_weights must have shape [Q,K,T,N]; got "
+            f"{tuple(evidence_weights.shape)}."
+        )
+    if tuple(positive_response.shape) != tuple(evidence_weights.shape):
+        raise ValueError(
+            "positive_response must match evidence_weights; got "
+            f"{tuple(positive_response.shape)} and "
+            f"{tuple(evidence_weights.shape)}."
+        )
+    if tuple(confuser_response.shape) != tuple(evidence_weights.shape):
+        raise ValueError(
+            "confuser_response must match evidence_weights; got "
+            f"{tuple(confuser_response.shape)} and "
+            f"{tuple(evidence_weights.shape)}."
+        )
+    q, num_classes, temporal_dim, _ = evidence_weights.shape
+    if tuple(frame_valid.shape) != (q, temporal_dim):
+        raise ValueError(
+            "frame_valid must have shape [Q,T]; got "
+            f"{tuple(frame_valid.shape)}."
+        )
+    if tuple(positive_count.shape) != (num_classes,):
+        raise ValueError(
+            "positive_count must have shape [K]; got "
+            f"{tuple(positive_count.shape)}."
+        )
+    if tuple(confuser_count.shape) != (num_classes,):
+        raise ValueError(
+            "confuser_count must have shape [K]; got "
+            f"{tuple(confuser_count.shape)}."
+        )
+    temperature = float(temperature)
+    bias = float(bias)
+    finite = bool(torch.isfinite(torch.tensor([temperature, bias])).all())
+    if not finite or temperature <= 0.0:
+        raise ValueError(
+            "Frame margin temperature must be positive and bias finite."
+        )
+
+    weights = torch.nan_to_num(
+        evidence_weights.float(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).clamp_min(0.0)
+    positive_evidence = (
+        weights * torch.nan_to_num(positive_response.float(), nan=0.0)
+    ).sum(dim=-1)
+    confuser_evidence = (
+        weights * torch.nan_to_num(confuser_response.float(), nan=0.0)
+    ).sum(dim=-1)
+    class_valid = (
+        positive_count.to(device=weights.device).gt(0)
+        & confuser_count.to(device=weights.device).gt(0)
+    )
+    valid = (
+        frame_valid.to(device=weights.device).bool().unsqueeze(1)
+        & class_valid.view(1, num_classes, 1)
+    )
+    margin = positive_evidence - confuser_evidence
+    margin = torch.where(valid, margin, torch.zeros_like(margin))
+    rho = torch.sigmoid((margin - bias) / temperature)
+    # Missing frames or comparison classes must be a strict no-op.
+    rho = torch.where(valid, rho, torch.ones_like(rho))
+    rho = torch.nan_to_num(rho, nan=1.0, posinf=1.0, neginf=0.0).clamp(
+        0.0,
+        1.0,
+    )
+    positive_evidence = torch.where(
+        valid,
+        positive_evidence,
+        torch.zeros_like(positive_evidence),
+    )
+    confuser_evidence = torch.where(
+        valid,
+        confuser_evidence,
+        torch.zeros_like(confuser_evidence),
+    )
+    return {
+        "positive_evidence": positive_evidence,
+        "confuser_evidence": confuser_evidence,
+        "margin": margin,
+        "matchability": rho,
+        "valid": valid,
+        "class_valid": class_valid,
+    }
+
+
+def classwise_frame_similarity(
+    query_prototypes: torch.Tensor,
+    support_prototypes: torch.Tensor,
+) -> torch.Tensor:
+    """Return the full positive frame matrix ``[Q,K,Tq,Ts]``."""
+    if query_prototypes.ndim != 4:
+        raise ValueError(
+            "query_prototypes must have shape [Q,K,T,D]; got "
+            f"{tuple(query_prototypes.shape)}."
+        )
+    if support_prototypes.ndim != 3:
+        raise ValueError(
+            "support_prototypes must have shape [K,T,D]; got "
+            f"{tuple(support_prototypes.shape)}."
+        )
+    if (
+        query_prototypes.shape[1] != support_prototypes.shape[0]
+        or query_prototypes.shape[-1] != support_prototypes.shape[-1]
+    ):
+        raise ValueError(
+            "Query/Support class and feature axes must agree; got "
+            f"{tuple(query_prototypes.shape)} and "
+            f"{tuple(support_prototypes.shape)}."
+        )
+    query_unit = _safe_unit(query_prototypes)
+    support_unit = _safe_unit(support_prototypes)
+    similarity = torch.einsum(
+        "qktd,ksd->qkts",
+        query_unit,
+        support_unit,
+    )
+    return torch.nan_to_num(
+        similarity,
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    ).clamp(-1.0, 1.0)
+
+
+def confidence_aware_bimhm_logits(
+    frame_similarity: torch.Tensor,
+    frame_matchability: torch.Tensor,
+    base_logits: torch.Tensor,
+    alpha: float = 10.0,
+    penalty_weight: float = 0.05,
+    eps: float = 0.05,
+    direction: str = "support_to_query",
+) -> Dict[str, torch.Tensor]:
+    """Apply Query-frame confidence inside BiMHM without rebuilding Q.
+
+    ``support_to_query`` preserves the controlled first ablation and modifies
+    only the Support-to-Query ``max_t``.  ``both`` implements the complete
+    document formula by applying the same Query-frame penalty to both BiMHM
+    reductions.  Expressing either result as a delta from ``base_logits``
+    guarantees a bitwise no-op when ``penalty_weight`` is zero and preserves
+    the existing matcher bias exactly.
+    """
+    if frame_similarity.ndim != 4:
+        raise ValueError(
+            "frame_similarity must have shape [Q,K,Tq,Ts]; got "
+            f"{tuple(frame_similarity.shape)}."
+        )
+    expected_rho = frame_similarity.shape[:3]
+    if tuple(frame_matchability.shape) != tuple(expected_rho):
+        raise ValueError(
+            "frame_matchability must have shape [Q,K,Tq]; got "
+            f"{tuple(frame_matchability.shape)}, expected {tuple(expected_rho)}."
+        )
+    if tuple(base_logits.shape) != tuple(frame_similarity.shape[:2]):
+        raise ValueError(
+            "base_logits must have shape [Q,K]; got "
+            f"{tuple(base_logits.shape)}."
+        )
+    alpha = float(alpha)
+    penalty_weight = float(penalty_weight)
+    eps = float(eps)
+    finite = bool(torch.isfinite(torch.tensor([alpha, penalty_weight, eps])).all())
+    if not finite or alpha <= 0.0 or penalty_weight < 0.0:
+        raise ValueError("alpha must be positive and penalty_weight non-negative.")
+    if not 0.0 < eps <= 1.0:
+        raise ValueError("Frame log eps must be in (0, 1].")
+    direction = str(direction).lower()
+    if direction not in {"support_to_query", "both"}:
+        raise ValueError(
+            "FRAME_PENALTY_DIRECTION must be 'support_to_query' or 'both'."
+        )
+
+    similarity_logits = alpha * torch.nan_to_num(
+        frame_similarity.float(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    )
+    frame_penalty = penalty_weight * torch.log(
+        torch.nan_to_num(
+            frame_matchability.float(),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp_min(eps)
+    )
+    base_q_to_s = similarity_logits.max(dim=-1).values.mean(dim=-1)
+    base_s_to_q, base_winner = similarity_logits.max(dim=-2)
+    verified_pair_logits = similarity_logits + frame_penalty.unsqueeze(-1)
+    verified_q_to_s = verified_pair_logits.max(dim=-1).values.mean(dim=-1)
+    verified_s_to_q, verified_winner = verified_pair_logits.max(dim=-2)
+    q_to_s_delta = verified_q_to_s - base_q_to_s
+    s_to_q_delta = verified_s_to_q.mean(dim=-1) - base_s_to_q.mean(dim=-1)
+    if direction == "both":
+        temporal_delta = 0.5 * (q_to_s_delta + s_to_q_delta)
+    else:
+        temporal_delta = 0.5 * s_to_q_delta
+    temporal_logits = base_logits.float() + temporal_delta
+    if penalty_weight == 0.0:
+        # Besides making the mathematical no-op explicit, this avoids tiny
+        # recomputation drift in strict paired regression tests.
+        temporal_logits = base_logits.float()
+    winner_switch_fraction = (
+        verified_winner.ne(base_winner).float().mean(dim=-1)
+    )
+    return {
+        "logits": torch.nan_to_num(
+            temporal_logits,
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        ),
+        "frame_penalty": torch.nan_to_num(
+            frame_penalty,
+            nan=0.0,
+            posinf=0.0,
+            neginf=-1e4,
+        ),
+        "pair_logits": verified_pair_logits,
+        "q_to_s_delta": q_to_s_delta,
+        "s_to_q_delta": s_to_q_delta,
+        "base_winner": base_winner,
+        "verified_winner": verified_winner,
+        "winner_switch_fraction": winner_switch_fraction,
+    }
+
+
 def build_confuser_refined_query_prototypes(
     pointformer: Any,
     query_tokens: torch.Tensor,
@@ -1277,18 +1602,48 @@ def _build_frame_softmax_q2s_with_matchability(
     local_refinement_enable = bool(
         _cfg_value(cfg, "LOCAL_REFINEMENT_ENABLE", False)
     )
-    if local_refinement_enable:
+    evidence_verification_enable = bool(
+        _cfg_value(cfg, "EVIDENCE_VERIFICATION_ENABLE", False)
+    )
+    evidence_map_source = str(
+        _cfg_value(cfg, "EVIDENCE_MAP_SOURCE", "raw")
+    ).lower()
+    if evidence_verification_enable and evidence_map_source not in {
+        "raw",
+        "post",
+    }:
+        raise ValueError(
+            "EVIDENCE_MAP_SOURCE must be 'raw' or 'post'; got "
+            f"{evidence_map_source!r}."
+        )
+    if (
+        evidence_verification_enable
+        and evidence_map_source == "raw"
+        and matchability_evidence_tokens is None
+    ):
+        raise ValueError(
+            "Raw Evidence verification was enabled, but pre-Pointformer "
+            "DinoTxt tokens were not provided."
+        )
+    if local_refinement_enable and evidence_verification_enable:
+        raise ValueError(
+            "LOCAL_REFINEMENT_ENABLE and EVIDENCE_VERIFICATION_ENABLE are "
+            "controlled alternatives and cannot be enabled together."
+        )
+    if local_refinement_enable or evidence_verification_enable:
         if matchability_mode not in relative_modes:
             raise ValueError(
-                "LOCAL_REFINEMENT_ENABLE requires MODE='positive_confuser_margin'."
+                "Local Positive/Confuser evidence requires "
+                "MODE='positive_confuser_margin'."
             )
-        if evidence_source != "post":
+        if local_refinement_enable and evidence_source != "post":
             raise ValueError(
                 "LOCAL_REFINEMENT_ENABLE currently requires EVIDENCE_SOURCE='post'."
             )
         if refined_similarity is not None:
             raise RuntimeError(
-                "LOCAL_REFINEMENT_ENABLE currently requires COST_AGG.ENABLE=False."
+                "Local Positive/Confuser evidence currently requires "
+                "COST_AGG.ENABLE=False."
             )
         support_frame_mask = metadata.get("pred_visibility", point_mask).to(
             device=value_tokens.device,
@@ -1324,31 +1679,67 @@ def _build_frame_softmax_q2s_with_matchability(
             routed_confuser_valid,
             query_point_mask,
             positive_aggregation=str(
-                _cfg_value(cfg, "LOCAL_POSITIVE_AGGREGATION", "topk_mean")
+                _cfg_value(
+                    cfg,
+                    "LOCAL_POSITIVE_AGGREGATION"
+                    if local_refinement_enable
+                    else "EVIDENCE_POSITIVE_AGGREGATION",
+                    "topk_mean",
+                )
             ),
-            positive_topk=int(_cfg_value(cfg, "LOCAL_POSITIVE_TOPK", 2)),
+            positive_topk=int(_cfg_value(
+                cfg,
+                "LOCAL_POSITIVE_TOPK"
+                if local_refinement_enable
+                else "EVIDENCE_POSITIVE_TOPK",
+                2,
+            )),
             negative_aggregation=str(
                 _cfg_value(cfg, "LOCAL_NEGATIVE_AGGREGATION", "topk_mean")
+                if local_refinement_enable
+                else _cfg_value(
+                    cfg,
+                    "EVIDENCE_CONFUSER_AGGREGATION",
+                    "topk_mean",
+                )
             ),
-            negative_topk=int(_cfg_value(cfg, "LOCAL_NEGATIVE_TOPK", 2)),
+            negative_topk=int(_cfg_value(
+                cfg,
+                "LOCAL_NEGATIVE_TOPK"
+                if local_refinement_enable
+                else "EVIDENCE_CONFUSER_TOPK",
+                2,
+            )),
             positive_temperature=float(
                 _cfg_value(
                     cfg,
-                    "LOCAL_MARGIN_TEMPERATURE",
+                    "LOCAL_MARGIN_TEMPERATURE"
+                    if local_refinement_enable
+                    else "EVIDENCE_AGGREGATION_TEMPERATURE",
                     0.10,
                 )
             ),
             negative_temperature=float(
                 _cfg_value(
                     cfg,
-                    "LOCAL_NEGATIVE_TEMPERATURE",
-                    _cfg_value(cfg, "LOCAL_MARGIN_TEMPERATURE", 0.10),
+                    "LOCAL_NEGATIVE_TEMPERATURE"
+                    if local_refinement_enable
+                    else "EVIDENCE_AGGREGATION_TEMPERATURE",
+                    0.10,
                 )
             ),
             detach_references=bool(
-                _cfg_value(cfg, "LOCAL_DETACH_REFERENCES", True)
+                _cfg_value(
+                    cfg,
+                    "LOCAL_DETACH_REFERENCES"
+                    if local_refinement_enable
+                    else "EVIDENCE_DETACH_REFERENCES",
+                    True,
+                )
             ),
         )
+
+    if local_refinement_enable:
         patch_tau = float(
             getattr(self.pot_route_cfg, "FRAME_SOFTMAX_TAU", 0.07)
         )
@@ -1420,6 +1811,82 @@ def _build_frame_softmax_q2s_with_matchability(
         )
         pre_refinement_logits = alpha * pre_refinement_diag_similarity + bias
 
+    temporal_logits = base_logits.float()
+    evidence_map_aux = None
+    frame_matchability_aux = None
+    temporal_match_aux = None
+    if evidence_verification_enable:
+        evidence_tokens_all = (
+            matchability_evidence_tokens
+            if evidence_map_source == "raw"
+            else value_tokens
+        )
+        if tuple(evidence_tokens_all.shape[:3]) != tuple(value_tokens.shape[:3]):
+            raise ValueError(
+                "Evidence-map tokens must align with post values in B/T/N; got "
+                f"{tuple(evidence_tokens_all.shape)} and "
+                f"{tuple(value_tokens.shape)}."
+            )
+        evidence_query_tokens = evidence_tokens_all.index_select(
+            0,
+            query_indices,
+        )
+        evidence_point_mask = query_point_mask
+        if bool(_cfg_value(cfg, "EVIDENCE_USE_VISIBILITY", True)):
+            query_visibility = metadata.get(
+                "pred_visibility",
+                point_mask,
+            ).to(device=value_tokens.device).bool().index_select(
+                0,
+                query_indices,
+            )
+            evidence_point_mask = evidence_point_mask & query_visibility
+        evidence_map_aux = build_query_evidence_map(
+            self,
+            evidence_query_tokens,
+            evidence_point_mask,
+            episode_label_text,
+            temperature=float(
+                _cfg_value(cfg, "EVIDENCE_MAP_TEMPERATURE", 0.02)
+            ),
+        )
+        frame_matchability_aux = (
+            compute_evidence_conditioned_frame_matchability(
+                evidence_map_aux["weights"],
+                local_positive_similarity,
+                local_confuser_similarity,
+                evidence_map_aux["frame_valid"],
+                local_positive_counts,
+                local_confuser_counts,
+                temperature=float(
+                    _cfg_value(cfg, "FRAME_MARGIN_TEMPERATURE", 0.10)
+                ),
+                bias=float(_cfg_value(cfg, "FRAME_MARGIN_BIAS", 0.0)),
+            )
+        )
+        positive_frame_similarity = classwise_frame_similarity(
+            query_prototypes,
+            support_prototypes,
+        )
+        temporal_match_aux = confidence_aware_bimhm_logits(
+            positive_frame_similarity,
+            frame_matchability_aux["matchability"],
+            base_logits,
+            alpha=alpha,
+            penalty_weight=float(
+                _cfg_value(cfg, "FRAME_LOG_PENALTY_WEIGHT", 0.05)
+            ),
+            eps=float(_cfg_value(cfg, "FRAME_LOG_EPS", 0.05)),
+            direction=str(
+                _cfg_value(
+                    cfg,
+                    "FRAME_PENALTY_DIRECTION",
+                    "support_to_query",
+                )
+            ),
+        )
+        temporal_logits = temporal_match_aux["logits"]
+
     if matchability_mode in relative_modes:
         if evidence_source != "post":
             raise ValueError(
@@ -1434,7 +1901,7 @@ def _build_frame_softmax_q2s_with_matchability(
             raise RuntimeError(
                 "positive_confuser_margin currently requires COST_AGG.ENABLE=False."
             )
-        if routed_support_references is None:
+        if routed_support_references is None or not local_refinement_enable:
             confuser_prototypes, confuser_valid, confuser_support_indices = (
                 build_class_confuser_prototypes(
                     self,
@@ -1560,7 +2027,7 @@ def _build_frame_softmax_q2s_with_matchability(
         log_penalty = torch.zeros_like(final_logits)
     else:
         final_logits, log_penalty = apply_log_matchability_penalty(
-            base_logits,
+            temporal_logits,
             matchability_aux["matchability"],
             cfg,
             support_reliable=matchability_aux["support_reliable"],
@@ -1577,6 +2044,10 @@ def _build_frame_softmax_q2s_with_matchability(
             dtype=value_tokens.dtype,
         ),
         "query_partial_q2s_base_logits": base_logits.to(
+            device=value_tokens.device,
+            dtype=value_tokens.dtype,
+        ),
+        "query_partial_q2s_temporal_logits": temporal_logits.to(
             device=value_tokens.device,
             dtype=value_tokens.dtype,
         ),
@@ -1646,6 +2117,114 @@ def _build_frame_softmax_q2s_with_matchability(
             "confuser_valid_count"
         ],
     }
+    if evidence_map_aux is not None:
+        frame_valid = frame_matchability_aux["valid"].to(
+            device=value_tokens.device,
+        ).bool()
+        frame_valid_float = frame_valid.float()
+        frame_valid_count = frame_valid_float.sum(dim=-1)
+
+        def _evidence_frame_mean(value, fallback=0.0):
+            mean = (
+                value.float() * frame_valid_float
+            ).sum(dim=-1) / frame_valid_count.clamp_min(1.0)
+            return torch.where(
+                frame_valid_count.gt(0),
+                mean,
+                torch.full_like(mean, float(fallback)),
+            )
+
+        evidence_effective = evidence_map_aux[
+            "effective_patches"
+        ].expand_as(frame_matchability_aux["matchability"])
+        evidence_top1 = evidence_map_aux["top1_mass"].expand_as(
+            frame_matchability_aux["matchability"]
+        )
+        result.update({
+            "query_evidence_patch_weights": evidence_map_aux["weights"].to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_evidence_patch_similarity": evidence_map_aux[
+                "similarity"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_evidence_patch_positive_response": (
+                local_positive_similarity.to(
+                    device=value_tokens.device,
+                    dtype=value_tokens.dtype,
+                )
+            ),
+            "query_evidence_patch_confuser_response": (
+                local_confuser_similarity.to(
+                    device=value_tokens.device,
+                    dtype=value_tokens.dtype,
+                )
+            ),
+            "query_frame_positive_evidence": frame_matchability_aux[
+                "positive_evidence"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_confuser_evidence": frame_matchability_aux[
+                "confuser_evidence"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_relative_margin": frame_matchability_aux[
+                "margin"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_matchability": frame_matchability_aux[
+                "matchability"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_valid": frame_valid,
+            "query_frame_confuser_available": frame_matchability_aux[
+                "class_valid"
+            ].to(device=value_tokens.device, dtype=torch.bool),
+            "query_frame_log_penalty": temporal_match_aux[
+                "frame_penalty"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_positive_evidence_mean": _evidence_frame_mean(
+                frame_matchability_aux["positive_evidence"]
+            ),
+            "query_frame_confuser_evidence_mean": _evidence_frame_mean(
+                frame_matchability_aux["confuser_evidence"]
+            ),
+            "query_frame_relative_margin_mean": _evidence_frame_mean(
+                frame_matchability_aux["margin"]
+            ),
+            "query_frame_matchability_mean": _evidence_frame_mean(
+                frame_matchability_aux["matchability"],
+                fallback=1.0,
+            ),
+            "query_frame_log_penalty_mean": _evidence_frame_mean(
+                temporal_match_aux["frame_penalty"]
+            ),
+            "query_evidence_effective_patches_mean": _evidence_frame_mean(
+                evidence_effective
+            ),
+            "query_evidence_top1_mass_mean": _evidence_frame_mean(
+                evidence_top1
+            ),
+            "query_frame_s_to_q_delta": temporal_match_aux[
+                "s_to_q_delta"
+            ].to(device=value_tokens.device, dtype=torch.float32),
+            "query_frame_temporal_logit_delta": (
+                temporal_logits.float() - base_logits.float()
+            ),
+            "query_frame_max_t_switch_fraction": temporal_match_aux[
+                "winner_switch_fraction"
+            ].to(device=value_tokens.device, dtype=torch.float32),
+            "query_frame_base_winner": temporal_match_aux[
+                "base_winner"
+            ].to(device=value_tokens.device, dtype=torch.long),
+            "query_frame_verified_winner": temporal_match_aux[
+                "verified_winner"
+            ].to(device=value_tokens.device, dtype=torch.long),
+            "query_evidence_positive_support_count": local_positive_counts.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+            "query_evidence_confuser_support_count": local_confuser_counts.to(
+                device=value_tokens.device,
+                dtype=torch.long,
+            ),
+        })
     if local_refinement is not None:
         local_valid = query_point_mask.to(
             device=value_tokens.device,

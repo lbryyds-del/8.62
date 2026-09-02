@@ -427,6 +427,9 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     "base_score": _aux_numpy(
                         "query_partial_q2s_base_logits"
                     ),
+                    "temporal_score": _aux_numpy(
+                        "query_partial_q2s_temporal_logits"
+                    ),
                     "matchability": _aux_numpy(
                         "query_class_matchability"
                     ),
@@ -463,9 +466,37 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                         "query_class_confuser_valid_count",
                         dtype=torch.long,
                     ),
+                    "frame_positive_evidence": _aux_numpy(
+                        "query_frame_positive_evidence_mean"
+                    ),
+                    "frame_confuser_evidence": _aux_numpy(
+                        "query_frame_confuser_evidence_mean"
+                    ),
+                    "frame_margin": _aux_numpy(
+                        "query_frame_relative_margin_mean"
+                    ),
+                    "frame_matchability": _aux_numpy(
+                        "query_frame_matchability_mean"
+                    ),
+                    "frame_log_penalty": _aux_numpy(
+                        "query_frame_log_penalty_mean"
+                    ),
+                    "frame_effective_patches": _aux_numpy(
+                        "query_evidence_effective_patches_mean"
+                    ),
+                    "frame_top1_mass": _aux_numpy(
+                        "query_evidence_top1_mass_mean"
+                    ),
+                    "frame_temporal_delta": _aux_numpy(
+                        "query_frame_temporal_logit_delta"
+                    ),
+                    "frame_max_t_switch": _aux_numpy(
+                        "query_frame_max_t_switch_fraction"
+                    ),
                 }
                 for name in (
                     "base_score",
+                    "temporal_score",
                     "matchability",
                     "evidence",
                     "log_penalty",
@@ -473,6 +504,15 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     "hardest_confuser_similarity",
                     "relative_margin",
                     "hardest_confuser_index",
+                    "frame_positive_evidence",
+                    "frame_confuser_evidence",
+                    "frame_margin",
+                    "frame_matchability",
+                    "frame_log_penalty",
+                    "frame_effective_patches",
+                    "frame_top1_mass",
+                    "frame_temporal_delta",
+                    "frame_max_t_switch",
                 ):
                     if query_matchability_rows[name] is None:
                         continue
@@ -583,6 +623,7 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                             ),
                         })
                         optional_pair_fields = {
+                            "query_class_temporal_score": "temporal_score",
                             "query_class_positive_similarity": (
                                 "positive_similarity"
                             ),
@@ -592,6 +633,25 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                             "query_class_relative_margin": "relative_margin",
                             "query_class_hardest_confuser_support_index": (
                                 "hardest_confuser_index"
+                            ),
+                            "query_frame_positive_evidence": (
+                                "frame_positive_evidence"
+                            ),
+                            "query_frame_confuser_evidence": (
+                                "frame_confuser_evidence"
+                            ),
+                            "query_frame_relative_margin": "frame_margin",
+                            "query_frame_matchability": "frame_matchability",
+                            "query_frame_log_penalty": "frame_log_penalty",
+                            "query_evidence_effective_patches": (
+                                "frame_effective_patches"
+                            ),
+                            "query_evidence_top1_mass": "frame_top1_mass",
+                            "query_frame_temporal_logit_delta": (
+                                "frame_temporal_delta"
+                            ),
+                            "query_frame_max_t_switch_fraction": (
+                                "frame_max_t_switch"
                             ),
                         }
                         for output_name, source_name in optional_pair_fields.items():

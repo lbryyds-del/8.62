@@ -76,8 +76,9 @@ FEW_SHOT:
     NEGATIVE_TOPK: 2
     NEGATIVE_TEMPERATURE: 0.10
     DETACH_CONFUSER_SUPPORT: True
-    # Local confuser-aware patch routing refinement.
-    LOCAL_REFINEMENT_ENABLE: True
+    # Keep the 8.66 implementation for rollback, but do not let its local
+    # Support margin rewrite the main Query construction weights.
+    LOCAL_REFINEMENT_ENABLE: False
     LOCAL_MARGIN_TEMPERATURE: 0.10
     LOCAL_LOGIT_STRENGTH: 0.50
     LOCAL_POSITIVE_AGGREGATION: "topk_mean"
@@ -86,10 +87,33 @@ FEW_SHOT:
     LOCAL_NEGATIVE_TOPK: 2
     LOCAL_NEGATIVE_TEMPERATURE: 0.10
     LOCAL_DETACH_REFERENCES: True
-    # Train both the refined base matcher and the globally verified matcher.
+    # Raw text selects semantic trajectory slots only for evidence verification;
+    # the existing post-Pointformer Text+Support route still constructs Q.
+    EVIDENCE_VERIFICATION_ENABLE: True
+    EVIDENCE_MAP_SOURCE: "raw"
+    EVIDENCE_MAP_TEMPERATURE: 0.07
+    EVIDENCE_USE_VISIBILITY: True
+    EVIDENCE_POSITIVE_AGGREGATION: "topk_mean"
+    EVIDENCE_POSITIVE_TOPK: 2
+    EVIDENCE_CONFUSER_AGGREGATION: "topk_mean"
+    EVIDENCE_CONFUSER_TOPK: 2
+    EVIDENCE_AGGREGATION_TEMPERATURE: 0.10
+    EVIDENCE_DETACH_REFERENCES: True
+    # Apply frame confidence to the complete bidirectional BiMHM in the
+    # document recipe.
+    FRAME_MARGIN_TEMPERATURE: 0.10
+    FRAME_MARGIN_BIAS: 0.0
+    FRAME_LOG_PENALTY_WEIGHT: 0.10
+    FRAME_LOG_EPS: 0.05
+    FRAME_PENALTY_DIRECTION: "both"
+    # Weak video-label supervision over the strongest Evidence margins.
+    EVIDENCE_VIDEO_TOPK_FRAMES: 3
+    EVIDENCE_MIL_TEMPERATURE: 0.10
+    EVIDENCE_MIL_LOSS_WEIGHT: 0.10
+    # Train both the untouched base matcher and the verified matcher.
     DUAL_LOGIT_LOSS_ENABLE: True
-    BASE_LOGIT_LOSS_WEIGHT: 0.50
-    VERIFIED_LOGIT_LOSS_WEIGHT: 0.50
+    BASE_LOGIT_LOSS_WEIGHT: 0.60
+    VERIFIED_LOGIT_LOSS_WEIGHT: 0.40
     # User-requested first training run: include the relative penalty in q2s
     # BCE during training as well as in evaluation.
     APPLY_DURING_TRAIN: True

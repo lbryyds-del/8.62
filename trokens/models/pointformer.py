@@ -2507,9 +2507,22 @@ class Pointformer(nn.Module):
             matchability_source = str(
                 getattr(match_cfg, "EVIDENCE_SOURCE", "post")
             ).lower()
+            evidence_verification_enabled = bool(
+                getattr(match_cfg, "EVIDENCE_VERIFICATION_ENABLE", False)
+            )
+            evidence_map_source = str(
+                getattr(match_cfg, "EVIDENCE_MAP_SOURCE", "raw")
+            ).lower()
+            raw_evidence_requested = (
+                matchability_source == "raw"
+                or (
+                    evidence_verification_enabled
+                    and evidence_map_source == "raw"
+                )
+            )
             if (
                 bool(getattr(match_cfg, "ENABLE", False))
-                and matchability_source == "raw"
+                and raw_evidence_requested
             ):
                 if self.feat_extractor_type != "dinotxt_vitl14_reg4":
                     raise ValueError(

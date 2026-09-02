@@ -121,6 +121,38 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_NEGATIVE_TOPK = 2
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_NEGATIVE_TEMPERATURE = 0.10
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.LOCAL_DETACH_REFERENCES = True
+    # Optional Raw-Semantic-Key evidence verifier.  This branch never changes
+    # the Query construction weights: pure text selects raw DinoTxt trajectory
+    # slots, while post-Pointformer Positive/Confuser responses explain those
+    # same slots and produce a per-frame confidence penalty.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_VERIFICATION_ENABLE = False
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MAP_SOURCE = "raw"
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MAP_TEMPERATURE = 0.02
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_USE_VISIBILITY = True
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_POSITIVE_AGGREGATION = (
+        "topk_mean"
+    )
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_POSITIVE_TOPK = 2
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_CONFUSER_AGGREGATION = (
+        "topk_mean"
+    )
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_CONFUSER_TOPK = 2
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_AGGREGATION_TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_DETACH_REFERENCES = True
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.FRAME_MARGIN_TEMPERATURE = 0.10
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.FRAME_MARGIN_BIAS = 0.0
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.FRAME_LOG_PENALTY_WEIGHT = 0.05
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.FRAME_LOG_EPS = 0.05
+    # The first controlled version modifies only the Support-to-Query max_t
+    # direction.  Query-to-Support remains bitwise on the original route.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.FRAME_PENALTY_DIRECTION = (
+        "support_to_query"
+    )
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_VIDEO_TOPK_FRAMES = 3
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MIL_TEMPERATURE = 0.10
+    # Disabled generically; individual experiments can opt into the
+    # video-label MIL objective without changing compatibility callers.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MIL_LOSS_WEIGHT = 0.0
     # Keep the original and verified q2s objectives separately supervised
     # when local refinement is enabled.  Disabled by default for compatibility.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DUAL_LOGIT_LOSS_ENABLE = False
