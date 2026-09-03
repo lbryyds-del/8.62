@@ -153,6 +153,22 @@ def add_custom_config(cfg):
     # Disabled generically; individual experiments can opt into the
     # video-label MIL objective without changing compatibility callers.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MIL_LOSS_WEIGHT = 0.0
+    # Optional Support-calibrated absolute transport mass.  Unlike the
+    # patch-wise Softmax, this mass may approach zero.  The remaining mass is
+    # retained as an explicit unmatched state by the frame matcher.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_ENABLE = False
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_SOURCE = "raw"
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_USE_VISIBILITY = True
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_PATCH_TOPK = 8
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_SUPPORT_TOPK_FRAMES = 3
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_CALIBRATION_BETA = 0.25
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_TEMPERATURE = 0.05
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_MIN_SUPPORT_GAP = 0.0
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_DETACH_SUPPORT_STATS = True
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_RELIABILITY_FALLBACK = True
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_TRANSPORT_STRENGTH = 1.0
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_UNMATCHED_COST = 0.0
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_ONE_SIDED = True
     # Keep the original and verified q2s objectives separately supervised
     # when local refinement is enabled.  Disabled by default for compatibility.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DUAL_LOGIT_LOSS_ENABLE = False

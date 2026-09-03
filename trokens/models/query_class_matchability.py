@@ -8,7 +8,11 @@ Query Null token:
    positive-versus-confuser Support margin;
 2. ``whether``: either the legacy Support-calibrated text evidence or a global
    positive-versus-confuser Support margin estimates whether the Query-class
-   hypothesis is matchable at all.
+   hypothesis is matchable at all;
+3. ``how much``: an optional Support-calibrated absolute evidence branch splits
+   every Query frame into transported patch mass ``m`` and explicit unmatched
+   mass ``1-m``.  The unmatched mass is retained by BiMHM instead of being
+   normalized back onto arbitrary patches.
 
 The matchability is calibrated from labeled Support videos in the current
 episode and enters the final q2s logit as a non-positive log-probability
@@ -941,6 +945,206 @@ def compute_evidence_conditioned_frame_matchability(
     }
 
 
+def compute_support_calibrated_frame_transport_mass(
+    similarity: torch.Tensor,
+    point_mask: torch.Tensor,
+    support_mask: torch.Tensor,
+    episode_positive_labels: torch.Tensor,
+    cfg: Any,
+) -> Dict[str, torch.Tensor]:
+    """Split Query-frame quality into patch and unmatched mass.
+
+    ``similarity`` is pure-text cosine evidence in a common semantic space,
+    normally Raw DinoTxt, with shape ``[B,K,T,N]``.  A Support video first
+    produces a robust absolute score by taking the Top-K patches per frame and
+    the Top-L frames per video.  Labeled positive and negative Support videos
+    then calibrate one threshold per episode class.  Query *frame* evidence is
+    compared with that threshold to obtain ``m[q,k,t]``.
+
+    Query labels are deliberately never indexed.  For a class whose Support
+    calibration is missing or inverted, the default reliability fallback sets
+    valid Query-frame patch mass to one, exactly disabling this branch.  Frames
+    with no valid trajectory have zero patch mass and unit unmatched mass.
+    """
+    if similarity.ndim != 4:
+        raise ValueError(
+            "similarity must have shape [B,K,T,N]; got "
+            f"{tuple(similarity.shape)}."
+        )
+    batch, num_classes, temporal_dim, num_points = similarity.shape
+    if tuple(point_mask.shape) != (batch, temporal_dim, num_points):
+        raise ValueError(
+            "point_mask must match similarity B,T,N; got "
+            f"{tuple(point_mask.shape)}."
+        )
+    support_mask = support_mask.to(device=similarity.device).bool().flatten()
+    if tuple(support_mask.shape) != (batch,):
+        raise ValueError(
+            "support_mask must have shape [B]; got "
+            f"{tuple(support_mask.shape)}."
+        )
+    labels = episode_positive_labels.to(device=similarity.device).bool()
+    if tuple(labels.shape) != (batch, num_classes):
+        raise ValueError(
+            "episode_positive_labels must have shape [B,K]; got "
+            f"{tuple(labels.shape)}, expected {(batch, num_classes)}."
+        )
+    if not support_mask.any():
+        raise ValueError("At least one labeled Support sample is required.")
+
+    patch_topk = int(_cfg_value(cfg, "ABSOLUTE_MASS_PATCH_TOPK", 8))
+    frame_topk = int(
+        _cfg_value(cfg, "ABSOLUTE_MASS_SUPPORT_TOPK_FRAMES", 3)
+    )
+    beta = float(_cfg_value(cfg, "ABSOLUTE_MASS_CALIBRATION_BETA", 0.25))
+    temperature = float(_cfg_value(cfg, "ABSOLUTE_MASS_TEMPERATURE", 0.05))
+    min_gap = float(_cfg_value(cfg, "ABSOLUTE_MASS_MIN_SUPPORT_GAP", 0.0))
+    finite = bool(
+        torch.isfinite(torch.tensor([beta, temperature, min_gap])).all()
+    )
+    if patch_topk <= 0 or frame_topk <= 0:
+        raise ValueError(
+            "ABSOLUTE_MASS_PATCH_TOPK and "
+            "ABSOLUTE_MASS_SUPPORT_TOPK_FRAMES must be positive."
+        )
+    if not finite or temperature <= 0.0 or min_gap < 0.0:
+        raise ValueError(
+            "Absolute-mass temperature must be positive and min gap finite/non-negative."
+        )
+    if not 0.0 <= beta <= 1.0:
+        raise ValueError("ABSOLUTE_MASS_CALIBRATION_BETA must be in [0, 1].")
+
+    similarity = torch.nan_to_num(
+        similarity.float(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=-1.0,
+    ).clamp(-1.0, 1.0)
+    point_mask = point_mask.to(device=similarity.device).bool()
+    patch_valid = point_mask.unsqueeze(1).expand_as(similarity)
+    frame_evidence = masked_topk_mean(
+        similarity,
+        patch_valid,
+        patch_topk,
+        dim=-1,
+    )
+    frame_valid = point_mask.any(dim=-1)
+    class_frame_valid = frame_valid.unsqueeze(1).expand(
+        batch,
+        num_classes,
+        temporal_dim,
+    )
+    video_evidence = masked_topk_mean(
+        frame_evidence,
+        class_frame_valid,
+        frame_topk,
+        dim=-1,
+    )
+
+    support_evidence = video_evidence[support_mask]
+    support_targets = labels[support_mask]
+    positive_mean, positive_count = _classwise_masked_mean(
+        support_evidence,
+        support_targets,
+    )
+    negative_targets = ~support_targets
+    negative_mean, negative_count = _classwise_masked_mean(
+        support_evidence,
+        negative_targets,
+    )
+    all_negative = support_evidence[negative_targets]
+    global_negative = (
+        all_negative.mean()
+        if all_negative.numel() > 0
+        else support_evidence.mean()
+    )
+    negative_mean = torch.where(
+        negative_count > 0,
+        negative_mean,
+        global_negative.expand_as(negative_mean),
+    )
+    positive_mean = torch.where(
+        positive_count > 0,
+        positive_mean,
+        negative_mean,
+    )
+    support_gap = positive_mean - negative_mean
+    support_reliable = (
+        (positive_count > 0)
+        & (negative_count > 0)
+        & (support_gap > min_gap)
+    )
+    threshold = negative_mean + beta * support_gap.clamp_min(0.0)
+    if bool(_cfg_value(cfg, "ABSOLUTE_MASS_DETACH_SUPPORT_STATS", True)):
+        positive_mean = positive_mean.detach()
+        negative_mean = negative_mean.detach()
+        support_gap = support_gap.detach()
+        threshold = threshold.detach()
+
+    query_frame_evidence = frame_evidence[~support_mask]
+    query_frame_valid = frame_valid[~support_mask]
+    raw_patch_mass = torch.sigmoid(
+        (query_frame_evidence - threshold.view(1, num_classes, 1))
+        / temperature
+    )
+    raw_patch_mass = torch.nan_to_num(
+        raw_patch_mass,
+        nan=0.5,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
+    valid = query_frame_valid.unsqueeze(1).expand_as(raw_patch_mass)
+    if bool(_cfg_value(cfg, "ABSOLUTE_MASS_RELIABILITY_FALLBACK", True)):
+        reliable = support_reliable.view(1, num_classes, 1)
+        patch_mass = torch.where(reliable, raw_patch_mass, torch.ones_like(raw_patch_mass))
+    else:
+        patch_mass = raw_patch_mass
+    patch_mass = torch.where(valid, patch_mass, torch.zeros_like(patch_mass))
+    unmatched_mass = 1.0 - patch_mass
+
+    valid_float = valid.float()
+    valid_count = valid_float.sum(dim=-1)
+    mean_patch_mass = (patch_mass * valid_float).sum(dim=-1) / valid_count.clamp_min(1.0)
+    mean_patch_mass = torch.where(
+        valid_count > 0,
+        mean_patch_mass,
+        torch.zeros_like(mean_patch_mass),
+    )
+    top_patch_mass = masked_topk_mean(
+        patch_mass,
+        valid,
+        frame_topk,
+        dim=-1,
+    )
+    mean_frame_evidence = (
+        query_frame_evidence * valid_float
+    ).sum(dim=-1) / valid_count.clamp_min(1.0)
+    mean_frame_evidence = torch.where(
+        valid_count > 0,
+        mean_frame_evidence,
+        torch.zeros_like(mean_frame_evidence),
+    )
+    return {
+        "frame_evidence": frame_evidence,
+        "video_evidence": video_evidence,
+        "query_frame_evidence": query_frame_evidence,
+        "query_frame_valid": query_frame_valid,
+        "raw_patch_mass": raw_patch_mass,
+        "patch_mass": patch_mass,
+        "unmatched_mass": unmatched_mass,
+        "mean_patch_mass": mean_patch_mass,
+        "top_patch_mass": top_patch_mass,
+        "mean_frame_evidence": mean_frame_evidence,
+        "support_positive_evidence_mean": positive_mean,
+        "support_negative_evidence_mean": negative_mean,
+        "support_positive_count": positive_count,
+        "support_negative_count": negative_count,
+        "support_gap": support_gap,
+        "support_reliable": support_reliable,
+        "threshold": threshold,
+    }
+
+
 def classwise_frame_similarity(
     query_prototypes: torch.Tensor,
     support_prototypes: torch.Tensor,
@@ -988,8 +1192,12 @@ def confidence_aware_bimhm_logits(
     penalty_weight: float = 0.05,
     eps: float = 0.05,
     direction: str = "support_to_query",
+    frame_transport_mass: Optional[torch.Tensor] = None,
+    transport_strength: float = 1.0,
+    unmatched_cost: float = 0.0,
+    one_sided_transport: bool = True,
 ) -> Dict[str, torch.Tensor]:
-    """Apply Query-frame confidence inside BiMHM without rebuilding Q.
+    """Apply relative confidence and explicit unmatched mass inside BiMHM.
 
     ``support_to_query`` preserves the controlled first ablation and modifies
     only the Support-to-Query ``max_t``.  ``both`` implements the complete
@@ -997,6 +1205,13 @@ def confidence_aware_bimhm_logits(
     reductions.  Expressing either result as a delta from ``base_logits``
     guarantees a bitwise no-op when ``penalty_weight`` is zero and preserves
     the existing matcher bias exactly.
+
+    When ``frame_transport_mass`` is supplied, each Query-frame/class pair has
+    matched patch mass ``m`` and unmatched mass ``1-m``.  In cosine units its
+    pair score is ``m*C - unmatched_cost*(1-m)``.  This is evaluated before
+    both BiMHM maxima, so normalizing the visual prototype cannot cancel the
+    mass.  ``one_sided_transport`` prevents abstention from increasing an
+    already-low visual score.
     """
     if frame_similarity.ndim != 4:
         raise ValueError(
@@ -1017,23 +1232,36 @@ def confidence_aware_bimhm_logits(
     alpha = float(alpha)
     penalty_weight = float(penalty_weight)
     eps = float(eps)
-    finite = bool(torch.isfinite(torch.tensor([alpha, penalty_weight, eps])).all())
+    transport_strength = float(transport_strength)
+    unmatched_cost = float(unmatched_cost)
+    finite = bool(torch.isfinite(torch.tensor([
+        alpha,
+        penalty_weight,
+        eps,
+        transport_strength,
+        unmatched_cost,
+    ])).all())
     if not finite or alpha <= 0.0 or penalty_weight < 0.0:
         raise ValueError("alpha must be positive and penalty_weight non-negative.")
     if not 0.0 < eps <= 1.0:
         raise ValueError("Frame log eps must be in (0, 1].")
+    if not 0.0 <= transport_strength <= 1.0:
+        raise ValueError("transport_strength must be in [0, 1].")
+    if unmatched_cost < 0.0:
+        raise ValueError("unmatched_cost must be non-negative.")
     direction = str(direction).lower()
     if direction not in {"support_to_query", "both"}:
         raise ValueError(
             "FRAME_PENALTY_DIRECTION must be 'support_to_query' or 'both'."
         )
 
-    similarity_logits = alpha * torch.nan_to_num(
+    frame_similarity_fp32 = torch.nan_to_num(
         frame_similarity.float(),
         nan=0.0,
         posinf=1.0,
         neginf=-1.0,
-    )
+    ).clamp(-1.0, 1.0)
+    similarity_logits = alpha * frame_similarity_fp32
     frame_penalty = penalty_weight * torch.log(
         torch.nan_to_num(
             frame_matchability.float(),
@@ -1042,9 +1270,48 @@ def confidence_aware_bimhm_logits(
             neginf=0.0,
         ).clamp_min(eps)
     )
+    if frame_transport_mass is None or transport_strength == 0.0:
+        effective_patch_mass = torch.ones_like(frame_matchability.float())
+        unmatched_mass = torch.zeros_like(effective_patch_mass)
+        transported_similarity = frame_similarity_fp32
+        transport_enabled = False
+    else:
+        if tuple(frame_transport_mass.shape) != tuple(expected_rho):
+            raise ValueError(
+                "frame_transport_mass must have shape [Q,K,Tq]; got "
+                f"{tuple(frame_transport_mass.shape)}, expected {tuple(expected_rho)}."
+            )
+        raw_mass = torch.nan_to_num(
+            frame_transport_mass.float(),
+            nan=1.0,
+            posinf=1.0,
+            neginf=0.0,
+        ).clamp(0.0, 1.0)
+        effective_patch_mass = 1.0 - transport_strength * (1.0 - raw_mass)
+        unmatched_mass = 1.0 - effective_patch_mass
+        transported_similarity = (
+            effective_patch_mass.unsqueeze(-1) * frame_similarity_fp32
+            - unmatched_cost * unmatched_mass.unsqueeze(-1)
+        )
+        if one_sided_transport:
+            transported_similarity = torch.minimum(
+                transported_similarity,
+                frame_similarity_fp32,
+            )
+        transport_enabled = True
+
     base_q_to_s = similarity_logits.max(dim=-1).values.mean(dim=-1)
     base_s_to_q, base_winner = similarity_logits.max(dim=-2)
-    verified_pair_logits = similarity_logits + frame_penalty.unsqueeze(-1)
+    transported_pair_logits = alpha * transported_similarity
+    transport_only_q_to_s = transported_pair_logits.max(dim=-1).values.mean(dim=-1)
+    transport_only_s_to_q = transported_pair_logits.max(dim=-2).values.mean(dim=-1)
+    transport_delta = 0.5 * (
+        transport_only_q_to_s
+        + transport_only_s_to_q
+        - base_q_to_s
+        - base_s_to_q.mean(dim=-1)
+    )
+    verified_pair_logits = transported_pair_logits + frame_penalty.unsqueeze(-1)
     verified_q_to_s = verified_pair_logits.max(dim=-1).values.mean(dim=-1)
     verified_s_to_q, verified_winner = verified_pair_logits.max(dim=-2)
     q_to_s_delta = verified_q_to_s - base_q_to_s
@@ -1054,7 +1321,7 @@ def confidence_aware_bimhm_logits(
     else:
         temporal_delta = 0.5 * s_to_q_delta
     temporal_logits = base_logits.float() + temporal_delta
-    if penalty_weight == 0.0:
+    if penalty_weight == 0.0 and not transport_enabled:
         # Besides making the mathematical no-op explicit, this avoids tiny
         # recomputation drift in strict paired regression tests.
         temporal_logits = base_logits.float()
@@ -1075,6 +1342,10 @@ def confidence_aware_bimhm_logits(
             neginf=-1e4,
         ),
         "pair_logits": verified_pair_logits,
+        "transported_similarity": transported_similarity,
+        "effective_patch_mass": effective_patch_mass,
+        "unmatched_mass": unmatched_mass,
+        "transport_delta": transport_delta,
         "q_to_s_delta": q_to_s_delta,
         "s_to_q_delta": s_to_q_delta,
         "base_winner": base_winner,
@@ -1587,6 +1858,8 @@ def _build_frame_softmax_q2s_with_matchability(
         )
 
     query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
+    query_tokens = value_tokens.index_select(0, query_indices)
+    query_point_mask = point_mask.index_select(0, query_indices)
     local_refinement = None
     local_margin = None
     local_positive_similarity = None
@@ -1604,6 +1877,9 @@ def _build_frame_softmax_q2s_with_matchability(
     )
     evidence_verification_enable = bool(
         _cfg_value(cfg, "EVIDENCE_VERIFICATION_ENABLE", False)
+    )
+    absolute_mass_enable = bool(
+        _cfg_value(cfg, "ABSOLUTE_MASS_ENABLE", False)
     )
     evidence_map_source = str(
         _cfg_value(cfg, "EVIDENCE_MAP_SOURCE", "raw")
@@ -1623,6 +1899,23 @@ def _build_frame_softmax_q2s_with_matchability(
     ):
         raise ValueError(
             "Raw Evidence verification was enabled, but pre-Pointformer "
+            "DinoTxt tokens were not provided."
+        )
+    absolute_mass_source = str(
+        _cfg_value(cfg, "ABSOLUTE_MASS_SOURCE", "raw")
+    ).lower()
+    if absolute_mass_enable and absolute_mass_source not in {"raw", "post"}:
+        raise ValueError(
+            "ABSOLUTE_MASS_SOURCE must be 'raw' or 'post'; got "
+            f"{absolute_mass_source!r}."
+        )
+    if (
+        absolute_mass_enable
+        and absolute_mass_source == "raw"
+        and matchability_evidence_tokens is None
+    ):
+        raise ValueError(
+            "Raw absolute-mass evidence was enabled, but pre-Pointformer "
             "DinoTxt tokens were not provided."
         )
     if local_refinement_enable and evidence_verification_enable:
@@ -1663,8 +1956,6 @@ def _build_frame_softmax_q2s_with_matchability(
             episode_positive_labels,
             query_label_features,
         )
-        query_tokens = value_tokens.index_select(0, query_indices)
-        query_point_mask = point_mask.index_select(0, query_indices)
         (
             local_margin,
             local_positive_similarity,
@@ -1761,17 +2052,21 @@ def _build_frame_softmax_q2s_with_matchability(
         # q2s score and the optional global matchability penalty.
         query_prototypes = local_refinement["refined_prototypes"]
         base_query_prototypes = local_refinement["base_prototypes"]
+        query_patch_weights = local_refinement["refined_weights"]
     else:
         query_prototypes = []
+        query_patch_weights = []
         for sample_idx in query_indices.tolist():
             if refined_similarity is None:
-                sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
-                    value_tokens[sample_idx],
-                    point_mask[sample_idx],
-                    query_label_features,
+                sample_prototypes, sample_patch_weights = (
+                    self._compute_frame_softmax_text_prototypes(
+                        value_tokens[sample_idx],
+                        point_mask[sample_idx],
+                        query_label_features,
+                    )
                 )
             else:
-                sample_prototypes, _ = (
+                sample_prototypes, sample_patch_weights = (
                     self._compute_frame_softmax_prototypes_from_similarity(
                         value_tokens[sample_idx],
                         point_mask[sample_idx],
@@ -1779,9 +2074,11 @@ def _build_frame_softmax_q2s_with_matchability(
                     )
                 )
             query_prototypes.append(sample_prototypes.unsqueeze(0))
+            query_patch_weights.append(sample_patch_weights.unsqueeze(0))
         if not query_prototypes:
             return None
         query_prototypes = torch.cat(query_prototypes, dim=0)
+        query_patch_weights = torch.cat(query_patch_weights, dim=0)
         base_query_prototypes = query_prototypes
 
     diag_similarity = self._compute_bidirectional_frame_similarity(
@@ -1815,6 +2112,38 @@ def _build_frame_softmax_q2s_with_matchability(
     evidence_map_aux = None
     frame_matchability_aux = None
     temporal_match_aux = None
+    absolute_mass_aux = None
+    if absolute_mass_enable:
+        absolute_tokens_all = (
+            matchability_evidence_tokens
+            if absolute_mass_source == "raw"
+            else value_tokens
+        )
+        if tuple(absolute_tokens_all.shape[:3]) != tuple(value_tokens.shape[:3]):
+            raise ValueError(
+                "Absolute-mass tokens must align with post values in B/T/N; got "
+                f"{tuple(absolute_tokens_all.shape)} and "
+                f"{tuple(value_tokens.shape)}."
+            )
+        absolute_point_mask = point_mask
+        if bool(_cfg_value(cfg, "ABSOLUTE_MASS_USE_VISIBILITY", True)):
+            absolute_visibility = metadata.get(
+                "pred_visibility",
+                point_mask,
+            ).to(device=value_tokens.device).bool()
+            absolute_point_mask = absolute_point_mask & absolute_visibility
+        absolute_similarity = self._compute_batched_point_text_similarity(
+            absolute_tokens_all,
+            episode_label_text,
+        )
+        absolute_mass_aux = compute_support_calibrated_frame_transport_mass(
+            absolute_similarity,
+            absolute_point_mask,
+            support_mask,
+            episode_positive_labels,
+            cfg,
+        )
+
     if evidence_verification_enable:
         evidence_tokens_all = (
             matchability_evidence_tokens
@@ -1864,18 +2193,29 @@ def _build_frame_softmax_q2s_with_matchability(
                 bias=float(_cfg_value(cfg, "FRAME_MARGIN_BIAS", 0.0)),
             )
         )
+    if evidence_verification_enable or absolute_mass_enable:
         positive_frame_similarity = classwise_frame_similarity(
             query_prototypes,
             support_prototypes,
         )
+        if frame_matchability_aux is None:
+            frame_matchability = torch.ones(
+                positive_frame_similarity.shape[:3],
+                device=value_tokens.device,
+                dtype=torch.float32,
+            )
+            frame_penalty_weight = 0.0
+        else:
+            frame_matchability = frame_matchability_aux["matchability"]
+            frame_penalty_weight = float(
+                _cfg_value(cfg, "FRAME_LOG_PENALTY_WEIGHT", 0.05)
+            )
         temporal_match_aux = confidence_aware_bimhm_logits(
             positive_frame_similarity,
-            frame_matchability_aux["matchability"],
+            frame_matchability,
             base_logits,
             alpha=alpha,
-            penalty_weight=float(
-                _cfg_value(cfg, "FRAME_LOG_PENALTY_WEIGHT", 0.05)
-            ),
+            penalty_weight=frame_penalty_weight,
             eps=float(_cfg_value(cfg, "FRAME_LOG_EPS", 0.05)),
             direction=str(
                 _cfg_value(
@@ -1883,6 +2223,20 @@ def _build_frame_softmax_q2s_with_matchability(
                     "FRAME_PENALTY_DIRECTION",
                     "support_to_query",
                 )
+            ),
+            frame_transport_mass=(
+                absolute_mass_aux["patch_mass"]
+                if absolute_mass_aux is not None
+                else None
+            ),
+            transport_strength=float(
+                _cfg_value(cfg, "ABSOLUTE_MASS_TRANSPORT_STRENGTH", 1.0)
+            ),
+            unmatched_cost=float(
+                _cfg_value(cfg, "ABSOLUTE_MASS_UNMATCHED_COST", 0.0)
+            ),
+            one_sided_transport=bool(
+                _cfg_value(cfg, "ABSOLUTE_MASS_ONE_SIDED", True)
             ),
         )
         temporal_logits = temporal_match_aux["logits"]
@@ -2033,6 +2387,24 @@ def _build_frame_softmax_q2s_with_matchability(
             support_reliable=matchability_aux["support_reliable"],
         )
 
+    if absolute_mass_aux is None:
+        query_transport_mass_summary = matchability_aux["matchability"]
+    else:
+        transport_frame_valid = absolute_mass_aux["query_frame_valid"].bool()
+        transport_valid = transport_frame_valid.unsqueeze(1).expand_as(
+            temporal_match_aux["effective_patch_mass"]
+        )
+        transport_valid_float = transport_valid.float()
+        transport_valid_count = transport_valid_float.sum(dim=-1)
+        query_transport_mass_summary = (
+            temporal_match_aux["effective_patch_mass"] * transport_valid_float
+        ).sum(dim=-1) / transport_valid_count.clamp_min(1.0)
+        query_transport_mass_summary = torch.where(
+            transport_valid_count > 0,
+            query_transport_mass_summary,
+            torch.zeros_like(query_transport_mass_summary),
+        )
+
     target_label_indices = torch.arange(
         episode_class_ids.numel(),
         device=value_tokens.device,
@@ -2099,7 +2471,7 @@ def _build_frame_softmax_q2s_with_matchability(
         ),
         "query_partial_target_label_indices": target_label_indices,
         "query_class_matchability": matchability_aux["matchability"],
-        "query_class_transport_mass": matchability_aux["matchability"],
+        "query_class_transport_mass": query_transport_mass_summary,
         "query_class_evidence": matchability_aux["query_evidence"],
         "query_class_threshold": matchability_aux["threshold"],
         "query_class_log_penalty": log_penalty,
@@ -2117,6 +2489,93 @@ def _build_frame_softmax_q2s_with_matchability(
             "confuser_valid_count"
         ],
     }
+    if absolute_mass_aux is not None:
+        effective_patch_mass = temporal_match_aux["effective_patch_mass"]
+        unmatched_mass = temporal_match_aux["unmatched_mass"]
+        transported_patch_weights = (
+            query_patch_weights.float() * effective_patch_mass.unsqueeze(-1)
+        )
+        transported_query_prototypes = (
+            query_prototypes.float() * effective_patch_mass.unsqueeze(-1)
+        )
+        transport_valid = absolute_mass_aux["query_frame_valid"].bool().unsqueeze(1)
+        transport_valid = transport_valid.expand_as(effective_patch_mass)
+        transport_valid_float = transport_valid.float()
+        transport_valid_count = transport_valid_float.sum(dim=-1)
+
+        def _transport_frame_mean(value):
+            mean = (value.float() * transport_valid_float).sum(
+                dim=-1
+            ) / transport_valid_count.clamp_min(1.0)
+            return torch.where(
+                transport_valid_count > 0,
+                mean,
+                torch.zeros_like(mean),
+            )
+
+        result.update({
+            "query_patch_conditional_weights": query_patch_weights.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_patch_transport_weights": transported_patch_weights.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_partial_query_transported_prototypes": (
+                transported_query_prototypes.to(
+                    device=value_tokens.device,
+                    dtype=value_tokens.dtype,
+                )
+            ),
+            "query_frame_absolute_evidence": absolute_mass_aux[
+                "query_frame_evidence"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_absolute_mass_raw": absolute_mass_aux[
+                "raw_patch_mass"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_frame_patch_mass": effective_patch_mass.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_frame_unmatched_mass": unmatched_mass.to(
+                device=value_tokens.device,
+                dtype=value_tokens.dtype,
+            ),
+            "query_frame_transport_valid": transport_valid,
+            "query_frame_absolute_evidence_mean": _transport_frame_mean(
+                absolute_mass_aux["query_frame_evidence"]
+            ),
+            "query_frame_patch_mass_mean": _transport_frame_mean(
+                effective_patch_mass
+            ),
+            "query_frame_unmatched_mass_mean": _transport_frame_mean(
+                unmatched_mass
+            ),
+            "query_frame_transport_logit_delta": temporal_match_aux[
+                "transport_delta"
+            ].to(device=value_tokens.device, dtype=torch.float32),
+            "query_frame_transported_similarity": temporal_match_aux[
+                "transported_similarity"
+            ].to(device=value_tokens.device, dtype=value_tokens.dtype),
+            "query_absolute_mass_threshold": absolute_mass_aux["threshold"],
+            "support_absolute_positive_evidence_mean": absolute_mass_aux[
+                "support_positive_evidence_mean"
+            ],
+            "support_absolute_negative_evidence_mean": absolute_mass_aux[
+                "support_negative_evidence_mean"
+            ],
+            "support_absolute_evidence_gap": absolute_mass_aux["support_gap"],
+            "support_absolute_calibration_reliable": absolute_mass_aux[
+                "support_reliable"
+            ],
+            "support_absolute_positive_count": absolute_mass_aux[
+                "support_positive_count"
+            ],
+            "support_absolute_negative_count": absolute_mass_aux[
+                "support_negative_count"
+            ],
+        })
     if evidence_map_aux is not None:
         frame_valid = frame_matchability_aux["valid"].to(
             device=value_tokens.device,

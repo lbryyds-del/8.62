@@ -110,6 +110,24 @@ FEW_SHOT:
     EVIDENCE_VIDEO_TOPK_FRAMES: 3
     EVIDENCE_MIL_TEMPERATURE: 0.10
     EVIDENCE_MIL_LOSS_WEIGHT: 0.10
+    # Full absolute-mass route: pure-text Raw evidence is calibrated by the
+    # labeled Support set.  Patch weights sum to m (not one), while 1-m is
+    # retained as unmatched mass inside both BiMHM directions.
+    ABSOLUTE_MASS_ENABLE: True
+    ABSOLUTE_MASS_SOURCE: "raw"
+    ABSOLUTE_MASS_USE_VISIBILITY: True
+    ABSOLUTE_MASS_PATCH_TOPK: 8
+    ABSOLUTE_MASS_SUPPORT_TOPK_FRAMES: 3
+    ABSOLUTE_MASS_CALIBRATION_BETA: 0.25
+    ABSOLUTE_MASS_TEMPERATURE: 0.05
+    ABSOLUTE_MASS_MIN_SUPPORT_GAP: 0.0
+    ABSOLUTE_MASS_DETACH_SUPPORT_STATS: True
+    ABSOLUTE_MASS_RELIABILITY_FALLBACK: True
+    ABSOLUTE_MASS_TRANSPORT_STRENGTH: 1.0
+    # At m=0 the visual match is neutral (cosine 0), then the existing -2
+    # q2s bias and global relative penalty still apply.
+    ABSOLUTE_MASS_UNMATCHED_COST: 0.0
+    ABSOLUTE_MASS_ONE_SIDED: True
     # Train both the untouched base matcher and the verified matcher.
     DUAL_LOGIT_LOSS_ENABLE: True
     BASE_LOGIT_LOSS_WEIGHT: 0.60

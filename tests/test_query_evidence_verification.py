@@ -10,6 +10,7 @@ from trokens.models.query_class_matchability import (
     build_query_evidence_map,
     classwise_frame_similarity,
     compute_evidence_conditioned_frame_matchability,
+    compute_support_calibrated_frame_transport_mass,
     confidence_aware_bimhm_logits,
 )
 
@@ -55,6 +56,19 @@ def _evidence_cfg(**overrides):
         "EVIDENCE_VIDEO_TOPK_FRAMES": 3,
         "EVIDENCE_MIL_TEMPERATURE": 0.10,
         "EVIDENCE_MIL_LOSS_WEIGHT": 0.10,
+        "ABSOLUTE_MASS_ENABLE": False,
+        "ABSOLUTE_MASS_SOURCE": "raw",
+        "ABSOLUTE_MASS_USE_VISIBILITY": True,
+        "ABSOLUTE_MASS_PATCH_TOPK": 1,
+        "ABSOLUTE_MASS_SUPPORT_TOPK_FRAMES": 1,
+        "ABSOLUTE_MASS_CALIBRATION_BETA": 0.50,
+        "ABSOLUTE_MASS_TEMPERATURE": 0.05,
+        "ABSOLUTE_MASS_MIN_SUPPORT_GAP": 0.0,
+        "ABSOLUTE_MASS_DETACH_SUPPORT_STATS": True,
+        "ABSOLUTE_MASS_RELIABILITY_FALLBACK": True,
+        "ABSOLUTE_MASS_TRANSPORT_STRENGTH": 1.0,
+        "ABSOLUTE_MASS_UNMATCHED_COST": 0.0,
+        "ABSOLUTE_MASS_ONE_SIDED": True,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -103,6 +117,70 @@ def test_frame_matchability_compares_identical_evidence_regions():
     assert result["confuser_evidence"].item() == pytest.approx(0.2)
     assert result["margin"].item() == pytest.approx(0.4)
     assert result["matchability"].item() > 0.98
+
+
+def test_support_calibrated_absolute_mass_can_abstain_per_frame():
+    # Support row 0 is positive for class 0 and row 1 for class 1.  Query
+    # evidence alternates between the two classes across its two frames.
+    similarity = torch.tensor(
+        [
+            [[[0.90], [0.80]], [[0.10], [0.20]]],
+            [[[0.10], [0.20]], [[0.90], [0.80]]],
+            [[[0.75], [0.10]], [[0.15], [0.70]]],
+        ]
+    )
+    point_mask = torch.ones(3, 2, 1, dtype=torch.bool)
+    support_mask = torch.tensor([True, True, False])
+    labels = torch.tensor(
+        [[1, 0], [0, 1], [0, 1]],
+        dtype=torch.bool,
+    )
+    result = compute_support_calibrated_frame_transport_mass(
+        similarity,
+        point_mask,
+        support_mask,
+        labels,
+        _evidence_cfg(),
+    )
+
+    assert result["threshold"].tolist() == pytest.approx([0.55, 0.55])
+    assert result["support_reliable"].tolist() == [True, True]
+    assert result["patch_mass"][0, 0, 0] > 0.98
+    assert result["patch_mass"][0, 0, 1] < 0.001
+    assert result["patch_mass"][0, 1, 0] < 0.001
+    assert result["patch_mass"][0, 1, 1] > 0.95
+    assert torch.allclose(
+        result["patch_mass"] + result["unmatched_mass"],
+        torch.ones_like(result["patch_mass"]),
+    )
+
+    changed = labels.clone()
+    changed[-1] = torch.tensor([1, 0])
+    changed_result = compute_support_calibrated_frame_transport_mass(
+        similarity,
+        point_mask,
+        support_mask,
+        changed,
+        _evidence_cfg(),
+    )
+    assert torch.equal(result["patch_mass"], changed_result["patch_mass"])
+
+
+def test_unreliable_absolute_mass_calibration_is_a_strict_fallback():
+    similarity = torch.tensor([[[[0.8]]], [[[0.1]]]])
+    point_mask = torch.ones(2, 1, 1, dtype=torch.bool)
+    support_mask = torch.tensor([True, False])
+    labels = torch.ones(2, 1, dtype=torch.bool)
+    result = compute_support_calibrated_frame_transport_mass(
+        similarity,
+        point_mask,
+        support_mask,
+        labels,
+        _evidence_cfg(),
+    )
+    assert not result["support_reliable"].item()
+    assert result["patch_mass"].item() == 1.0
+    assert result["unmatched_mass"].item() == 0.0
 
 
 def test_missing_confuser_or_frame_is_a_strict_noop():
@@ -193,6 +271,49 @@ def test_bidirectional_frame_penalty_updates_both_bimhm_reductions():
     assert both["logits"].item() < support_only["logits"].item()
 
 
+def test_patch_and_unmatched_mass_change_bimhm_before_frame_max():
+    similarity = torch.tensor([[[[0.90], [0.80]]]])
+    rho = torch.ones(1, 1, 2)
+    base = torch.tensor([[8.75]])
+    result = confidence_aware_bimhm_logits(
+        similarity,
+        rho,
+        base,
+        alpha=10.0,
+        penalty_weight=0.0,
+        direction="both",
+        frame_transport_mass=torch.tensor([[[0.0, 1.0]]]),
+        transport_strength=1.0,
+        unmatched_cost=0.0,
+    )
+
+    assert result["effective_patch_mass"].tolist() == [[[0.0, 1.0]]]
+    assert result["unmatched_mass"].tolist() == [[[1.0, 0.0]]]
+    assert result["transported_similarity"].flatten().tolist() == pytest.approx(
+        [0.0, 0.8]
+    )
+    # Base BiMHM similarity is .875; transported BiMHM is .60.
+    assert result["logits"].item() == pytest.approx(6.0, abs=1e-6)
+    assert result["verified_winner"].item() == 1
+
+
+def test_one_sided_unmatched_mass_never_rewards_negative_similarity():
+    similarity = torch.tensor([[[[-0.5]]]])
+    result = confidence_aware_bimhm_logits(
+        similarity,
+        torch.ones(1, 1, 1),
+        torch.tensor([[-5.0]]),
+        alpha=10.0,
+        penalty_weight=0.0,
+        direction="both",
+        frame_transport_mass=torch.zeros(1, 1, 1),
+        unmatched_cost=0.0,
+        one_sided_transport=True,
+    )
+    assert result["transported_similarity"].item() == pytest.approx(-0.5)
+    assert result["logits"].item() == pytest.approx(-5.0)
+
+
 def test_frame_similarity_matches_manual_cosine_matrix():
     query = torch.tensor([[[[1.0, 0.0], [0.0, 1.0]]]])
     support = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
@@ -281,6 +402,86 @@ def test_wrapper_keeps_construction_route_and_ignores_query_targets():
         "query_partial_q2s_logits",
     ):
         assert torch.equal(first[key], second[key])
+
+
+def test_wrapper_preserves_explicit_patch_plus_unmatched_mass():
+    model = _pointformer(tau=1.0)
+    cfg = _evidence_cfg(
+        EVIDENCE_VERIFICATION_ENABLE=False,
+        ABSOLUTE_MASS_ENABLE=True,
+        LOG_PENALTY_WEIGHT=0.0,
+        FRAME_LOG_PENALTY_WEIGHT=0.0,
+    )
+    model.cfg = SimpleNamespace(
+        FEW_SHOT=SimpleNamespace(QUERY_CLASS_MATCHABILITY=cfg),
+        POINT_INFO=SimpleNamespace(USE_PT_QUERY_MASK=True),
+    )
+    model.pot_route_cfg = SimpleNamespace(
+        FRAME_SOFTMAX_TAU=1.0,
+        QUERY_PARTIAL_LOGIT_ALPHA=10.0,
+        QUERY_PARTIAL_LOGIT_BIAS=-2.0,
+    )
+    model.use_query_null_route = False
+    model.use_cat_cost_aggregation = False
+    model.use_support_text_fusion = False
+    model._get_pot_label_text_features = (
+        lambda class_ids, dtype: torch.eye(2, dtype=dtype)
+    )
+    post = torch.tensor(
+        [
+            [[[1.0, 0.0]]],
+            [[[0.0, 1.0]]],
+            [[[1.0, 1.0]]],
+        ],
+        requires_grad=True,
+    )
+    raw = torch.tensor(
+        [
+            [[[1.0, 0.0]]],
+            [[[0.0, 1.0]]],
+            [[[1.0, 0.0]]],
+        ]
+    )
+    mask = torch.ones(3, 1, 1, dtype=torch.bool)
+    metadata = {
+        "support_mask": torch.tensor([True, True, False]),
+        "pred_query_mask": mask,
+        "pred_visibility": mask,
+        "episode_class_ids": torch.tensor([0, 1]),
+        "episode_positive_labels": torch.tensor(
+            [[1, 0], [0, 1], [0, 1]],
+            dtype=torch.bool,
+        ),
+    }
+    model.train()
+    result = model._build_frame_softmax_q2s_aux(
+        post,
+        metadata,
+        matchability_evidence_tokens=raw,
+    )
+
+    conditional_sum = result["query_patch_conditional_weights"].sum(dim=-1)
+    transported_sum = result["query_patch_transport_weights"].sum(dim=-1)
+    patch_mass = result["query_frame_patch_mass"]
+    unmatched_mass = result["query_frame_unmatched_mass"]
+    assert torch.allclose(conditional_sum, torch.ones_like(conditional_sum))
+    assert torch.allclose(transported_sum, patch_mass, atol=1e-6)
+    assert torch.allclose(
+        transported_sum + unmatched_mass,
+        torch.ones_like(transported_sum),
+        atol=1e-6,
+    )
+    assert patch_mass[0, 0, 0] > 0.99
+    assert patch_mass[0, 1, 0] < 0.001
+    assert result["query_frame_transport_logit_delta"][0, 1] < 0.0
+    assert torch.allclose(
+        result["query_partial_query_transported_prototypes"],
+        result["query_partial_query_prototypes"] * patch_mass.unsqueeze(-1),
+        atol=1e-6,
+    )
+    result["query_partial_q2s_logits"].sum().backward()
+    assert post.grad is not None
+    assert torch.isfinite(post.grad).all()
 
 
 def test_evidence_and_local_refinement_are_mutually_exclusive():

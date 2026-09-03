@@ -712,6 +712,18 @@ def get_query_matchability_metrics(few_shot_aux, q2s_labels):
         "evidence_top1_mass": _pair_tensor(
             "query_evidence_top1_mass_mean"
         ),
+        "absolute_evidence": _pair_tensor(
+            "query_frame_absolute_evidence_mean"
+        ),
+        "transport_patch_mass": _pair_tensor(
+            "query_frame_patch_mass_mean"
+        ),
+        "transport_unmatched_mass": _pair_tensor(
+            "query_frame_unmatched_mass_mean"
+        ),
+        "transport_logit_delta": _pair_tensor(
+            "query_frame_transport_logit_delta"
+        ),
     }
     for name, value in frame_pairs.items():
         if value is None:
@@ -722,6 +734,13 @@ def get_query_matchability_metrics(few_shot_aux, q2s_labels):
     if isinstance(valid_count, torch.Tensor):
         metrics["matchability_confuser_valid_count"] = (
             torch.nan_to_num(valid_count.float(), nan=0.0).mean()
+        )
+    absolute_reliable = few_shot_aux.get(
+        "support_absolute_calibration_reliable"
+    )
+    if isinstance(absolute_reliable, torch.Tensor):
+        metrics["transport_support_reliable_fraction"] = (
+            absolute_reliable.float().mean()
         )
     return {key: value.detach() for key, value in metrics.items()}
 

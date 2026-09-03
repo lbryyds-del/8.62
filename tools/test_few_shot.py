@@ -493,6 +493,34 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     "frame_max_t_switch": _aux_numpy(
                         "query_frame_max_t_switch_fraction"
                     ),
+                    "absolute_evidence": _aux_numpy(
+                        "query_frame_absolute_evidence_mean"
+                    ),
+                    "transport_patch_mass": _aux_numpy(
+                        "query_frame_patch_mass_mean"
+                    ),
+                    "transport_unmatched_mass": _aux_numpy(
+                        "query_frame_unmatched_mass_mean"
+                    ),
+                    "transport_logit_delta": _aux_numpy(
+                        "query_frame_transport_logit_delta"
+                    ),
+                    "absolute_threshold": _aux_numpy(
+                        "query_absolute_mass_threshold"
+                    ),
+                    "support_absolute_positive": _aux_numpy(
+                        "support_absolute_positive_evidence_mean"
+                    ),
+                    "support_absolute_negative": _aux_numpy(
+                        "support_absolute_negative_evidence_mean"
+                    ),
+                    "support_absolute_gap": _aux_numpy(
+                        "support_absolute_evidence_gap"
+                    ),
+                    "support_absolute_reliable": _aux_numpy(
+                        "support_absolute_calibration_reliable",
+                        dtype=torch.bool,
+                    ),
                 }
                 for name in (
                     "base_score",
@@ -513,6 +541,10 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     "frame_top1_mass",
                     "frame_temporal_delta",
                     "frame_max_t_switch",
+                    "absolute_evidence",
+                    "transport_patch_mass",
+                    "transport_unmatched_mass",
+                    "transport_logit_delta",
                 ):
                     if query_matchability_rows[name] is None:
                         continue
@@ -530,6 +562,11 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                     "support_reliable",
                     "confuser_available",
                     "confuser_valid_count",
+                    "absolute_threshold",
+                    "support_absolute_positive",
+                    "support_absolute_negative",
+                    "support_absolute_gap",
+                    "support_absolute_reliable",
                 ):
                     if query_matchability_rows[name] is not None and (
                         query_matchability_rows[name].shape[-1:]
@@ -653,6 +690,16 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                             "query_frame_max_t_switch_fraction": (
                                 "frame_max_t_switch"
                             ),
+                            "query_frame_absolute_evidence": (
+                                "absolute_evidence"
+                            ),
+                            "query_frame_patch_mass": "transport_patch_mass",
+                            "query_frame_unmatched_mass": (
+                                "transport_unmatched_mass"
+                            ),
+                            "query_frame_transport_logit_delta": (
+                                "transport_logit_delta"
+                            ),
                         }
                         for output_name, source_name in optional_pair_fields.items():
                             values = query_matchability_rows[source_name]
@@ -668,6 +715,19 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                             "support_calibration_reliable": "support_reliable",
                             "query_class_confuser_available": "confuser_available",
                             "query_class_confuser_valid_count": "confuser_valid_count",
+                            "query_absolute_mass_threshold": "absolute_threshold",
+                            "support_absolute_positive_evidence_mean": (
+                                "support_absolute_positive"
+                            ),
+                            "support_absolute_negative_evidence_mean": (
+                                "support_absolute_negative"
+                            ),
+                            "support_absolute_evidence_gap": (
+                                "support_absolute_gap"
+                            ),
+                            "support_absolute_calibration_reliable": (
+                                "support_absolute_reliable"
+                            ),
                         }
                         for output_name, source_name in optional_class_fields.items():
                             values = query_matchability_rows[source_name]
@@ -676,7 +736,10 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                             value = values[episode_idx]
                             row[output_name] = (
                                 bool(value)
-                                if source_name == "support_reliable"
+                                if source_name in {
+                                    "support_reliable",
+                                    "support_absolute_reliable",
+                                }
                                 else float(value)
                             )
                     all_df.append(row)
