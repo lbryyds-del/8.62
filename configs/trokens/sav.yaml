@@ -4,7 +4,7 @@ OUTPUT_DIR: output/sav
 
 FEW_SHOT:
   N_WAY: 5
-  K_SHOT: 1
+  K_SHOT: 5
   TRAIN_QUERY_PER_CLASS: 6
   TEST_QUERY_PER_CLASS: 1
   TRAIN_EPISODES: 2000
@@ -42,51 +42,17 @@ FEW_SHOT:
     QUERY_PARTIAL_ENABLE: True
     QUERY_PARTIAL_LOGIT_ALPHA: 10.0
     QUERY_PARTIAL_LOGIT_BIAS: -2.0
-  # Retain 8.63 for ablation, but do not couple patch routing to a learned Null.
-  QUERY_NULL_ROUTE:
-    ENABLE: False
-    SCORE_INIT: 0.07
-    SCORE_MIN: -0.20
-    SCORE_MAX: 0.80
-    CARDINALITY_CORRECTION: True
-    TOKEN_INIT_STD: 0.02
-    VALUE_SCALE: 1.0
-    DETACH_FRAME_SCALE: True
-    ORTHO_WEIGHT: 0.01
-    ORTHO_DETACH_SUPPORT: True
   QUERY_CLASS_MATCHABILITY:
     ENABLE: True
-    MODE: "positive_confuser_margin"
-    # Legacy threshold-mode evidence (kept for R1 rollback/comparison).
-    TOPK_PATCHES: 8
-    TOPK_FRAMES: 3
-    # "post": post-Pointformer tokens; "raw": pre-Pointformer DinoTxt tokens.
-    EVIDENCE_SOURCE: "post"
-    # Legacy threshold = negative Support evidence + beta * positive/negative gap.
-    CALIBRATION_BETA: 0.25
-    TEMPERATURE: 0.10
-    # Final q2s = original q2s + weight * log(matchability).
+    # Global positive-vs-confuser confidence penalty.
     LOG_PENALTY_WEIGHT: 0.25
     LOG_EPS: 0.05
-    DETACH_SUPPORT_STATS: True
-    RELIABILITY_FALLBACK: False
     MARGIN_TEMPERATURE: 0.10
     MARGIN_BIAS: 0.0
     NEGATIVE_AGGREGATION: "max"
     NEGATIVE_TOPK: 2
     NEGATIVE_TEMPERATURE: 0.10
     DETACH_CONFUSER_SUPPORT: True
-    # Keep the 8.66 implementation for rollback, but do not let its local
-    # Support margin rewrite the main Query construction weights.
-    LOCAL_REFINEMENT_ENABLE: False
-    LOCAL_MARGIN_TEMPERATURE: 0.10
-    LOCAL_LOGIT_STRENGTH: 0.50
-    LOCAL_POSITIVE_AGGREGATION: "topk_mean"
-    LOCAL_POSITIVE_TOPK: 2
-    LOCAL_NEGATIVE_AGGREGATION: "topk_mean"
-    LOCAL_NEGATIVE_TOPK: 2
-    LOCAL_NEGATIVE_TEMPERATURE: 0.10
-    LOCAL_DETACH_REFERENCES: True
     # Raw text selects semantic trajectory slots only for evidence verification;
     # the existing post-Pointformer Text+Support route still constructs Q.
     EVIDENCE_VERIFICATION_ENABLE: True

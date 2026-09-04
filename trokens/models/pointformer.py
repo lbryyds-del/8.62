@@ -23,6 +23,24 @@ from .build import MODEL_REGISTRY
 
 # pylint: disable=unused-argument,redefined-builtin
 
+
+def _query_class_requires_raw_tokens(match_cfg):
+    """Return whether any enabled confidence branch consumes Raw DinoTxt."""
+    if not bool(getattr(match_cfg, "ENABLE", False)):
+        return False
+    evidence_raw = (
+        bool(getattr(match_cfg, "EVIDENCE_VERIFICATION_ENABLE", False))
+        and str(getattr(match_cfg, "EVIDENCE_MAP_SOURCE", "raw")).lower()
+        == "raw"
+    )
+    absolute_raw = (
+        bool(getattr(match_cfg, "ABSOLUTE_MASS_ENABLE", False))
+        and str(getattr(match_cfg, "ABSOLUTE_MASS_SOURCE", "raw")).lower()
+        == "raw"
+    )
+    return evidence_raw or absolute_raw
+
+
 @MODEL_REGISTRY.register()
 class Pointformer(nn.Module):
     """ Main model for point tracking based transformer model.
@@ -88,11 +106,6 @@ class Pointformer(nn.Module):
             "SUPPORT_TEXT_FUSION",
             None,
         )
-        self.query_null_cfg = getattr(
-            cfg.FEW_SHOT,
-            "QUERY_NULL_ROUTE",
-            None,
-        )
         self.is_multilabel_few_shot = (
             cfg.TASK == 'few_shot'
             and cfg.DATA.MULTI_LABEL
@@ -119,12 +132,6 @@ class Pointformer(nn.Module):
             self.use_frame_softmax_route
             and bool(getattr(self.pot_route_cfg, "QUERY_PARTIAL_ENABLE", False))
         )
-        query_null_requested = bool(
-            getattr(self.query_null_cfg, "ENABLE", False)
-        )
-        self.use_query_null_route = (
-            query_null_requested and self.use_query_partial_q2s
-        )
         self.use_text_alignment = (
             self.is_multilabel_few_shot
             and self.feat_extractor_type == "dinotxt_vitl14_reg4"
@@ -145,11 +152,6 @@ class Pointformer(nn.Module):
         ):
             raise NotImplementedError(
                 "QUERY_PARTIAL_ENABLE currently requires POT_ROUTE.ENABLE."
-            )
-        if query_null_requested and not self.use_query_partial_q2s:
-            raise NotImplementedError(
-                "QUERY_NULL_ROUTE requires POT_ROUTE.ENABLE and "
-                "POT_ROUTE.QUERY_PARTIAL_ENABLE."
             )
         if (
             self.is_multilabel_few_shot
@@ -183,42 +185,6 @@ class Pointformer(nn.Module):
             self.use_frame_softmax_route
             or self.use_text_alignment
         )
-        if self.use_query_null_route:
-            score_min = float(self.query_null_cfg.SCORE_MIN)
-            score_max = float(self.query_null_cfg.SCORE_MAX)
-            score_init = float(self.query_null_cfg.SCORE_INIT)
-            token_init_std = float(self.query_null_cfg.TOKEN_INIT_STD)
-            value_scale = float(self.query_null_cfg.VALUE_SCALE)
-            ortho_weight = float(self.query_null_cfg.ORTHO_WEIGHT)
-            if not all(
-                np.isfinite(value)
-                for value in (score_min, score_max, score_init)
-            ) or not score_min < score_init < score_max:
-                raise ValueError(
-                    "QUERY_NULL_ROUTE requires finite SCORE_MIN < SCORE_INIT "
-                    "< SCORE_MAX."
-                )
-            if not np.isfinite(token_init_std) or token_init_std <= 0.0:
-                raise ValueError(
-                    "QUERY_NULL_ROUTE.TOKEN_INIT_STD must be finite and positive."
-                )
-            if not np.isfinite(value_scale) or value_scale <= 0.0:
-                raise ValueError(
-                    "QUERY_NULL_ROUTE.VALUE_SCALE must be finite and positive."
-                )
-            if not np.isfinite(ortho_weight) or ortho_weight < 0.0:
-                raise ValueError(
-                    "QUERY_NULL_ROUTE.ORTHO_WEIGHT must be finite and non-negative."
-                )
-
-            score_ratio = (score_init - score_min) / (score_max - score_min)
-            raw_score = np.log(score_ratio / (1.0 - score_ratio))
-            self.query_null_token = nn.Parameter(
-                torch.empty(1, self.embed_dim)
-            )
-            self.query_null_score_raw = nn.Parameter(
-                torch.tensor(raw_score, dtype=torch.float32)
-            )
         self.num_patches = (224 // self.patch_size) ** 2
         if cfg.POINT_INFO.ENABLE:
             self.point_grid_size = self.get_point_grid_size()
@@ -391,11 +357,6 @@ class Pointformer(nn.Module):
         # Initialize weights
         self.init_weights()
         self.apply(self._init_weights)
-        if self.use_query_null_route:
-            trunc_normal_(
-                self.query_null_token,
-                std=float(self.query_null_cfg.TOKEN_INIT_STD),
-            )
         if self.feat_extractor_type == "dino":
             dino_config  = cfg.MODEL.DINO_CONFIG
             torch_home = os.environ.get("TORCH_HOME", os.path.join(os.getcwd(), ".torch-cache"))
@@ -500,8 +461,6 @@ class Pointformer(nn.Module):
             skip = {'pos_embed', 'cls_token', 'st_embed'}
         else:
             skip = {'pos_embed', 'cls_token', 'temp_embed'}
-        if getattr(self, "use_query_null_route", False):
-            skip.update({"query_null_token", "query_null_score_raw"})
         return skip
 
     def get_classifier(self):
@@ -1211,237 +1170,6 @@ class Pointformer(nn.Module):
         )
         return prototypes, patch_weights
 
-    def _get_query_null_score(self):
-        """Map the Query Null score parameter into its configured cosine range."""
-        score_min = float(self.query_null_cfg.SCORE_MIN)
-        score_max = float(self.query_null_cfg.SCORE_MAX)
-        return score_min + (score_max - score_min) * torch.sigmoid(
-            self.query_null_score_raw.float()
-        )
-
-    def _compute_frame_softmax_query_prototypes_with_null(
-        self,
-        patch_tokens,
-        point_mask,
-        label_text_features,
-    ):
-        """Build Query frame prototypes with one shared Null alternative."""
-        label_text_features = torch.nan_to_num(
-            label_text_features.to(device=patch_tokens.device),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        token_norm = self._safe_l2_normalize(patch_tokens, dim=-1)
-        text_norm = self._safe_l2_normalize(label_text_features, dim=-1)
-        similarity = torch.einsum("kc,tnc->ktn", text_norm, token_norm)
-        similarity = torch.nan_to_num(
-            similarity,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-        return (
-            self
-            ._compute_frame_softmax_query_prototypes_with_null_from_similarity(
-                patch_tokens,
-                point_mask,
-                similarity,
-            )
-        )
-
-    def _compute_frame_softmax_query_prototypes_with_null_from_similarity(
-        self,
-        patch_tokens,
-        point_mask,
-        similarity,
-    ):
-        """Route Query patch and Null mass from a precomputed ``[K,T,N]`` score."""
-        output_dtype = patch_tokens.dtype
-        patch_tokens_fp32 = torch.nan_to_num(
-            patch_tokens.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        point_mask = point_mask.to(device=patch_tokens.device).bool()
-        similarity = similarity.to(device=patch_tokens.device).float()
-
-        temporal_dim, num_points, feat_dim = patch_tokens.shape
-        if tuple(point_mask.shape) != (temporal_dim, num_points):
-            raise ValueError(
-                "Query point_mask must have shape [T,N] matching patch tokens; "
-                f"got {tuple(point_mask.shape)}, expected "
-                f"{(temporal_dim, num_points)}."
-            )
-        if similarity.ndim != 3:
-            raise ValueError(
-                "Query Null similarity must have shape [K,T,N]; got "
-                f"{tuple(similarity.shape)}."
-            )
-        num_labels = similarity.shape[0]
-        expected_shape = (num_labels, temporal_dim, num_points)
-        if tuple(similarity.shape) != expected_shape:
-            raise ValueError(
-                "Query Null similarity must have shape [K,T,N] matching the "
-                f"patch tokens; got {tuple(similarity.shape)}, expected "
-                f"{expected_shape}."
-            )
-        if num_labels == 0:
-            return (
-                patch_tokens.new_zeros(0, temporal_dim, feat_dim),
-                patch_tokens.new_zeros(0, temporal_dim, num_points),
-                patch_tokens.new_zeros(0, temporal_dim),
-            )
-
-        similarity = torch.nan_to_num(
-            similarity,
-            nan=0.0,
-            posinf=1e4,
-            neginf=-1e4,
-        )
-        tau = max(
-            float(getattr(self.pot_route_cfg, "FRAME_SOFTMAX_TAU", 0.07)),
-            1e-6,
-        )
-        expanded_mask = point_mask.unsqueeze(0).expand_as(similarity)
-        patch_logits = (similarity / tau).masked_fill(~expanded_mask, -1e4)
-
-        null_score = self._get_query_null_score().to(device=patch_tokens.device)
-        null_logits = (null_score / tau).view(1, 1, 1).expand(
-            num_labels,
-            temporal_dim,
-            1,
-        )
-        if bool(getattr(
-            self.query_null_cfg,
-            "CARDINALITY_CORRECTION",
-            True,
-        )):
-            valid_count = point_mask.sum(dim=-1).clamp_min(1).float()
-            null_logits = (
-                null_logits
-                + valid_count.log().view(1, temporal_dim, 1)
-            )
-
-        joint_weights = torch.softmax(
-            torch.cat((patch_logits, null_logits), dim=-1),
-            dim=-1,
-        )
-        patch_weights = (
-            joint_weights[..., :-1]
-            * expanded_mask.to(dtype=joint_weights.dtype)
-        )
-        null_weights = joint_weights[..., -1]
-
-        mask_fp32 = point_mask.float()
-        token_norms = patch_tokens_fp32.norm(dim=-1)
-        valid_count_fp32 = mask_fp32.sum(dim=-1)
-        frame_scale = (
-            token_norms * mask_fp32
-        ).sum(dim=-1) / valid_count_fp32.clamp_min(1.0)
-        frame_scale = torch.where(
-            valid_count_fp32 > 0.0,
-            frame_scale,
-            torch.ones_like(frame_scale),
-        )
-        if bool(getattr(
-            self.query_null_cfg,
-            "DETACH_FRAME_SCALE",
-            True,
-        )):
-            frame_scale = frame_scale.detach()
-
-        null_unit = self._safe_l2_normalize(
-            self.query_null_token.to(device=patch_tokens.device),
-            dim=-1,
-        ).squeeze(0)
-        null_values = (
-            float(getattr(self.query_null_cfg, "VALUE_SCALE", 1.0))
-            * frame_scale.unsqueeze(-1)
-            * null_unit.unsqueeze(0)
-        )
-        patch_component = torch.einsum(
-            "ktn,tnd->ktd",
-            patch_weights.float(),
-            patch_tokens_fp32,
-        )
-        null_component = (
-            null_weights.unsqueeze(-1)
-            * null_values.unsqueeze(0)
-        )
-        query_prototypes = torch.nan_to_num(
-            patch_component + null_component,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        return (
-            query_prototypes.to(dtype=output_dtype),
-            patch_weights.to(dtype=output_dtype),
-            null_weights,
-        )
-
-    def _compute_query_null_support_cosines(
-        self,
-        support_prototypes,
-        detach_support,
-    ):
-        """Return Null-to-Support frame cosines and their validity mask."""
-        if support_prototypes.ndim != 3:
-            raise ValueError(
-                "support_prototypes must have shape [K,T,D]; got "
-                f"{tuple(support_prototypes.shape)}."
-            )
-        support = torch.nan_to_num(
-            support_prototypes.float(),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-        if detach_support:
-            support = support.detach()
-        valid = support.norm(dim=-1) > 1e-12
-        support_unit = self._safe_l2_normalize(support, dim=-1)
-        null_unit = self._safe_l2_normalize(
-            self.query_null_token.to(device=support.device),
-            dim=-1,
-        ).squeeze(0)
-        cosine = torch.einsum("d,ktd->kt", null_unit, support_unit)
-        cosine = torch.nan_to_num(
-            cosine,
-            nan=0.0,
-            posinf=1.0,
-            neginf=-1.0,
-        ).clamp(-1.0, 1.0)
-        return cosine, valid
-
-    def _compute_query_null_orthogonal_loss(self, support_prototypes):
-        """Penalize squared cosine between the Null token and valid Support frames."""
-        cosine, valid = self._compute_query_null_support_cosines(
-            support_prototypes,
-            detach_support=bool(getattr(
-                self.query_null_cfg,
-                "ORTHO_DETACH_SUPPORT",
-                True,
-            )),
-        )
-        if not valid.any():
-            return cosine.new_zeros(())
-        return cosine[valid].square().mean()
-
-    def _compute_query_null_support_cosine_stats(self, support_prototypes):
-        """Return detached mean/max absolute Null-to-Support cosine diagnostics."""
-        cosine, valid = self._compute_query_null_support_cosines(
-            support_prototypes,
-            detach_support=True,
-        )
-        if not valid.any():
-            zero = cosine.new_zeros(())
-            return zero, zero
-        absolute = cosine[valid].abs()
-        return absolute.mean().detach(), absolute.max().detach()
-
     def _build_frame_softmax_support_prototypes(
         self,
         value_tokens,
@@ -2119,34 +1847,8 @@ class Pointformer(nn.Module):
 
         query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
         query_prototypes = []
-        query_null_weights = []
         for sample_idx in query_indices.tolist():
-            if bool(getattr(self, "use_query_null_route", False)):
-                if refined_similarity is None:
-                    (
-                        sample_prototypes,
-                        _,
-                        sample_null_weights,
-                    ) = self._compute_frame_softmax_query_prototypes_with_null(
-                        value_tokens[sample_idx],
-                        point_mask[sample_idx],
-                        query_label_features,
-                    )
-                else:
-                    (
-                        sample_prototypes,
-                        _,
-                        sample_null_weights,
-                    ) = (
-                        self
-                        ._compute_frame_softmax_query_prototypes_with_null_from_similarity(
-                            value_tokens[sample_idx],
-                            point_mask[sample_idx],
-                            refined_similarity[sample_idx],
-                        )
-                    )
-                query_null_weights.append(sample_null_weights.unsqueeze(0))
-            elif refined_similarity is None:
+            if refined_similarity is None:
                 sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
                     value_tokens[sample_idx],
                     point_mask[sample_idx],
@@ -2220,33 +1922,6 @@ class Pointformer(nn.Module):
             ),
             "query_partial_target_label_indices": target_label_indices,
         }
-        if bool(getattr(self, "use_query_null_route", False)):
-            query_null_weights = torch.cat(query_null_weights, dim=0)
-            null_ortho_loss = self._compute_query_null_orthogonal_loss(
-                support_prototypes,
-            )
-            (
-                support_mean_abs_cosine,
-                support_max_abs_cosine,
-            ) = self._compute_query_null_support_cosine_stats(
-                support_prototypes,
-            )
-            result.update({
-                "query_null_weights": query_null_weights.to(
-                    device=value_tokens.device,
-                    dtype=torch.float32,
-                ),
-                "query_null_score": self._get_query_null_score().to(
-                    device=value_tokens.device,
-                ),
-                "query_null_orthogonal_loss": null_ortho_loss,
-                "query_null_support_mean_abs_cosine": (
-                    support_mean_abs_cosine
-                ),
-                "query_null_support_max_abs_cosine": (
-                    support_max_abs_cosine
-                ),
-            })
         if support_visual is not None:
             result.update({
                 "support_text_fusion_query_features": query_label_features.to(
@@ -2504,26 +2179,7 @@ class Pointformer(nn.Module):
                 "QUERY_CLASS_MATCHABILITY",
                 None,
             )
-            matchability_source = str(
-                getattr(match_cfg, "EVIDENCE_SOURCE", "post")
-            ).lower()
-            evidence_verification_enabled = bool(
-                getattr(match_cfg, "EVIDENCE_VERIFICATION_ENABLE", False)
-            )
-            evidence_map_source = str(
-                getattr(match_cfg, "EVIDENCE_MAP_SOURCE", "raw")
-            ).lower()
-            raw_evidence_requested = (
-                matchability_source == "raw"
-                or (
-                    evidence_verification_enabled
-                    and evidence_map_source == "raw"
-                )
-            )
-            if (
-                bool(getattr(match_cfg, "ENABLE", False))
-                and raw_evidence_requested
-            ):
+            if _query_class_requires_raw_tokens(match_cfg):
                 if self.feat_extractor_type != "dinotxt_vitl14_reg4":
                     raise ValueError(
                         "Raw matchability evidence requires dinotxt_vitl14_reg4."

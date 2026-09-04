@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from trokens.models.pointformer import Pointformer
+from trokens.models.pointformer import Pointformer, _query_class_requires_raw_tokens
 from trokens.models.query_class_matchability import (
     build_query_evidence_map,
     classwise_frame_similarity,
@@ -25,11 +25,8 @@ def _pointformer(tau=1.0):
 def _evidence_cfg(**overrides):
     values = {
         "ENABLE": True,
-        "MODE": "positive_confuser_margin",
-        "EVIDENCE_SOURCE": "post",
         "LOG_PENALTY_WEIGHT": 0.0,
         "LOG_EPS": 0.05,
-        "RELIABILITY_FALLBACK": False,
         "MARGIN_TEMPERATURE": 0.10,
         "MARGIN_BIAS": 0.0,
         "NEGATIVE_AGGREGATION": "max",
@@ -37,7 +34,6 @@ def _evidence_cfg(**overrides):
         "NEGATIVE_TEMPERATURE": 0.10,
         "DETACH_CONFUSER_SUPPORT": True,
         "APPLY_DURING_TRAIN": True,
-        "LOCAL_REFINEMENT_ENABLE": False,
         "EVIDENCE_VERIFICATION_ENABLE": True,
         "EVIDENCE_MAP_SOURCE": "raw",
         "EVIDENCE_MAP_TEMPERATURE": 0.07,
@@ -72,6 +68,17 @@ def _evidence_cfg(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_absolute_mass_requests_raw_tokens_independently_of_frame_verification():
+    cfg = _evidence_cfg(
+        EVIDENCE_VERIFICATION_ENABLE=False,
+        ABSOLUTE_MASS_ENABLE=True,
+        ABSOLUTE_MASS_SOURCE="raw",
+    )
+    assert _query_class_requires_raw_tokens(cfg)
+    cfg.ABSOLUTE_MASS_SOURCE = "post"
+    assert not _query_class_requires_raw_tokens(cfg)
 
 
 def test_raw_evidence_map_uses_pure_text_and_respects_mask():
@@ -335,7 +342,6 @@ def test_wrapper_keeps_construction_route_and_ignores_query_targets():
         QUERY_PARTIAL_LOGIT_ALPHA=10.0,
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
     )
-    model.use_query_null_route = False
     model.use_cat_cost_aggregation = False
     model.use_support_text_fusion = False
     model._get_pot_label_text_features = (
@@ -392,10 +398,6 @@ def test_wrapper_keeps_construction_route_and_ignores_query_targets():
     assert first["query_evidence_patch_weights"].shape == (1, 2, 1, 2)
     assert first["query_frame_matchability"].shape == (1, 2, 1)
     assert first["query_partial_q2s_temporal_logits"].shape == (1, 2)
-    assert torch.equal(
-        first["query_partial_query_prototypes"],
-        first["query_partial_query_prototypes_before_refinement"],
-    )
     for key in (
         "query_evidence_patch_weights",
         "query_frame_relative_margin",
@@ -421,7 +423,6 @@ def test_wrapper_preserves_explicit_patch_plus_unmatched_mass():
         QUERY_PARTIAL_LOGIT_ALPHA=10.0,
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
     )
-    model.use_query_null_route = False
     model.use_cat_cost_aggregation = False
     model.use_support_text_fusion = False
     model._get_pot_label_text_features = (
@@ -482,44 +483,3 @@ def test_wrapper_preserves_explicit_patch_plus_unmatched_mass():
     result["query_partial_q2s_logits"].sum().backward()
     assert post.grad is not None
     assert torch.isfinite(post.grad).all()
-
-
-def test_evidence_and_local_refinement_are_mutually_exclusive():
-    model = _pointformer(tau=1.0)
-    model.cfg = SimpleNamespace(
-        FEW_SHOT=SimpleNamespace(
-            QUERY_CLASS_MATCHABILITY=_evidence_cfg(
-                LOCAL_REFINEMENT_ENABLE=True,
-            ),
-        ),
-        POINT_INFO=SimpleNamespace(USE_PT_QUERY_MASK=True),
-    )
-    model.pot_route_cfg = SimpleNamespace(
-        FRAME_SOFTMAX_TAU=1.0,
-        QUERY_PARTIAL_LOGIT_ALPHA=10.0,
-        QUERY_PARTIAL_LOGIT_BIAS=-2.0,
-    )
-    model.use_query_null_route = False
-    model.use_cat_cost_aggregation = False
-    model.use_support_text_fusion = False
-    model._get_pot_label_text_features = (
-        lambda class_ids, dtype: torch.eye(2, dtype=dtype)
-    )
-    values = torch.randn(3, 1, 2, 2)
-    mask = torch.ones(3, 1, 2, dtype=torch.bool)
-    metadata = {
-        "support_mask": torch.tensor([True, True, False]),
-        "pred_query_mask": mask,
-        "pred_visibility": mask,
-        "episode_class_ids": torch.tensor([0, 1]),
-        "episode_positive_labels": torch.tensor(
-            [[1, 0], [0, 1], [1, 0]],
-            dtype=torch.bool,
-        ),
-    }
-    with pytest.raises(ValueError, match="controlled alternatives"):
-        model._build_frame_softmax_q2s_aux(
-            values,
-            metadata,
-            matchability_evidence_tokens=values,
-        )
