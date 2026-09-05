@@ -18,8 +18,6 @@ from few_shot_multilabel import (
     empty_ap_storage,
     episode_labels_from_global,
     few_shot_aux_has_query_partial_logits,
-    few_shot_aux_has_support_tokens,
-    get_text_align_loss,
     get_episode_class_ids,
     is_multilabel_episode,
     mean_or_nan,
@@ -27,7 +25,6 @@ from few_shot_multilabel import (
     multilabel_top1_accuracy,
     q2s_cos_sim_fp32,
     support_query_split_multilabel,
-    support_query_split_multilabel_conditioned,
     update_ap_storage,
 )
 import trokens.utils.checkpoint as cu
@@ -239,7 +236,6 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
     val_meter.iter_tic()
     epoch_top_1_acc_few_shot = []
     epoch_q2s_loss = []
-    epoch_align_loss = []
     multi_label = cfg.DATA.MULTI_LABEL
     if multi_label:
         ap_storage = empty_ap_storage(cfg.MODEL.NUM_CLASSES)
@@ -287,19 +283,10 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                 few_shot_aux = None
             if isinstance(preds, tuple):
                 preds, _ = preds
-            align_loss = get_text_align_loss(few_shot_aux, patch_tokens)
-
             multilabel_episode = is_multilabel_episode(cfg, labels, meta)
             if multilabel_episode:
-                base_support_query_dict = support_query_split_multilabel(
+                patch_support_query_dict = support_query_split_multilabel(
                     patch_tokens, labels, meta)
-                if few_shot_aux_has_support_tokens(few_shot_aux):
-                    patch_support_query_dict = support_query_split_multilabel_conditioned(
-                        base_support_query_dict,
-                        few_shot_aux,
-                    )
-                else:
-                    patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
             q2s_labels = patch_support_query_dict['query_batch_labels']
@@ -614,16 +601,14 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
             })
 
         if cfg.NUM_GPUS > 1:
-            few_shot_top1_acc, q2s_loss, align_loss = du.all_reduce(
-                [few_shot_top1_acc, q2s_loss, align_loss]
+            few_shot_top1_acc, q2s_loss = du.all_reduce(
+                [few_shot_top1_acc, q2s_loss]
             )
 
         # Copy the errors from GPU to CPU (sync point).
         few_shot_top1_acc = few_shot_top1_acc.item()
         q2s_loss = q2s_loss.item()
-        align_loss = align_loss.item()
         epoch_q2s_loss.append(q2s_loss)
-        epoch_align_loss.append(align_loss)
         epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
 
         if not multilabel_episode:
@@ -652,7 +637,6 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
             * max(
                 cfg.NUM_GPUS, 1
             ),  # If running  on CPU (cfg.NUM_GPUS == 1), use 1 to represent 1 CPU.
-            extra_metrices={"align_loss": align_loss},
         )
 
 
@@ -665,7 +649,6 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
                 {
                     shot_acc_name: f"{few_shot_top1_acc:.2f}",
                     "q2s_loss": f"{q2s_loss:.3f}",
-                    "align_loss": f"{align_loss:.3f}",
                 },
                 refresh=False,
             )
@@ -677,7 +660,6 @@ def test_epoch(val_loader, model, val_meter, cur_epoch, cfg):
     val_meter.log_epoch_stats(cur_epoch)
     log_dict = {
         'test_q2s_loss': mean_or_nan(epoch_q2s_loss),
-        'test_align_loss': mean_or_nan(epoch_align_loss),
         'test_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch}
     if multi_label:

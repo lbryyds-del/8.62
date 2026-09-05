@@ -1437,26 +1437,13 @@ def _build_frame_softmax_q2s_with_matchability(
         episode_class_ids,
         value_tokens.dtype,
     )
-    refined_similarity = None
-    if bool(getattr(self, "use_cat_cost_aggregation", False)):
-        refined_similarity = self._compute_split_cat_refined_point_similarity(
-            value_tokens,
-            point_mask,
-            pred_tracks,
-            support_mask,
-            episode_positive_labels,
-            episode_class_ids,
-            episode_label_text,
-            raw_positive_labels=metadata.get("raw_positive_labels"),
-        )
-
     support_prototypes = self._build_frame_softmax_support_prototypes(
         value_tokens,
         point_mask,
         support_mask,
         episode_positive_labels,
         episode_label_text,
-        precomputed_similarity=refined_similarity,
+        precomputed_similarity=None,
     )
 
     # The existing text+Support feature remains responsible for ``where``.
@@ -1464,10 +1451,6 @@ def _build_frame_softmax_q2s_with_matchability(
     support_visual = None
     support_visual_valid = None
     if bool(getattr(self, "use_support_text_fusion", False)):
-        if refined_similarity is not None:
-            raise RuntimeError(
-                "SUPPORT_TEXT_FUSION cannot consume CAT precomputed query costs."
-            )
         (
             query_label_features,
             support_visual,
@@ -1528,11 +1511,6 @@ def _build_frame_softmax_q2s_with_matchability(
     local_positive_counts = None
     local_confuser_counts = None
     if evidence_verification_enable:
-        if refined_similarity is not None:
-            raise RuntimeError(
-                "Frame evidence verification currently requires "
-                "COST_AGG.ENABLE=False."
-            )
         support_frame_mask = metadata.get("pred_visibility", point_mask).to(
             device=value_tokens.device,
         ).bool()
@@ -1604,22 +1582,13 @@ def _build_frame_softmax_q2s_with_matchability(
     query_prototypes = []
     query_patch_weights = []
     for sample_idx in query_indices.tolist():
-        if refined_similarity is None:
-            sample_prototypes, sample_patch_weights = (
-                self._compute_frame_softmax_text_prototypes(
-                    value_tokens[sample_idx],
-                    point_mask[sample_idx],
-                    query_label_features,
-                )
+        sample_prototypes, sample_patch_weights = (
+            self._compute_frame_softmax_text_prototypes(
+                value_tokens[sample_idx],
+                point_mask[sample_idx],
+                query_label_features,
             )
-        else:
-            sample_prototypes, sample_patch_weights = (
-                self._compute_frame_softmax_prototypes_from_similarity(
-                    value_tokens[sample_idx],
-                    point_mask[sample_idx],
-                    refined_similarity[sample_idx],
-                )
-            )
+        )
         query_prototypes.append(sample_prototypes.unsqueeze(0))
         query_patch_weights.append(sample_patch_weights.unsqueeze(0))
     if not query_prototypes:
@@ -1776,12 +1745,6 @@ def _build_frame_softmax_q2s_with_matchability(
         )
         temporal_logits = temporal_match_aux["logits"]
 
-    # The CAT path only has positive Support costs, so it cannot provide
-    # comparable negative Support hypotheses for this confidence branch.
-    if refined_similarity is not None:
-        raise RuntimeError(
-            "Query-class confidence currently requires COST_AGG.ENABLE=False."
-        )
     confuser_prototypes, confuser_valid, confuser_support_indices = (
         build_class_confuser_prototypes(
             self,

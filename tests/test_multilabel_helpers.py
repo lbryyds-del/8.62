@@ -7,10 +7,13 @@ import torch
 import torch.nn.functional as F
 
 from tools.few_shot_multilabel import (
+    compute_base_novel_hm,
     compute_evidence_mil_loss,
+    compute_episode_ap,
     compute_query_partial_q2s_loss,
+    empty_ap_storage,
     q2s_cos_sim_fp32,
-    support_query_split_multilabel_conditioned,
+    update_ap_storage,
 )
 
 
@@ -40,24 +43,73 @@ def test_q2s_cosine_forces_fp32_for_large_tokens_and_keeps_gradients_finite():
     assert torch.isfinite(y.grad).all()
 
 
-def test_conditioned_split_replaces_support_and_query():
-    base = {
-        "support_preds": torch.randn(3, 2, 4, 8),
-        "query_preds": torch.randn(1, 2, 4, 8),
-        "query_condition": torch.tensor([False, False, True]),
-    }
-    query = torch.randn(1, 2, 1, 8)
-    aux = {
-        "support_conditioned_patch_tokens": torch.randn(2, 2, 1, 8),
-        "support_branch_class_indices": torch.tensor([0, 1]),
-        "query_conditioned_patch_tokens": query,
-        "query_conditioned_sample_indices": torch.tensor([2]),
-    }
+def test_episode_ap_can_drop_query_rows_empty_in_target_subset():
+    labels = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    ).numpy()
+    scores = torch.tensor(
+        [
+            [0.9, 0.1, 0.9],
+            [0.1, 0.9, 0.8],
+            [0.1, 0.1, 0.7],
+        ]
+    ).numpy()
 
-    result = support_query_split_multilabel_conditioned(base, aux)
+    keep_all = compute_episode_ap(labels, scores, [0, 1, 2], [2])
+    drop_empty = compute_episode_ap(
+        labels,
+        scores,
+        [0, 1, 2],
+        [2],
+        drop_empty_query_rows=True,
+    )
 
-    assert result["support_preds"].shape == (3, 2, 1, 8)
-    assert torch.equal(result["query_preds"], query)
+    assert keep_all == pytest.approx(1.0 / 3.0)
+    assert drop_empty == pytest.approx(1.0)
+
+
+def test_base_novel_metric_uses_configured_query_row_filter():
+    labels = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    scores = torch.tensor(
+        [
+            [0.9, 0.1, 0.9],
+            [0.1, 0.9, 0.8],
+            [0.1, 0.1, 0.7],
+        ]
+    )
+    storage = empty_ap_storage(num_classes=3)
+    update_ap_storage(storage, scores, labels, torch.tensor([0, 1, 2]))
+
+    keep_cfg = SimpleNamespace(
+        TEST=SimpleNamespace(
+            SEEN_LABELS=[0, 1],
+            NOVEL_LABELS=[2],
+            DROP_EMPTY_QUERY_ROWS=False,
+        )
+    )
+    drop_cfg = SimpleNamespace(
+        TEST=SimpleNamespace(
+            SEEN_LABELS=[0, 1],
+            NOVEL_LABELS=[2],
+            DROP_EMPTY_QUERY_ROWS=True,
+        )
+    )
+
+    keep_novel = compute_base_novel_hm(storage, keep_cfg)[1]
+    drop_novel = compute_base_novel_hm(storage, drop_cfg)[1]
+
+    assert keep_novel == pytest.approx(100.0 / 3.0)
+    assert drop_novel == pytest.approx(100.0)
 
 
 def _dual_loss_cfg(

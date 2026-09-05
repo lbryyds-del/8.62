@@ -13,7 +13,6 @@ import numpy as np
 from torch.nn.init import trunc_normal_
 
 from trokens.models.attention import TrajectoryAttentionBlock
-from trokens.models.cat_spatial_aggregation import CATSpatialCostAggregator
 from trokens.models.branches.motion_blocks import (
     CrossMotionModule,
     HODMotionModule
@@ -99,8 +98,6 @@ class Pointformer(nn.Module):
         self.head_act = cfg.MF.HEAD_ACT
         self.cfg = cfg
         self.pot_route_cfg = cfg.FEW_SHOT.POT_ROUTE
-        self.text_align_cfg = cfg.FEW_SHOT.TEXT_ALIGN
-        self.cost_agg_cfg = getattr(cfg.FEW_SHOT, "COST_AGG", None)
         self.support_text_fusion_cfg = getattr(
             cfg.FEW_SHOT,
             "SUPPORT_TEXT_FUSION",
@@ -122,20 +119,9 @@ class Pointformer(nn.Module):
         self.use_support_text_fusion = (
             support_text_fusion_requested and self.use_frame_softmax_route
         )
-        cost_agg_requested = bool(
-            getattr(self.cost_agg_cfg, "ENABLE", False)
-        )
-        self.use_cat_cost_aggregation = (
-            cost_agg_requested and self.use_frame_softmax_route
-        )
         self.use_query_partial_q2s = (
             self.use_frame_softmax_route
             and bool(getattr(self.pot_route_cfg, "QUERY_PARTIAL_ENABLE", False))
-        )
-        self.use_text_alignment = (
-            self.is_multilabel_few_shot
-            and self.feat_extractor_type == "dinotxt_vitl14_reg4"
-            and self.text_align_cfg.ENABLE
         )
         if (
             self.is_multilabel_few_shot
@@ -153,38 +139,12 @@ class Pointformer(nn.Module):
             raise NotImplementedError(
                 "QUERY_PARTIAL_ENABLE currently requires POT_ROUTE.ENABLE."
             )
-        if (
-            self.is_multilabel_few_shot
-            and self.text_align_cfg.ENABLE
-            and self.feat_extractor_type != "dinotxt_vitl14_reg4"
-        ):
-            raise NotImplementedError(
-                "TEXT_ALIGN currently requires the dinotxt_vitl14_reg4 backbone."
-            )
-        if cost_agg_requested and not self.use_frame_softmax_route:
-            raise NotImplementedError(
-                "COST_AGG currently requires the enabled frame_softmax text route."
-            )
         if support_text_fusion_requested and not self.use_frame_softmax_route:
             raise NotImplementedError(
                 "SUPPORT_TEXT_FUSION currently requires the enabled "
                 "frame_softmax text route."
             )
-        if self.use_support_text_fusion and self.use_cat_cost_aggregation:
-            raise NotImplementedError(
-                "SUPPORT_TEXT_FUSION and COST_AGG cannot be enabled together: "
-                "CAT supplies precomputed query costs and would bypass the fused "
-                "query features."
-            )
-        if self.use_cat_cost_aggregation and not cfg.POINT_INFO.ENABLE:
-            raise NotImplementedError(
-                "COST_AGG currently requires POINT_INFO.ENABLE so dense cost "
-                "corrections can be sampled at pred_tracks."
-            )
-        self.use_label_text_features = (
-            self.use_frame_softmax_route
-            or self.use_text_alignment
-        )
+        self.use_label_text_features = self.use_frame_softmax_route
         self.num_patches = (224 // self.patch_size) ** 2
         if cfg.POINT_INFO.ENABLE:
             self.point_grid_size = self.get_point_grid_size()
@@ -300,59 +260,8 @@ class Pointformer(nn.Module):
                 self.text_to_model_proj = nn.Identity()
             else:
                 self.text_to_model_proj = nn.Linear(self.text_feature_dim, self.embed_dim)
-            if self.use_frame_softmax_route or self.use_text_alignment:
-                self.atomic_label_names = self._load_atomic_label_names()
-
-        if self.use_cat_cost_aggregation:
-            cost_dim = int(getattr(self.cost_agg_cfg, "COST_DIM", 32))
-            guidance_dim = int(getattr(self.cost_agg_cfg, "GUIDANCE_DIM", 32))
-            num_heads = int(getattr(self.cost_agg_cfg, "NUM_HEADS", 4))
-            window_size = int(getattr(self.cost_agg_cfg, "WINDOW_SIZE", 4))
-            num_layers = int(getattr(self.cost_agg_cfg, "NUM_LAYERS", 1))
-            mlp_ratio = float(getattr(self.cost_agg_cfg, "MLP_RATIO", 4.0))
-            class_agg_cfg = getattr(self.cost_agg_cfg, "CLASS_AGG", None)
-            self.cat_spatial_cost_aggregator = CATSpatialCostAggregator(
-                appearance_dim=self.embed_dim,
-                cost_dim=cost_dim,
-                guidance_dim=guidance_dim,
-                num_heads=num_heads,
-                window_size=window_size,
-                num_layers=num_layers,
-                input_resolution=(self.patch_num_side, self.patch_num_side),
-                mlp_ratio=mlp_ratio,
-                attn_dropout=float(
-                    getattr(self.cost_agg_cfg, "ATTN_DROPOUT", 0.0)
-                ),
-                proj_dropout=float(
-                    getattr(self.cost_agg_cfg, "PROJ_DROPOUT", 0.0)
-                ),
-                class_attention_enabled=bool(
-                    getattr(class_agg_cfg, "ENABLE", False)
-                ),
-                class_guidance_dim=int(
-                    getattr(class_agg_cfg, "GUIDANCE_DIM", 32)
-                ),
-                class_num_heads=int(
-                    getattr(class_agg_cfg, "NUM_HEADS", num_heads)
-                ),
-                class_attention_type=str(
-                    getattr(class_agg_cfg, "ATTENTION_TYPE", "full")
-                ),
-                class_pooling_size=getattr(
-                    class_agg_cfg,
-                    "POOLING_SIZE",
-                    1,
-                ),
-                class_pad_len=int(
-                    getattr(class_agg_cfg, "PAD_LEN", 0)
-                ),
-                class_mlp_ratio=float(
-                    getattr(class_agg_cfg, "MLP_RATIO", 4.0)
-                ),
-                class_gate_init=float(
-                    getattr(class_agg_cfg, "GATE_INIT", 0.0)
-                ),
-            )
+            self.atomic_label_names = self._load_atomic_label_names()
+            self.atomic_label_prompt_groups = self._load_label_prompt_groups()
 
         # Initialize weights
         self.init_weights()
@@ -473,174 +382,42 @@ class Pointformer(nn.Module):
         all_divisors = divisors(self.cfg.POINT_INFO.NUM_POINTS_TO_SAMPLE)
         return all_divisors[len(all_divisors) // 2]
 
-    def _resolve_sav_label_map_path(self):
-        """Resolve the SAV atomic label map used for DinoTxt label text."""
-        candidate_paths = []
-        if self.cfg.DATA.PATH_TO_DATA_DIR:
-            data_root = self.cfg.DATA.PATH_TO_DATA_DIR
-            if os.path.isabs(data_root):
-                candidate_paths.append(
-                    os.path.join(data_root, "education_first_label.pbtxt")
-                )
-            else:
-                candidate_paths.append(
-                    os.path.join(
-                        os.getcwd(),
-                        data_root,
-                        "education_first_label.pbtxt",
-                    )
-                )
-        candidate_paths.append(
-            os.path.join(os.getcwd(), "data", "sav", "education_first_label.pbtxt")
-        )
-        for candidate_path in candidate_paths:
-            if os.path.exists(candidate_path):
-                return candidate_path
-        raise FileNotFoundError(
-            "Could not locate SAV atomic label map education_first_label.pbtxt."
-        )
-
     def _load_atomic_label_names(self):
-        """Load the 0-based SAV atomic action names for POT routing."""
-        dataset_names = {
-            str(getattr(self.cfg.TRAIN, "DATASET", "")).lower(),
-            str(getattr(self.cfg.TEST, "DATASET", "")).lower(),
-        }
-        if "sav" not in dataset_names:
-            raise NotImplementedError(
-                "POT support routing currently expects SAV atomic label names."
+        """Load the configured global class vocabulary for text routing."""
+        configured_names = list(getattr(self.cfg.TEST, "CLASS_NAME", []))
+        if len(configured_names) != self.num_classes:
+            raise ValueError(
+                "TEST.CLASS_NAME must contain MODEL.NUM_CLASSES entries for "
+                "text routing; "
+                f"got {len(configured_names)} names for {self.num_classes} classes."
+            )
+        if any(not isinstance(name, str) or not name for name in configured_names):
+            raise ValueError("TEST.CLASS_NAME entries must be non-empty strings.")
+        return configured_names
+
+    def _load_label_prompt_groups(self):
+        """Load dataset prompts, falling back to exact configured class names."""
+        configured_groups = list(getattr(self.cfg.DATA, "LABEL_PROMPTS", []))
+        if not configured_groups:
+            return [[label_name] for label_name in self.atomic_label_names]
+        if len(configured_groups) != self.num_classes:
+            raise ValueError(
+                "DATA.LABEL_PROMPTS must contain MODEL.NUM_CLASSES groups; "
+                f"got {len(configured_groups)} groups for {self.num_classes} classes."
             )
 
-        label_names = [str(class_id) for class_id in range(self.num_classes)]
-        label_map_path = self._resolve_sav_label_map_path()
-        current_name = None
-        current_id = None
-        with open(label_map_path, "r", encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if line.startswith("name:"):
-                    current_name = line.split(":", 1)[1].strip().strip('"')
-                elif line.startswith("id:"):
-                    current_id = int(line.split(":", 1)[1].strip()) - 1
-
-                if current_name is not None and current_id is not None:
-                    if 0 <= current_id < len(label_names):
-                        label_names[current_id] = current_name
-                    current_name = None
-                    current_id = None
-        return label_names
-
-    def _get_sav_label_prompts(self, label_name):
-        """Return visually grounded prompt variants for every SAV atomic label."""
-        base_prompt = label_name.replace("_", " ")
-        prompt_bank = {
-            "sit": [
-                "sit",
-                "a student sits on a chair",
-                "the person's hips rest on a seat",
-                "the upper body remains in a seated posture",
-                "a student is seated at a classroom desk",
-            ],
-            "stand": [
-                "stand",
-                "a student stands upright",
-                "the person's body is supported by both feet",
-                "the torso rises above the chair",
-                "an upright person stands beside a classroom desk",
-            ],
-            "look_forward": [
-                "look forward",
-                "a student looks toward the front of the classroom",
-                "the head and face point straight ahead",
-                "eyes are directed toward the teacher or board",
-                "the head remains centered without turning sideways",
-            ],
-            "look_sideways": [
-                "look sideways",
-                "a student looks to the left or right",
-                "the head turns toward one side",
-                "the face is oriented away from the front",
-                "the eyes and head point toward something nearby",
-            ],
-            "read": [
-                "read",
-                "a student reads a book or paper",
-                "eyes looking down at reading material",
-                "holding or looking at a book on a desk",
-                "reading pages without writing",
-            ],
-            "flip_books": [
-                "flip books",
-                "a student turns pages of a book",
-                "hand flipping book pages on a desk",
-                "fingers moving along page edges",
-                "a book page changes position over time",
-            ],
-            "touch_sth": [
-                "touch something",
-                "a student touches a nearby object",
-                "a hand reaches toward an object on the desk",
-                "fingers make contact with an item",
-                "the arm extends and the hand contacts something",
-            ],
-            "raise_hand": [
-                "raise hand",
-                "a student raises one hand in class",
-                "an arm moves upward above shoulder level",
-                "a hand is held up to get the teacher's attention",
-                "the raised arm extends upward away from the desk",
-            ],
-            "hands_down": [
-                "hands down",
-                "a student lowers one or both hands",
-                "hands move downward from a raised position",
-                "the arms descend toward the desk or the body",
-                "both hands finish below shoulder level",
-            ],
-            "take_notes": [
-                "take notes",
-                "a student writes notes on paper",
-                "hand holding a pen and writing",
-                "small repetitive hand motion on notebook",
-                "writing on a desk with paper",
-            ],
-            "applaud": [
-                "applaud",
-                "a student claps their hands",
-                "both hands repeatedly move together and apart",
-                "the palms meet in front of the body",
-                "repeated hand clapping in the classroom",
-            ],
-            "bend": [
-                "bend",
-                "a student bends the upper body",
-                "the torso leans forward or downward",
-                "the head and shoulders move toward the desk",
-                "the body changes from upright to a bent posture",
-            ],
-            "turn_around": [
-                "turn around",
-                "a person turns the head or body around",
-                "torso orientation changes over time",
-                "head rotates from front to side or back",
-                "shoulder direction changes across frames",
-            ],
-            "talk_with_others": [
-                "talk with others",
-                "a student talks with another person",
-                "face turned toward a nearby person while speaking",
-                "mouth movement during conversation",
-                "two people interacting or conversing",
-            ],
-            "answer_questions": [
-                "answer questions",
-                "a student answers a question in class",
-                "a student speaks while looking toward the teacher",
-                "a student responds in the classroom",
-                "head and mouth movement while answering",
-            ],
-        }
-        return prompt_bank.get(label_name, [base_prompt])
+        prompt_groups = []
+        for class_id, configured_group in enumerate(configured_groups):
+            group = list(configured_group)
+            if not group or any(
+                not isinstance(prompt, str) or not prompt for prompt in group
+            ):
+                raise ValueError(
+                    "Every DATA.LABEL_PROMPTS group must contain non-empty "
+                    f"strings; invalid group at class id {class_id}."
+                )
+            prompt_groups.append(group)
+        return prompt_groups
 
     def _get_pot_label_text_features(self, global_class_indices, dtype):
         """Encode episode label prompts with DinoTxt text encoder for POT routing."""
@@ -650,7 +427,7 @@ class Pointformer(nn.Module):
             )
 
         prompt_groups = [
-            self._get_sav_label_prompts(self.atomic_label_names[int(class_id)])
+            self.atomic_label_prompt_groups[int(class_id)]
             for class_id in global_class_indices.detach().cpu().tolist()
         ]
         flat_prompts = [prompt for group in prompt_groups for prompt in group]
@@ -926,68 +703,6 @@ class Pointformer(nn.Module):
             torch.zeros_like(probs),
         )
         return torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-
-    def _build_support_text_alignment(self, patch_tokens, metadata):
-        """Align support global visual features with episode label text features."""
-        support_mask = metadata['support_mask'].bool()
-        episode_positive_labels = metadata['episode_positive_labels'].float()
-        base_pt_mask = (
-            metadata['pred_query_mask']
-            if self.cfg.POINT_INFO.USE_PT_QUERY_MASK
-            else metadata['pred_visibility']
-        )
-        episode_class_ids = metadata['episode_class_ids'].long()
-        episode_class_ids = (
-            episode_class_ids[0]
-            if episode_class_ids.ndim == 2
-            else episode_class_ids
-        )
-        if support_mask.sum().item() == 0:
-            return None
-
-        support_patch_tokens = patch_tokens[support_mask]
-        support_point_mask = base_pt_mask[support_mask]
-        support_targets = episode_positive_labels[support_mask].to(
-            device=patch_tokens.device,
-            dtype=patch_tokens.dtype,
-        )
-        valid_support = support_targets.sum(dim=-1) > 0
-        if not valid_support.any():
-            return None
-
-        support_patch_tokens = support_patch_tokens[valid_support]
-        support_point_mask = support_point_mask[valid_support]
-        support_targets = support_targets[valid_support]
-
-        support_global = self._masked_space_time_mean(
-            support_patch_tokens,
-            support_point_mask,
-        )
-        episode_label_text = self._get_pot_label_text_features(
-            episode_class_ids,
-            patch_tokens.dtype,
-        )
-        support_global = F.normalize(support_global.float(), dim=-1)
-        episode_label_text = F.normalize(episode_label_text.float(), dim=-1)
-        logits = float(self.text_align_cfg.LOGIT_SCALE) * torch.matmul(
-            support_global,
-            episode_label_text.transpose(0, 1),
-        )
-
-        target = support_targets / support_targets.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(1.0)
-        pred = torch.softmax(logits, dim=-1)
-        align_loss = ((pred - target.float()) ** 2).sum(dim=-1).mean()
-        return {
-            'text_align_loss': torch.nan_to_num(
-                align_loss.to(dtype=patch_tokens.dtype),
-                nan=0.0,
-                posinf=1e4,
-                neginf=0.0,
-            ),
-        }
 
     def _aggregate_weighted_st_support_tokens(self, feat, point_mask, st_weights):
         """Aggregate spatio-temporal token weights into per-frame support prototypes."""
@@ -1319,433 +1034,6 @@ class Pointformer(nn.Module):
             valid_classes.to(device=output_device),
         )
 
-    def _sample_dense_cost_at_tracks(self, dense_cost, pred_tracks):
-        """Sample [B,T,K,H,W] dense costs at [B,T,N,2] track coordinates."""
-        if dense_cost.ndim != 5:
-            raise ValueError(
-                "Dense cost must have shape [B,T,K,H,W]; got "
-                f"{tuple(dense_cost.shape)}."
-            )
-        if pred_tracks.ndim != 4 or pred_tracks.shape[-1] != 2:
-            raise ValueError(
-                "pred_tracks must have shape [B,T,N,2]; got "
-                f"{tuple(pred_tracks.shape)}."
-            )
-        batch_size, temporal_dim, num_labels, _, _ = dense_cost.shape
-        if tuple(pred_tracks.shape[:2]) != (batch_size, temporal_dim):
-            raise ValueError(
-                "Dense cost and pred_tracks must share B,T; got "
-                f"{tuple(dense_cost.shape[:2])} and "
-                f"{tuple(pred_tracks.shape[:2])}."
-            )
-
-        model_cfg = getattr(self.cfg, "MODEL", None)
-        sample_mode = str(
-            getattr(model_cfg, "FEAT_EXTRACT_MODE", "nearest")
-        ).lower()
-        # Preserve the exact FP32 pred_tracks coordinates used by the original
-        # dense-feature sampler. Casting the grid to an autocast FP16 cost dtype
-        # can move boundary coordinates into a different nearest patch cell.
-        with torch.autocast(device_type=dense_cost.device.type, enabled=False):
-            dense_cost_bt = rearrange(
-                dense_cost,
-                "b t k h w -> (b t) k h w",
-            ).float()
-            track_grid = rearrange(
-                pred_tracks,
-                "b t n c -> (b t) n 1 c",
-            ).to(device=dense_cost.device, dtype=torch.float32)
-            track_grid = torch.nan_to_num(
-                track_grid,
-                nan=2.0,
-                posinf=2.0,
-                neginf=-2.0,
-            )
-            sampled_cost = F.grid_sample(
-                dense_cost_bt,
-                track_grid,
-                mode=sample_mode,
-                padding_mode="zeros",
-                align_corners=True,
-            ).squeeze(-1)
-        sampled_cost = rearrange(
-            sampled_cost,
-            "(b t) k n -> b k t n",
-            b=batch_size,
-            t=temporal_dim,
-            k=num_labels,
-        )
-        return torch.nan_to_num(
-            sampled_cost,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-    def _rasterize_point_cost_and_guidance(
-        self,
-        patch_tokens,
-        point_similarity,
-        pred_tracks,
-        point_mask,
-        resolution,
-    ):
-        """Nearest-scatter trajectory costs/features onto their current grid.
-
-        Colliding trajectories are averaged.  Cells receiving no valid
-        trajectory remain exactly zero and are marked false in the returned
-        occupancy mask.
-        """
-        if patch_tokens.ndim != 4:
-            raise ValueError(
-                "patch_tokens must have shape [B,T,N,D]; got "
-                f"{tuple(patch_tokens.shape)}."
-            )
-        if point_similarity.ndim != 4:
-            raise ValueError(
-                "point_similarity must have shape [B,K,T,N]; got "
-                f"{tuple(point_similarity.shape)}."
-            )
-        if pred_tracks.ndim != 4 or pred_tracks.shape[-1] != 2:
-            raise ValueError(
-                "pred_tracks must have shape [B,T,N,2]; got "
-                f"{tuple(pred_tracks.shape)}."
-            )
-        if point_mask.ndim != 3:
-            raise ValueError(
-                "point_mask must have shape [B,T,N]; got "
-                f"{tuple(point_mask.shape)}."
-            )
-        height, width = (int(resolution[0]), int(resolution[1]))
-        if height <= 0 or width <= 0:
-            raise ValueError(f"resolution must be positive, got {resolution}.")
-
-        batch, temporal, num_points, channels = patch_tokens.shape
-        num_labels = point_similarity.shape[1]
-        if tuple(point_similarity.shape) != (
-            batch,
-            num_labels,
-            temporal,
-            num_points,
-        ):
-            raise ValueError("point_similarity does not match patch token B/T/N.")
-        if tuple(pred_tracks.shape[:3]) != (batch, temporal, num_points):
-            raise ValueError("pred_tracks does not match patch token B/T/N.")
-        if tuple(point_mask.shape) != (batch, temporal, num_points):
-            raise ValueError("point_mask does not match patch token B/T/N.")
-
-        device = patch_tokens.device
-        with torch.autocast(device_type=device.type, enabled=False):
-            tokens = torch.nan_to_num(
-                patch_tokens.float(),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            similarity = torch.nan_to_num(
-                point_similarity.float(),
-                nan=0.0,
-                posinf=1.0,
-                neginf=-1.0,
-            ).clamp(-1.0, 1.0)
-            tracks = pred_tracks.to(device=device, dtype=torch.float32)
-            finite_tracks = torch.isfinite(tracks).all(dim=-1)
-            in_bounds = (
-                tracks.ge(-1.0).all(dim=-1)
-                & tracks.le(1.0).all(dim=-1)
-            )
-            valid = (
-                point_mask.to(device=device).bool()
-                & finite_tracks
-                & in_bounds
-            )
-            safe_tracks = torch.nan_to_num(
-                tracks,
-                nan=0.0,
-                posinf=1.0,
-                neginf=-1.0,
-            ).clamp(-1.0, 1.0)
-            x_index = torch.round(
-                (safe_tracks[..., 0] + 1.0) * 0.5 * max(width - 1, 0)
-            ).long()
-            y_index = torch.round(
-                (safe_tracks[..., 1] + 1.0) * 0.5 * max(height - 1, 0)
-            ).long()
-            flat_index = y_index * width + x_index
-            cells = height * width
-            valid_float = valid.float()
-
-            counts = torch.zeros(
-                batch,
-                temporal,
-                cells,
-                device=device,
-                dtype=torch.float32,
-            ).scatter_add(2, flat_index, valid_float)
-
-            guidance_index = flat_index.unsqueeze(-1).expand(
-                -1, -1, -1, channels
-            )
-            guidance_sum = torch.zeros(
-                batch,
-                temporal,
-                cells,
-                channels,
-                device=device,
-                dtype=torch.float32,
-            ).scatter_add(
-                2,
-                guidance_index,
-                tokens * valid_float.unsqueeze(-1),
-            )
-
-            cost_source = similarity.permute(0, 2, 1, 3)
-            cost_index = flat_index.unsqueeze(2).expand(
-                -1, -1, num_labels, -1
-            )
-            cost_sum = torch.zeros(
-                batch,
-                temporal,
-                num_labels,
-                cells,
-                device=device,
-                dtype=torch.float32,
-            ).scatter_add(
-                3,
-                cost_index,
-                cost_source * valid_float.unsqueeze(2),
-            )
-
-            denominator = counts.clamp_min(1.0)
-            dense_guidance = guidance_sum / denominator.unsqueeze(-1)
-            dense_cost = cost_sum / denominator.unsqueeze(2)
-            occupancy = counts > 0.0
-
-            dense_guidance = dense_guidance.reshape(
-                batch, temporal, height, width, channels
-            )
-            dense_cost = dense_cost.reshape(
-                batch, temporal, num_labels, height, width
-            )
-            occupancy = occupancy.reshape(batch, temporal, height, width)
-        return dense_cost, dense_guidance, occupancy
-
-    def _compute_cat_refined_point_similarity(
-        self,
-        patch_tokens,
-        point_mask,
-        pred_tracks,
-        label_text_features,
-    ):
-        """Replace point cosine with masked CAT cost built from the same tokens."""
-        if patch_tokens is None or pred_tracks is None:
-            raise ValueError(
-                "COST_AGG requires post-Pointformer patch_tokens and pred_tracks."
-            )
-        point_similarity = self._compute_batched_point_text_similarity(
-            patch_tokens,
-            label_text_features,
-        )
-        resolution = self.cat_spatial_cost_aggregator.input_resolution
-        dense_cost, dense_guidance, occupancy = (
-            self._rasterize_point_cost_and_guidance(
-                patch_tokens,
-                point_similarity,
-                pred_tracks,
-                point_mask,
-                resolution,
-            )
-        )
-        refined_dense_cost = (
-            self.cat_spatial_cost_aggregator.forward_precomputed(
-                dense_cost,
-                dense_guidance,
-                occupancy,
-                text_features=label_text_features,
-            )
-        )
-        refined_point_cost = self._sample_dense_cost_at_tracks(
-            refined_dense_cost,
-            pred_tracks,
-        )
-        return torch.nan_to_num(
-            refined_point_cost,
-            nan=0.0,
-            posinf=1e4,
-            neginf=-1e4,
-        )
-
-    def _compute_split_cat_refined_point_similarity(
-        self,
-        patch_tokens,
-        point_mask,
-        pred_tracks,
-        support_mask,
-        episode_positive_labels,
-        episode_class_ids,
-        episode_label_text,
-        raw_positive_labels=None,
-    ):
-        """Apply CAT with separate support/query label information.
-
-        Query samples are refined jointly against every candidate on the
-        episode label axis.  A support sample is instead refined against only
-        its known *global* ground-truth labels.  The refined support costs that
-        overlap the episode axis are then mapped back to their episode slots.
-
-        Importantly, query rows from ``raw_positive_labels`` are never read.
-        They are evaluation targets, not model inputs.  If global labels are
-        unavailable, support samples fall back to their known positive labels
-        on the episode axis.
-        """
-        device = patch_tokens.device
-        batch = patch_tokens.shape[0]
-        support_mask = support_mask.to(device=device).bool().flatten()
-        if support_mask.numel() != batch:
-            raise ValueError(
-                "support_mask must have one entry per sample; got "
-                f"{tuple(support_mask.shape)} for batch size {batch}."
-            )
-
-        episode_class_ids = episode_class_ids.to(
-            device=device,
-            dtype=torch.long,
-        ).flatten()
-        episode_positive_labels = episode_positive_labels.to(
-            device=device,
-        ).bool()
-        expected_positive_shape = (batch, episode_class_ids.numel())
-        if tuple(episode_positive_labels.shape) != expected_positive_shape:
-            raise ValueError(
-                "episode_positive_labels must have shape [B,K]; got "
-                f"{tuple(episode_positive_labels.shape)}, expected "
-                f"{expected_positive_shape}."
-            )
-        if tuple(episode_label_text.shape[:1]) != (
-            episode_class_ids.numel(),
-        ):
-            raise ValueError(
-                "episode label ids/text length mismatch: got "
-                f"{episode_class_ids.numel()} ids and "
-                f"{episode_label_text.shape[0]} text features."
-            )
-
-        support_raw_labels = None
-        if raw_positive_labels is not None:
-            raw_positive_labels = raw_positive_labels.to(device=device).bool()
-            raw_positive_labels = raw_positive_labels.reshape(batch, -1)
-            # Slice only support rows.  Query ground truth must not influence
-            # either its label axis or any class-attention computation.
-            support_indices = torch.nonzero(
-                support_mask,
-                as_tuple=False,
-            ).flatten()
-            support_raw_labels = raw_positive_labels.index_select(
-                0,
-                support_indices,
-            )
-        else:
-            support_indices = torch.nonzero(
-                support_mask,
-                as_tuple=False,
-            ).flatten()
-
-        # Non-positive support/episode slots remain zero and are never consumed
-        # downstream.  In particular, support samples do not even compute a
-        # cost against non-ground-truth episode labels.
-        refined_similarity = torch.zeros(
-            batch,
-            episode_class_ids.numel(),
-            patch_tokens.shape[1],
-            patch_tokens.shape[2],
-            device=device,
-            dtype=torch.float32,
-        )
-
-        query_indices = torch.nonzero(
-            ~support_mask,
-            as_tuple=False,
-        ).flatten()
-        if query_indices.numel() > 0:
-            query_similarity = self._compute_cat_refined_point_similarity(
-                patch_tokens.index_select(0, query_indices),
-                point_mask.index_select(0, query_indices),
-                pred_tracks.index_select(0, query_indices),
-                episode_label_text,
-            )
-            refined_similarity = refined_similarity.index_copy(
-                0,
-                query_indices,
-                query_similarity,
-            )
-
-        for local_support_idx, sample_idx_tensor in enumerate(support_indices):
-            sample_idx = int(sample_idx_tensor.item())
-            positive_episode_indices = torch.nonzero(
-                episode_positive_labels[sample_idx],
-                as_tuple=False,
-            ).flatten()
-            fallback_global_labels = episode_class_ids.index_select(
-                0,
-                positive_episode_indices,
-            )
-
-            if support_raw_labels is None:
-                true_global_labels = fallback_global_labels
-            else:
-                true_global_labels = torch.nonzero(
-                    support_raw_labels[local_support_idx],
-                    as_tuple=False,
-                ).flatten().to(dtype=torch.long)
-                # Metadata should agree, but keep all known episode positives
-                # if a partially populated raw-label vector is supplied.
-                if fallback_global_labels.numel() > 0:
-                    true_global_labels = torch.unique(
-                        torch.cat(
-                            (true_global_labels, fallback_global_labels),
-                            dim=0,
-                        ),
-                        sorted=True,
-                    )
-
-            if true_global_labels.numel() == 0:
-                continue
-
-            true_label_text = self._get_pot_label_text_features(
-                true_global_labels,
-                patch_tokens.dtype,
-            )
-            true_label_similarity = self._compute_cat_refined_point_similarity(
-                patch_tokens[sample_idx : sample_idx + 1],
-                point_mask[sample_idx : sample_idx + 1],
-                pred_tracks[sample_idx : sample_idx + 1],
-                true_label_text,
-            )[0]
-
-            true_axis_indices, episode_axis_indices = torch.nonzero(
-                true_global_labels[:, None] == episode_class_ids[None, :],
-                as_tuple=True,
-            )
-            if episode_axis_indices.numel() == 0:
-                continue
-            sample_similarity = refined_similarity[sample_idx].index_copy(
-                0,
-                episode_axis_indices,
-                true_label_similarity.index_select(0, true_axis_indices),
-            )
-            refined_similarity = refined_similarity.index_copy(
-                0,
-                sample_idx_tensor.reshape(1),
-                sample_similarity.unsqueeze(0),
-            )
-
-        return torch.nan_to_num(
-            refined_similarity,
-            nan=0.0,
-            posinf=1e4,
-            neginf=-1e4,
-        )
-
     def _compute_bidirectional_frame_similarity(
         self,
         query_prototypes_frame,
@@ -1808,34 +1096,18 @@ class Pointformer(nn.Module):
             episode_class_ids,
             value_tokens.dtype,
         )
-        refined_similarity = None
-        if bool(getattr(self, "use_cat_cost_aggregation", False)):
-            refined_similarity = self._compute_split_cat_refined_point_similarity(
-                value_tokens,
-                point_mask,
-                pred_tracks,
-                support_mask,
-                episode_positive_labels,
-                episode_class_ids,
-                episode_label_text,
-                raw_positive_labels=metadata.get("raw_positive_labels"),
-            )
         support_prototypes = self._build_frame_softmax_support_prototypes(
             value_tokens,
             point_mask,
             support_mask,
             episode_positive_labels,
             episode_label_text,
-            precomputed_similarity=refined_similarity,
+            precomputed_similarity=None,
         )
         query_label_features = episode_label_text
         support_visual = None
         support_visual_valid = None
         if bool(getattr(self, "use_support_text_fusion", False)):
-            if refined_similarity is not None:
-                raise RuntimeError(
-                    "SUPPORT_TEXT_FUSION cannot consume CAT precomputed query costs."
-                )
             (
                 query_label_features,
                 support_visual,
@@ -1848,20 +1120,11 @@ class Pointformer(nn.Module):
         query_indices = torch.nonzero(query_mask, as_tuple=False).flatten()
         query_prototypes = []
         for sample_idx in query_indices.tolist():
-            if refined_similarity is None:
-                sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
-                    value_tokens[sample_idx],
-                    point_mask[sample_idx],
-                    query_label_features,
-                )
-            else:
-                sample_prototypes, _ = (
-                    self._compute_frame_softmax_prototypes_from_similarity(
-                        value_tokens[sample_idx],
-                        point_mask[sample_idx],
-                        refined_similarity[sample_idx],
-                    )
-                )
+            sample_prototypes, _ = self._compute_frame_softmax_text_prototypes(
+                value_tokens[sample_idx],
+                point_mask[sample_idx],
+                query_label_features,
+            )
             query_prototypes.append(sample_prototypes.unsqueeze(0))
         if not query_prototypes:
             return None
@@ -2241,13 +1504,6 @@ class Pointformer(nn.Module):
 
         cls_x, patch_x = self.pt_forward(fused_feat, metadata)
         if 'support_mask' in metadata and 'episode_positive_labels' in metadata:
-            if self.use_text_alignment:
-                text_align_aux = self._build_support_text_alignment(
-                    patch_x,
-                    metadata,
-                )
-                if text_align_aux is not None:
-                    few_shot_aux.update(text_align_aux)
             if self.use_query_partial_q2s:
                 frame_softmax_aux = self._build_frame_softmax_q2s_aux(
                     patch_x,

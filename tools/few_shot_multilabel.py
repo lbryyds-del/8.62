@@ -113,55 +113,6 @@ def support_query_split_multilabel(preds, labels, metadata):
     }
 
 
-def support_query_split_multilabel_conditioned(base_split, few_shot_aux):
-    """Replace support prototypes with text-conditioned support branches."""
-    support_preds = base_split["support_preds"]
-    branch_tokens = few_shot_aux["support_conditioned_patch_tokens"]
-    branch_class_indices = few_shot_aux["support_branch_class_indices"].long()
-
-    conditioned_support = []
-    num_episode_classes = support_preds.shape[0]
-    for class_idx in range(num_episode_classes):
-        class_mask = branch_class_indices == class_idx
-        if class_mask.any():
-            class_tokens = branch_tokens[class_mask]
-            conditioned_support.append(class_tokens.mean(dim=0, keepdim=True))
-        else:
-            conditioned_support.append(
-                support_preds[class_idx:class_idx + 1].mean(dim=2, keepdim=True)
-            )
-
-    query_preds = base_split["query_preds"]
-    if (
-        "query_conditioned_patch_tokens" in few_shot_aux
-        and "query_conditioned_sample_indices" in few_shot_aux
-    ):
-        expected_indices = torch.nonzero(
-            base_split["query_condition"], as_tuple=False
-        ).flatten().to(few_shot_aux["query_conditioned_sample_indices"].device)
-        actual_indices = few_shot_aux["query_conditioned_sample_indices"].long()
-        if not torch.equal(expected_indices, actual_indices):
-            raise ValueError(
-                "LGA query sample indices do not match the episode query ordering."
-            )
-        query_preds = few_shot_aux["query_conditioned_patch_tokens"]
-
-    return {
-        **base_split,
-        "support_preds": torch.cat(conditioned_support, dim=0),
-        "query_preds": query_preds,
-    }
-
-
-def few_shot_aux_has_support_tokens(few_shot_aux):
-    """Return True when few_shot_aux carries support replacement tokens."""
-    return (
-        isinstance(few_shot_aux, dict)
-        and "support_conditioned_patch_tokens" in few_shot_aux
-        and "support_branch_class_indices" in few_shot_aux
-    )
-
-
 def few_shot_aux_has_query_partial_logits(few_shot_aux):
     """Return True when few_shot_aux carries query-side q2s logits."""
     return (
@@ -409,16 +360,6 @@ def compute_query_partial_q2s_loss(
     return loss, verified_scaled, diagnostics
 
 
-def get_text_align_loss(few_shot_aux, ref_tensor):
-    """Return the text alignment loss scalar or a zero scalar on the right device."""
-    if isinstance(few_shot_aux, dict) and "text_align_loss" in few_shot_aux:
-        align_loss = few_shot_aux["text_align_loss"]
-        if not isinstance(align_loss, torch.Tensor):
-            align_loss = ref_tensor.new_tensor(float(align_loss))
-        return torch.nan_to_num(align_loss, nan=0.0, posinf=1e4, neginf=0.0)
-    return ref_tensor.new_zeros(())
-
-
 def get_query_matchability_metrics(few_shot_aux, q2s_labels):
     """Return label-stratified diagnostics for the Query-class matcher.
 
@@ -655,8 +596,19 @@ def compute_ap_for_classes(storage, class_ids):
     return float(np.mean(list(aps.values())) * 100.0), aps
 
 
-def compute_episode_ap(labels, scores, episode_class_ids, target_class_ids):
-    """Compute macro AP for one episode over seen or novel classes only."""
+def compute_episode_ap(
+    labels,
+    scores,
+    episode_class_ids,
+    target_class_ids,
+    drop_empty_query_rows=False,
+):
+    """Compute macro AP for one episode over seen or novel classes only.
+
+    When ``drop_empty_query_rows`` is enabled, Query rows with no positive
+    label in the selected class subset are removed from both labels and scores
+    before AP is computed. This is the local CLIP-FSAR TinyVIRAT protocol.
+    """
     class_mask = np.array(
         [class_id in set(target_class_ids) for class_id in episode_class_ids],
         dtype=bool,
@@ -672,6 +624,12 @@ def compute_episode_ap(labels, scores, episode_class_ids, target_class_ids):
 
     filtered_labels = filtered_labels[:, valid_labels]
     filtered_scores = filtered_scores[:, valid_labels]
+    if drop_empty_query_rows:
+        non_zero_mask = ~np.all(filtered_labels == 0, axis=1)
+        filtered_labels = filtered_labels[non_zero_mask]
+        filtered_scores = filtered_scores[non_zero_mask]
+        if filtered_labels.shape[0] == 0:
+            return None
     return float(
         average_precision_score(filtered_labels, filtered_scores, average="macro")
     )
@@ -681,19 +639,30 @@ def compute_base_novel_hm(storage, cfg):
     """Compute doc-style seen/novel AP: per episode first, then mean over episodes."""
     seen_episode_aps = []
     novel_episode_aps = []
+    drop_empty_query_rows = bool(
+        getattr(cfg.TEST, "DROP_EMPTY_QUERY_ROWS", False)
+    )
     for episode in storage["episodes"]:
         labels = np.array(episode["labels"], dtype=np.float32)
         scores = np.array(episode["scores"], dtype=np.float32)
         episode_class_ids = [int(class_id) for class_id in episode["episode_class_ids"]]
 
         ap_seen = compute_episode_ap(
-            labels, scores, episode_class_ids, cfg.TEST.SEEN_LABELS
+            labels,
+            scores,
+            episode_class_ids,
+            cfg.TEST.SEEN_LABELS,
+            drop_empty_query_rows=drop_empty_query_rows,
         )
         if ap_seen is not None:
             seen_episode_aps.append(ap_seen)
 
         ap_novel = compute_episode_ap(
-            labels, scores, episode_class_ids, cfg.TEST.NOVEL_LABELS
+            labels,
+            scores,
+            episode_class_ids,
+            cfg.TEST.NOVEL_LABELS,
+            drop_empty_query_rows=drop_empty_query_rows,
         )
         if ap_novel is not None:
             novel_episode_aps.append(ap_novel)

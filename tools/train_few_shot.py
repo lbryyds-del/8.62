@@ -17,9 +17,7 @@ from few_shot_multilabel import (
     empty_ap_storage,
     episode_labels_from_global,
     few_shot_aux_has_query_partial_logits,
-    few_shot_aux_has_support_tokens,
     get_query_matchability_metrics,
-    get_text_align_loss,
     get_episode_class_ids,
     is_multilabel_episode,
     mean_or_nan,
@@ -28,7 +26,6 @@ from few_shot_multilabel import (
     multilabel_top1_accuracy,
     q2s_cos_sim_fp32,
     support_query_split_multilabel,
-    support_query_split_multilabel_conditioned,
     update_ap_storage,
 )
 import trokens.models.losses as losses
@@ -269,7 +266,6 @@ def train_epoch(
     epoch_top_1_acc_few_shot = []
     epoch_cls_loss = []
     epoch_q2s_loss = []
-    epoch_align_loss = []
     epoch_query_route_metrics = {}
 
     if cfg.MIXUP.ENABLE:
@@ -331,7 +327,6 @@ def train_epoch(
                 preds, _ = preds
             preds = preds / cfg.SOLVER.TEMPRATURE
             preds = torch.nan_to_num(preds, nan=0.0, posinf=30.0, neginf=-30.0)
-            align_loss = get_text_align_loss(few_shot_aux, patch_tokens)
             # Explicitly declare reduction to mean.
             loss_fun = losses.get_loss_func(cfg)(
                 reduction="mean"
@@ -345,15 +340,8 @@ def train_epoch(
                 classfication_loss = loss_fun(preds, labels)
             loss_dict = {'classfication_loss':classfication_loss}
             if multilabel_episode:
-                base_support_query_dict = support_query_split_multilabel(
+                patch_support_query_dict = support_query_split_multilabel(
                     patch_tokens, labels, meta)
-                if few_shot_aux_has_support_tokens(few_shot_aux):
-                    patch_support_query_dict = support_query_split_multilabel_conditioned(
-                        base_support_query_dict,
-                        few_shot_aux,
-                    )
-                else:
-                    patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
             q2s_labels = patch_support_query_dict['query_batch_labels']
@@ -390,10 +378,8 @@ def train_epoch(
                 )
                 q2s_loss = F.cross_entropy(patch_q2s_logits, q2s_labels)
             loss_dict['q2s_loss'] = q2s_loss
-            loss_dict['align_loss'] = align_loss
         loss = (cfg.FEW_SHOT.CLASS_LOSS_LAMBDA * classfication_loss +
-                cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss +
-                cfg.FEW_SHOT.TEXT_ALIGN.LOSS_WEIGHT * align_loss)
+                cfg.FEW_SHOT.Q2S_LOSS_LAMBDA * q2s_loss)
 
         if not torch.isfinite(loss):
             finite_report = {
@@ -404,7 +390,6 @@ def train_epoch(
                 "patch_q2s_logits": bool(torch.isfinite(patch_q2s_logits).all()),
                 "classification_loss": bool(torch.isfinite(classfication_loss)),
                 "q2s_loss": bool(torch.isfinite(q2s_loss)),
-                "align_loss": bool(torch.isfinite(align_loss)),
             }
             logger.warning(
                 "Skip non-finite train batch at epoch %d iter %d: %s",
@@ -440,7 +425,6 @@ def train_epoch(
         top1_err, top5_err = None, None
         classification_loss = loss_dict['classfication_loss']
         q2s_loss = loss_dict['q2s_loss']
-        align_loss = loss_dict['align_loss']
         query_route_metric_values = {}
 
         if multilabel_episode:
@@ -450,14 +434,12 @@ def train_epoch(
                     loss,
                     classification_loss,
                     q2s_loss,
-                    align_loss,
                     few_shot_top1_acc,
                 ) = du.all_reduce(
                     [
                         loss,
                         classification_loss,
                         q2s_loss,
-                        align_loss,
                         few_shot_top1_acc,
                     ]
                 )
@@ -472,7 +454,6 @@ def train_epoch(
             loss = loss.item()
             classification_loss = classification_loss.item()
             q2s_loss = q2s_loss.item()
-            align_loss = align_loss.item()
             few_shot_top1_acc = few_shot_top1_acc.item()
             query_route_metric_values = {
                 key: value.item()
@@ -481,7 +462,6 @@ def train_epoch(
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
-            epoch_align_loss.append(align_loss)
             epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
             for key, value in query_route_metric_values.items():
                 epoch_query_route_metrics.setdefault(key, []).append(value)
@@ -489,7 +469,6 @@ def train_epoch(
             wandb_iter_dict = {
                 'iter_cls_loss': classification_loss,
                 'iter_q2s_loss': q2s_loss,
-                'iter_align_loss': align_loss,
                 'iteration': global_iter,
                 'iter_top1_acc_few_shot': few_shot_top1_acc,
             }
@@ -520,7 +499,6 @@ def train_epoch(
                     top5_err,
                     few_shot_top1_acc,
                     q2s_loss,
-                    align_loss,
                     loss,
                 ) = du.all_reduce(
                     [
@@ -529,7 +507,6 @@ def train_epoch(
                         top5_err,
                         few_shot_top1_acc,
                         q2s_loss,
-                        align_loss,
                         loss,
                     ]
                 )
@@ -541,14 +518,12 @@ def train_epoch(
                 top5_err.item(),
             )
             q2s_loss = q2s_loss.item()
-            align_loss = align_loss.item()
 
             few_shot_top1_acc = few_shot_top1_acc.item()
             loss = loss.item()
 
             epoch_cls_loss.append(classification_loss)
             epoch_q2s_loss.append(q2s_loss)
-            epoch_align_loss.append(align_loss)
 
             epoch_top_1_err.append(top1_err)
             epoch_top_5_err.append(top5_err)
@@ -556,7 +531,6 @@ def train_epoch(
             global_iter = data_size * cur_epoch + cur_iter
             wandb_iter_dict = {'iter_cls_loss':classification_loss,
                                 'iter_q2s_loss':q2s_loss,
-                                'iter_align_loss':align_loss,
                                 'iter_top1_err':top1_err,
                                 'iter_top5_err':top5_err,
                             'iteration':global_iter,
@@ -567,7 +541,6 @@ def train_epoch(
         # Update and log stats.
         train_extra_metrics = {
             "q2s_loss": q2s_loss,
-            "align_loss": align_loss,
             **query_route_metric_values,
         }
         train_meter.update_stats(
@@ -589,7 +562,6 @@ def train_epoch(
             progress_metrics = {
                 shot_acc_name: f"{few_shot_top1_acc:.2f}",
                 "q2s_loss": f"{q2s_loss:.3f}",
-                "align_loss": f"{align_loss:.3f}",
             }
             progress_bar.set_postfix(progress_metrics, refresh=False)
         train_meter.iter_tic()
@@ -603,7 +575,6 @@ def train_epoch(
     wandb_iter_dict = {
         'train_cls_loss': mean_or_nan(epoch_cls_loss),
         'train_q2s_loss': mean_or_nan(epoch_q2s_loss),
-        'train_align_loss': mean_or_nan(epoch_align_loss),
         'train_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch,
     }
@@ -644,7 +615,6 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
     val_meter.iter_tic()
     epoch_top_1_acc_few_shot = []
     epoch_q2s_loss = []
-    epoch_align_loss = []
     epoch_query_route_metrics = {}
     ap_storage = empty_ap_storage(cfg.MODEL.NUM_CLASSES) if cfg.DATA.MULTI_LABEL else None
     shot_acc_name = shot_metric_name(cfg)
@@ -685,19 +655,10 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
                 few_shot_aux = None
             if isinstance(preds, tuple):
                 preds, _ = preds
-            align_loss = get_text_align_loss(few_shot_aux, patch_tokens)
-
             multilabel_episode = is_multilabel_episode(cfg, labels, meta)
             if multilabel_episode:
-                base_support_query_dict = support_query_split_multilabel(
+                patch_support_query_dict = support_query_split_multilabel(
                     patch_tokens, labels, meta)
-                if few_shot_aux_has_support_tokens(few_shot_aux):
-                    patch_support_query_dict = support_query_split_multilabel_conditioned(
-                        base_support_query_dict,
-                        few_shot_aux,
-                    )
-                else:
-                    patch_support_query_dict = base_support_query_dict
             else:
                 patch_support_query_dict = support_query_split(patch_tokens, labels, meta)
             q2s_labels = patch_support_query_dict['query_batch_labels']
@@ -743,12 +704,10 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
             (
                 few_shot_top1_acc,
                 q2s_loss,
-                align_loss,
             ) = du.all_reduce(
                 [
                     few_shot_top1_acc,
                     q2s_loss,
-                    align_loss,
                 ]
             )
             if query_route_metrics:
@@ -763,13 +722,11 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
         # Copy the errors from GPU to CPU (sync point).
         few_shot_top1_acc = few_shot_top1_acc.item()
         q2s_loss = q2s_loss.item()
-        align_loss = align_loss.item()
         query_route_metric_values = {
             key: value.item()
             for key, value in query_route_metrics.items()
         }
         epoch_q2s_loss.append(q2s_loss)
-        epoch_align_loss.append(align_loss)
         epoch_top_1_acc_few_shot.append(few_shot_top1_acc)
         for key, value in query_route_metric_values.items():
             epoch_query_route_metrics.setdefault(key, []).append(value)
@@ -777,7 +734,6 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
         val_meter.iter_toc()
         # Update and log stats.
         val_extra_metrics = {
-            "align_loss": align_loss,
             **query_route_metric_values,
         }
         val_meter.update_stats(
@@ -800,7 +756,6 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
             progress_metrics = {
                 shot_acc_name: f"{few_shot_top1_acc:.2f}",
                 "q2s_loss": f"{q2s_loss:.3f}",
-                "align_loss": f"{align_loss:.3f}",
             }
             progress_bar.set_postfix(progress_metrics, refresh=False)
         val_meter.iter_tic()
@@ -812,7 +767,6 @@ def eval_epoch(val_loader, model, val_meter, cur_epoch, cfg, wandb_run=None):
 
     log_dict = {
         'val_q2s_loss': mean_or_nan(epoch_q2s_loss),
-        'val_align_loss': mean_or_nan(epoch_align_loss),
         'val_top1_acc_few_shot': mean_or_nan(epoch_top_1_acc_few_shot),
         'epoch': cur_epoch}
     log_dict.update({

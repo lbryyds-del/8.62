@@ -1,5 +1,6 @@
-"""Tests for the descriptive SAV label prompt bank."""
+"""Tests for dataset-configured label prompts."""
 
+from trokens.config.defaults import get_cfg
 from trokens.models.pointformer import Pointformer
 
 
@@ -22,11 +23,21 @@ SAV_ATOMIC_LABELS = [
 ]
 
 
-def test_every_sav_label_has_a_descriptive_prompt_group():
+def _prompt_groups(config_path):
+    cfg = get_cfg()
+    cfg.merge_from_file(config_path)
     model = Pointformer.__new__(Pointformer)
+    model.cfg = cfg
+    model.num_classes = cfg.MODEL.NUM_CLASSES
+    model.atomic_label_names = model._load_atomic_label_names()
+    return model.atomic_label_names, model._load_label_prompt_groups()
 
-    for label_name in SAV_ATOMIC_LABELS:
-        prompts = model._get_sav_label_prompts(label_name)
+
+def test_every_sav_label_has_a_configured_descriptive_prompt_group():
+    label_names, prompt_groups = _prompt_groups("configs/trokens/sav.yaml")
+
+    assert label_names == SAV_ATOMIC_LABELS
+    for prompts in prompt_groups:
 
         assert len(prompts) == 5
         assert prompts[0]
@@ -34,7 +45,9 @@ def test_every_sav_label_has_a_descriptive_prompt_group():
         assert len(set(prompts)) == len(prompts)
 
 
-def test_unknown_sav_label_keeps_readable_fallback_prompt():
-    model = Pointformer.__new__(Pointformer)
+def test_tinyvirat_uses_exact_class_names_without_sav_prompts():
+    label_names, prompt_groups = _prompt_groups("configs/trokens/tinyvirat.yaml")
 
-    assert model._get_sav_label_prompts("new_action") == ["new action"]
+    assert prompt_groups == [[label_name] for label_name in label_names]
+    assert prompt_groups[3] == ["activity_carrying"]
+    assert prompt_groups[18] == ["specialized_talking_phone"]

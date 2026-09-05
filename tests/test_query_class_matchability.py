@@ -196,7 +196,6 @@ def test_relative_margin_penalty_is_used_during_training_when_enabled():
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
         FRAME_SOFTMAX_TAU=1.0,
     )
-    model.use_cat_cost_aggregation = False
     model.use_support_text_fusion = True
     model.support_text_fusion_cfg = SimpleNamespace(
         TEXT_WEIGHT=1.0,
@@ -254,7 +253,6 @@ def test_relative_margin_ignores_query_label_rows():
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
         FRAME_SOFTMAX_TAU=1.0,
     )
-    model.use_cat_cost_aggregation = False
     model.use_support_text_fusion = False
     text = torch.eye(2)
     model._get_pot_label_text_features = lambda class_ids, dtype: text.to(dtype)
@@ -304,7 +302,6 @@ def test_matchability_penalty_is_inference_only_by_default():
         QUERY_PARTIAL_LOGIT_BIAS=-2.0,
         FRAME_SOFTMAX_TAU=1.0,
     )
-    model.use_cat_cost_aggregation = False
     model.use_support_text_fusion = False
     text = torch.eye(2)
     model._get_pot_label_text_features = lambda class_ids, dtype: text.to(dtype)

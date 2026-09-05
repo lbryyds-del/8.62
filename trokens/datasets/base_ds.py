@@ -189,10 +189,7 @@ class BaseDataset(torch.utils.data.Dataset):
         pred_visibility = pt_dict['pred_visibility'].squeeze(0)
         obj_ids = pt_dict[self.cfg.POINT_INFO.OBJ_ID_KEY].clone().long()
         point_indices = torch.arange(pred_tracks.shape[1], dtype=torch.long)
-        if 'per_point_queries' in pt_dict:
-            per_point_queries = pt_dict['per_point_queries']
-        else:
-            per_point_queries = torch.zeros(pred_tracks.shape[1], dtype=torch.int64)
+        per_point_queries = _load_point_queries(pt_dict, pred_tracks.shape[1])
 
         # Selecting the frames for the current clip, currently only supports uniform sampling
         index_select = np.linspace(0, pred_tracks.shape[0] - 1,
@@ -367,12 +364,10 @@ class BaseDataset(torch.utils.data.Dataset):
         num_channels = video.shape[-1]
         if num_channels == 3:
             return video
-        if num_channels == 4:
-            return video[..., :3]
         if num_channels == 1:
             return np.repeat(video, 3, axis=-1)
         raise RuntimeError(
-            f"Expected decoded video to have 1, 3, or 4 channels, got {num_channels}."
+            f"Expected decoded video to have 1 or 3 channels, got {num_channels}."
         )
 
 

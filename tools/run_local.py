@@ -16,7 +16,7 @@ from pathlib import Path
 
 # Change this line when you want `python tools/run_local.py` to run another
 # dataset config by default, for example: "configs/trokens/sav.yaml".
-DEFAULT_CFG = "configs/trokens/sav.yaml"
+DEFAULT_CFG = "configs/trokens/tinyvirat.yaml"
 DEFAULT_GPUS = "2,3,4,5"
 
 

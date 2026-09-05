@@ -80,7 +80,7 @@ def extract_points(args, cotracker, feat_extractor, video_path, ds_dump_path,
         bool: True if the points were extracted, False otherwise
     """
     # load video for semantic feature extraction
-    vid_name = video_path.split('/')[-1].split('.')[0]
+    vid_name = os.path.splitext(os.path.basename(video_path))[0]
     debug_vis_dump_root = os.path.join(ds_dump_path, 'debug_vis', vid_name)
     feat_dump_path = os.path.join(ds_dump_path, 'feat_dump', f'{vid_name}.pkl')
     gif_dump_path = os.path.join(ds_dump_path, 'gif_dump', f'{vid_name}.gif')
@@ -268,7 +268,7 @@ if __name__ == "__main__":
                 custom_fps = None
         else:
             custom_fps = None
-        video_uniq_id = video_path.split('/')[-1].split('.')[0]
+        video_uniq_id = os.path.splitext(os.path.basename(video_path))[0]
         feat_dump_name = f'{video_uniq_id}'
         ds_dump_path = os.path.join(args.base_feat_path, dump_name, dataset)
         try:
