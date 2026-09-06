@@ -58,6 +58,11 @@ def add_custom_config(cfg):
     # slots, while post-Pointformer Positive/Confuser responses explain those
     # same slots and produce a per-frame confidence penalty.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_VERIFICATION_ENABLE = False
+    # Experimental propose-then-verify route.  When enabled, the frame-level
+    # Positive-vs-Confuser verifier reuses the class-conditioned Query patch
+    # distribution that already constructs Q_k instead of producing a second
+    # pure-text evidence map.  It is opt-in to preserve existing checkpoints.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_USE_QUERY_REGION = False
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MAP_SOURCE = "raw"
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MAP_TEMPERATURE = 0.02
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_USE_VISIBILITY = True
@@ -89,6 +94,12 @@ def add_custom_config(cfg):
     # patch-wise Softmax, this mass may approach zero.  The remaining mass is
     # retained as an explicit unmatched state by the frame matcher.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_ENABLE = False
+    # Experimental counterpart for absolute mass: measure Raw/Post absolute
+    # evidence inside a candidate region proposed by the same Text+Support
+    # distribution used to construct Q_k.  The proposal only selects a broad
+    # region; Raw evidence is still aggregated with Top-K inside that region.
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_USE_QUERY_REGION = False
+    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_REGION_TOPK = 32
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_SOURCE = "raw"
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_USE_VISIBILITY = True
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.ABSOLUTE_MASS_PATCH_TOPK = 8

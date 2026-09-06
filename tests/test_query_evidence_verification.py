@@ -12,6 +12,7 @@ from trokens.models.query_class_matchability import (
     compute_evidence_conditioned_frame_matchability,
     compute_support_calibrated_frame_transport_mass,
     confidence_aware_bimhm_logits,
+    normalize_patch_region_weights,
 )
 
 
@@ -35,6 +36,7 @@ def _evidence_cfg(**overrides):
         "DETACH_CONFUSER_SUPPORT": True,
         "APPLY_DURING_TRAIN": True,
         "EVIDENCE_VERIFICATION_ENABLE": True,
+        "EVIDENCE_USE_QUERY_REGION": False,
         "EVIDENCE_MAP_SOURCE": "raw",
         "EVIDENCE_MAP_TEMPERATURE": 0.07,
         "EVIDENCE_USE_VISIBILITY": True,
@@ -53,6 +55,8 @@ def _evidence_cfg(**overrides):
         "EVIDENCE_MIL_TEMPERATURE": 0.10,
         "EVIDENCE_MIL_LOSS_WEIGHT": 0.10,
         "ABSOLUTE_MASS_ENABLE": False,
+        "ABSOLUTE_MASS_USE_QUERY_REGION": False,
+        "ABSOLUTE_MASS_REGION_TOPK": 1,
         "ABSOLUTE_MASS_SOURCE": "raw",
         "ABSOLUTE_MASS_USE_VISIBILITY": True,
         "ABSOLUTE_MASS_PATCH_TOPK": 1,
@@ -79,6 +83,33 @@ def test_absolute_mass_requests_raw_tokens_independently_of_frame_verification()
     assert _query_class_requires_raw_tokens(cfg)
     cfg.ABSOLUTE_MASS_SOURCE = "post"
     assert not _query_class_requires_raw_tokens(cfg)
+
+
+def test_query_region_verification_does_not_require_a_second_raw_router():
+    cfg = _evidence_cfg(
+        EVIDENCE_VERIFICATION_ENABLE=True,
+        EVIDENCE_USE_QUERY_REGION=True,
+        ABSOLUTE_MASS_ENABLE=False,
+    )
+    assert not _query_class_requires_raw_tokens(cfg)
+
+
+def test_candidate_region_is_masked_and_renormalized_per_frame():
+    weights = torch.tensor(
+        [[[[0.2, 0.3, 0.5]], [[0.0, 0.5, 0.5]]]],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor([[[True, False, True]]])
+    normalized = normalize_patch_region_weights(weights, mask)
+
+    assert normalized[0, 0, 0].tolist() == pytest.approx(
+        [2.0 / 7.0, 0.0, 5.0 / 7.0]
+    )
+    assert normalized[0, 1, 0].tolist() == pytest.approx([0.0, 0.0, 1.0])
+    assert torch.allclose(
+        normalized.sum(dim=-1),
+        torch.ones(1, 2, 1),
+    )
 
 
 def test_raw_evidence_map_uses_pure_text_and_respects_mask():
@@ -171,6 +202,46 @@ def test_support_calibrated_absolute_mass_can_abstain_per_frame():
         _evidence_cfg(),
     )
     assert torch.equal(result["patch_mass"], changed_result["patch_mass"])
+
+
+def test_absolute_mass_keeps_raw_topk_inside_supplied_candidate_region():
+    similarity = torch.tensor(
+        [
+            [[[0.90, 0.10]]],
+            [[[0.20, 0.80]]],
+            [[[0.70, 0.30]]],
+        ]
+    )
+    region = torch.tensor(
+        [
+            [[[0.0, 1.0]]],
+            [[[1.0, 0.0]]],
+            [[[0.25, 0.75]]],
+        ]
+    )
+    point_mask = torch.ones(3, 1, 2, dtype=torch.bool)
+    support_mask = torch.tensor([True, True, False])
+    labels = torch.tensor([[1], [0], [1]], dtype=torch.bool)
+
+    result = compute_support_calibrated_frame_transport_mass(
+        similarity,
+        point_mask,
+        support_mask,
+        labels,
+        _evidence_cfg(),
+        region_weights=region,
+    )
+
+    assert result["frame_evidence"].flatten().tolist() == pytest.approx(
+        [0.10, 0.20, 0.30]
+    )
+    assert torch.equal(result["region_weights"], region)
+    assert result["region_mask"].flatten(end_dim=2).tolist() == [
+        [False, True],
+        [True, False],
+        [False, True],
+    ]
+    assert result["query_frame_candidate_raw_topk_recall"].item() == 0.0
 
 
 def test_unreliable_absolute_mass_calibration_is_a_strict_fallback():
@@ -403,6 +474,60 @@ def test_wrapper_keeps_construction_route_and_ignores_query_targets():
         "query_partial_q2s_logits",
     ):
         assert torch.equal(first[key], second[key])
+
+
+def test_frame_verifier_can_reuse_the_exact_query_construction_region():
+    model = _pointformer(tau=1.0)
+    cfg = _evidence_cfg(
+        EVIDENCE_USE_QUERY_REGION=True,
+        ABSOLUTE_MASS_ENABLE=False,
+    )
+    model.cfg = SimpleNamespace(
+        FEW_SHOT=SimpleNamespace(QUERY_CLASS_MATCHABILITY=cfg),
+        POINT_INFO=SimpleNamespace(USE_PT_QUERY_MASK=True),
+    )
+    model.pot_route_cfg = SimpleNamespace(
+        FRAME_SOFTMAX_TAU=1.0,
+        QUERY_PARTIAL_LOGIT_ALPHA=10.0,
+        QUERY_PARTIAL_LOGIT_BIAS=-2.0,
+    )
+    model.use_support_text_fusion = False
+    model._get_pot_label_text_features = (
+        lambda class_ids, dtype: torch.eye(2, dtype=dtype)
+    )
+    post = torch.tensor(
+        [
+            [[[1.0, 0.0], [0.8, 0.2]]],
+            [[[0.0, 1.0], [0.2, 0.8]]],
+            [[[0.9, 0.1], [0.1, 0.9]]],
+        ]
+    )
+    mask = torch.ones(3, 1, 2, dtype=torch.bool)
+    metadata = {
+        "support_mask": torch.tensor([True, True, False]),
+        "pred_query_mask": mask,
+        "pred_visibility": mask,
+        "episode_class_ids": torch.tensor([0, 1]),
+        "episode_positive_labels": torch.tensor(
+            [[1, 0], [0, 1], [0, 1]],
+            dtype=torch.bool,
+        ),
+    }
+
+    result = model._build_frame_softmax_q2s_aux(post, metadata)
+    _, expected = model._compute_frame_softmax_text_prototypes(
+        post[-1],
+        mask[-1],
+        torch.eye(2),
+    )
+    assert torch.equal(
+        result["query_evidence_patch_weights"],
+        expected.unsqueeze(0),
+    )
+    assert torch.allclose(
+        result["query_evidence_patch_weights"].sum(dim=-1),
+        torch.ones(1, 2, 1),
+    )
 
 
 def test_wrapper_preserves_explicit_patch_plus_unmatched_mass():

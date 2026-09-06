@@ -16,6 +16,7 @@ def test_tinyvirat_config_class_partition_matches_split_files():
     cfg = get_cfg()
     cfg.merge_from_file("configs/trokens/tinyvirat.yaml")
 
+    assert cfg.POINT_INFO.USE_PT_QUERY_MASK is True
     assert cfg.MODEL.NUM_CLASSES == 21
     assert len(cfg.TRAIN.CLASS_NAME) == 12
     assert len(cfg.TEST.CLASS_NAME) == 21

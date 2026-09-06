@@ -29,6 +29,7 @@ def _query_class_requires_raw_tokens(match_cfg):
         return False
     evidence_raw = (
         bool(getattr(match_cfg, "EVIDENCE_VERIFICATION_ENABLE", False))
+        and not bool(getattr(match_cfg, "EVIDENCE_USE_QUERY_REGION", False))
         and str(getattr(match_cfg, "EVIDENCE_MAP_SOURCE", "raw")).lower()
         == "raw"
     )

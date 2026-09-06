@@ -37,6 +37,8 @@ FEW_SHOT:
     # Raw text selects semantic trajectory slots only for evidence verification;
     # the existing post-Pointformer Text+Support route still constructs Q.
     EVIDENCE_VERIFICATION_ENABLE: True
+    # Ablation switch: reuse the exact Q-construction candidate distribution.
+    EVIDENCE_USE_QUERY_REGION: False
     EVIDENCE_MAP_SOURCE: "raw"
     EVIDENCE_MAP_TEMPERATURE: 0.07
     EVIDENCE_USE_VISIBILITY: True
@@ -61,6 +63,10 @@ FEW_SHOT:
     # labeled Support set.  Patch weights sum to m (not one), while 1-m is
     # retained as unmatched mass inside both BiMHM directions.
     ABSOLUTE_MASS_ENABLE: True
+    # Let the Q-construction distribution propose a broad candidate region,
+    # then retain Raw DinoTxt Top-K evidence inside that region.
+    ABSOLUTE_MASS_USE_QUERY_REGION: True
+    ABSOLUTE_MASS_REGION_TOPK: 32
     ABSOLUTE_MASS_SOURCE: "raw"
     ABSOLUTE_MASS_USE_VISIBILITY: True
     ABSOLUTE_MASS_PATCH_TOPK: 8
@@ -86,7 +92,9 @@ POINT_INFO:
   NAME: cotracker3_bip_fr_32_feat_dinotxt_vitl14reg4_fps_10
   PT_FIX_SAMPLING_TRAIN: True
   PT_FIX_SAMPLING_TEST: True
-  USE_PT_QUERY_MASK: True
+  # Only TinyVIRAT uses the trajectory seed-time query mask.  SAV follows
+  # per-frame CoTracker visibility instead.
+  USE_PT_QUERY_MASK: False
   SAMPLING_TYPE: cluster_sample
   NUM_POINTS_TO_SAMPLE: 256
   GRID_SIZE: 16
