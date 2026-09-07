@@ -1,4 +1,4 @@
-"""Tests for Raw-Key evidence verification without Query patch rerouting."""
+"""Tests for Query-region verification and absolute transport mass."""
 
 from types import SimpleNamespace
 
@@ -7,7 +7,6 @@ import torch
 
 from trokens.models.pointformer import Pointformer, _query_class_requires_raw_tokens
 from trokens.models.query_class_matchability import (
-    build_query_evidence_map,
     classwise_frame_similarity,
     compute_evidence_conditioned_frame_matchability,
     compute_support_calibrated_frame_transport_mass,
@@ -36,9 +35,6 @@ def _evidence_cfg(**overrides):
         "DETACH_CONFUSER_SUPPORT": True,
         "APPLY_DURING_TRAIN": True,
         "EVIDENCE_VERIFICATION_ENABLE": True,
-        "EVIDENCE_USE_QUERY_REGION": False,
-        "EVIDENCE_MAP_SOURCE": "raw",
-        "EVIDENCE_MAP_TEMPERATURE": 0.07,
         "EVIDENCE_USE_VISIBILITY": True,
         "EVIDENCE_POSITIVE_AGGREGATION": "topk_mean",
         "EVIDENCE_POSITIVE_TOPK": 2,
@@ -85,10 +81,9 @@ def test_absolute_mass_requests_raw_tokens_independently_of_frame_verification()
     assert not _query_class_requires_raw_tokens(cfg)
 
 
-def test_query_region_verification_does_not_require_a_second_raw_router():
+def test_frame_verification_does_not_require_a_second_raw_router():
     cfg = _evidence_cfg(
         EVIDENCE_VERIFICATION_ENABLE=True,
-        EVIDENCE_USE_QUERY_REGION=True,
         ABSOLUTE_MASS_ENABLE=False,
     )
     assert not _query_class_requires_raw_tokens(cfg)
@@ -108,31 +103,6 @@ def test_candidate_region_is_masked_and_renormalized_per_frame():
     assert normalized[0, 1, 0].tolist() == pytest.approx([0.0, 0.0, 1.0])
     assert torch.allclose(
         normalized.sum(dim=-1),
-        torch.ones(1, 2, 1),
-    )
-
-
-def test_raw_evidence_map_uses_pure_text_and_respects_mask():
-    model = _pointformer()
-    raw = torch.tensor(
-        [[[[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]]],
-        dtype=torch.float32,
-    )
-    mask = torch.tensor([[[True, True, False]]])
-    result = build_query_evidence_map(
-        model,
-        raw,
-        mask,
-        torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-        temperature=0.05,
-    )
-
-    assert result["weights"].shape == (1, 2, 1, 3)
-    assert result["weights"][0, 0, 0, 0] > 0.99
-    assert result["weights"][0, 1, 0, 1] > 0.99
-    assert torch.count_nonzero(result["weights"][..., 2]) == 0
-    assert torch.allclose(
-        result["weights"].sum(dim=-1),
         torch.ones(1, 2, 1),
     )
 
@@ -476,10 +446,9 @@ def test_wrapper_keeps_construction_route_and_ignores_query_targets():
         assert torch.equal(first[key], second[key])
 
 
-def test_frame_verifier_can_reuse_the_exact_query_construction_region():
+def test_frame_verifier_uses_the_exact_query_construction_region():
     model = _pointformer(tau=1.0)
     cfg = _evidence_cfg(
-        EVIDENCE_USE_QUERY_REGION=True,
         ABSOLUTE_MASS_ENABLE=False,
     )
     model.cfg = SimpleNamespace(

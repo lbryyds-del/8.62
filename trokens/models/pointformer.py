@@ -24,21 +24,15 @@ from .build import MODEL_REGISTRY
 
 
 def _query_class_requires_raw_tokens(match_cfg):
-    """Return whether any enabled confidence branch consumes Raw DinoTxt."""
+    """Return whether absolute-mass estimation consumes Raw DinoTxt."""
     if not bool(getattr(match_cfg, "ENABLE", False)):
         return False
-    evidence_raw = (
-        bool(getattr(match_cfg, "EVIDENCE_VERIFICATION_ENABLE", False))
-        and not bool(getattr(match_cfg, "EVIDENCE_USE_QUERY_REGION", False))
-        and str(getattr(match_cfg, "EVIDENCE_MAP_SOURCE", "raw")).lower()
-        == "raw"
-    )
     absolute_raw = (
         bool(getattr(match_cfg, "ABSOLUTE_MASS_ENABLE", False))
         and str(getattr(match_cfg, "ABSOLUTE_MASS_SOURCE", "raw")).lower()
         == "raw"
     )
-    return evidence_raw or absolute_raw
+    return absolute_raw
 
 
 @MODEL_REGISTRY.register()

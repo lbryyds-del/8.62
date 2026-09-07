@@ -53,18 +53,9 @@ def add_custom_config(cfg):
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_TOPK = 2
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.NEGATIVE_TEMPERATURE = 0.10
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.DETACH_CONFUSER_SUPPORT = False
-    # Optional Raw-Semantic-Key evidence verifier.  This branch never changes
-    # the Query construction weights: pure text selects raw DinoTxt trajectory
-    # slots, while post-Pointformer Positive/Confuser responses explain those
-    # same slots and produce a per-frame confidence penalty.
+    # Optional frame-level verifier. It always checks Positive-vs-Confuser
+    # specificity on the class-conditioned region pi that constructs Q_k.
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_VERIFICATION_ENABLE = False
-    # Experimental propose-then-verify route.  When enabled, the frame-level
-    # Positive-vs-Confuser verifier reuses the class-conditioned Query patch
-    # distribution that already constructs Q_k instead of producing a second
-    # pure-text evidence map.  It is opt-in to preserve existing checkpoints.
-    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_USE_QUERY_REGION = False
-    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MAP_SOURCE = "raw"
-    cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_MAP_TEMPERATURE = 0.02
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_USE_VISIBILITY = True
     cfg.FEW_SHOT.QUERY_CLASS_MATCHABILITY.EVIDENCE_POSITIVE_AGGREGATION = (
         "topk_mean"
